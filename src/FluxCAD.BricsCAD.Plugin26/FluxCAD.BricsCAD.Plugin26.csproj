@@ -3,7 +3,9 @@
   <PropertyGroup>
     <TargetFramework>net8.0-windows</TargetFramework>
     <ImplicitUsings>enable</ImplicitUsings>
+	<UseWPF>true</UseWPF>
     <Nullable>enable</Nullable>
+    <Platforms>AnyCPU;x64</Platforms>
   </PropertyGroup>
 
   <ItemGroup>
@@ -12,6 +14,21 @@
     <ProjectReference Include="..\FluxCAD.Core\FluxCAD.Core.csproj" />
     <ProjectReference Include="..\FluxCAD.Gui26\FluxCAD.Gui26.csproj" />
     <ProjectReference Include="..\FluxCAD.Infrastructure\FluxCAD.Infrastructure.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Reference Include="BrxMgd">
+      <HintPath>C:\Program Files\Bricsys\BRXSDK\BRX26.2.01.0\dotnet\refs\BrxMgd.dll</HintPath>
+      <Private>False</Private>
+    </Reference>
+    <Reference Include="TD_Mgd">
+      <HintPath>C:\Program Files\Bricsys\BRXSDK\BRX26.2.01.0\dotnet\refs\TD_Mgd.dll</HintPath>
+      <Private>False</Private>
+    </Reference>
+    <Reference Include="TD_MgdBrep">
+      <HintPath>C:\Program Files\Bricsys\BRXSDK\BRX26.2.01.0\dotnet\refs\TD_MgdBrep.dll</HintPath>
+      <Private>False</Private>
+    </Reference>
   </ItemGroup>
 
 </Project>

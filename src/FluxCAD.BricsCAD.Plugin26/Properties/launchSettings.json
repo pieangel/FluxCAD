@@ -1,0 +1,9 @@
+{
+  "profiles": {
+    "FluxCAD.BricsCAD.Plugin26": {
+      "commandName": "Project",
+      "commandLineArgs": "C:\\Program Files\\Bricsys\\BricsCAD V26 en_US\\bricscad.exe",
+      "workingDirectory": "C:\\Program Files\\Bricsys\\BricsCAD V26 en_US"
+    }
+  }
+}

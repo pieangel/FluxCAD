@@ -5,9 +5,11 @@
     <Nullable>enable</Nullable>
     <UseWPF>true</UseWPF>
     <ImplicitUsings>enable</ImplicitUsings>
+    <Platforms>AnyCPU;x64</Platforms>
   </PropertyGroup>
 
   <ItemGroup>
+    <ProjectReference Include="..\FluxCAD.BricsCAD.Adapter26\FluxCAD.BricsCAD.Adapter26.csproj" />
     <ProjectReference Include="..\FluxCAD.Contracts\FluxCAD.Contracts.csproj" />
     <ProjectReference Include="..\FluxCAD.Core\FluxCAD.Core.csproj" />
     <ProjectReference Include="..\FluxCAD.Infrastructure\FluxCAD.Infrastructure.csproj" />
