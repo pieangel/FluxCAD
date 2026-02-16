@@ -1,0 +1,17 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\FluxCAD.BricsCAD.Adapter26\FluxCAD.BricsCAD.Adapter26.csproj" />
+    <ProjectReference Include="..\FluxCAD.Contracts\FluxCAD.Contracts.csproj" />
+    <ProjectReference Include="..\FluxCAD.Core\FluxCAD.Core.csproj" />
+    <ProjectReference Include="..\FluxCAD.Gui26\FluxCAD.Gui26.csproj" />
+    <ProjectReference Include="..\FluxCAD.Infrastructure\FluxCAD.Infrastructure.csproj" />
+  </ItemGroup>
+
+</Project>
