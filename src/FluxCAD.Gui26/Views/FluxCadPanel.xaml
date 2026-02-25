@@ -1,44 +1,115 @@
 ﻿<UserControl x:Class="FluxCAD.Gui26.Views.FluxCadPanel"
              xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
-             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
+             xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
+             xmlns:summary="clr-namespace:FluxCAD.Contracts.Summary;assembly=FluxCAD.Contracts"
+             xmlns:adpt="clr-namespace:FluxCAD.BricsCAD.Adapter26;assembly=FluxCAD.BricsCAD.Adapter26"
+             mc:Ignorable="d" d:DesignHeight="700" d:DesignWidth="900">
+    <UserControl.Resources>
+        <BooleanToVisibilityConverter x:Key="BooleanToVisibilityConverter"/>
+
+        <Style x:Key="StatusTextStyle" TargetType="TextBlock">
+            <Style.Triggers>
+                <DataTrigger Binding="{Binding Status}" Value="OK">
+                    <Setter Property="Foreground" Value="Green"/>
+                </DataTrigger>
+                <DataTrigger Binding="{Binding Status}" Value="Warning">
+                    <Setter Property="Foreground" Value="Orange"/>
+                </DataTrigger>
+            </Style.Triggers>
+        </Style>
+    </UserControl.Resources>
+
     <Grid Margin="12">
         <Grid.RowDefinitions>
             <RowDefinition Height="Auto"/>
             <RowDefinition Height="Auto"/>
             <RowDefinition Height="*"/>
+            <RowDefinition Height="150"/>
         </Grid.RowDefinitions>
 
-        <StackPanel Orientation="Horizontal">
-            <Button Width="160" Height="32" Content="Analyze Active DWG" Click="OnAnalyzeClick"/>
-            <Button Width="100" Height="32" Content="Analyze Active DWG" Click="OnStripDimsClick"/>
-            <TextBlock Margin="12,0,0,0" VerticalAlignment="Center" Text="{Binding Header}"/>
-        </StackPanel>
+        <Border Background="#F8F9FA" Padding="10" CornerRadius="4" Margin="0,0,0,8">
+            <DockPanel>
+                <StackPanel Orientation="Horizontal" DockPanel.Dock="Left">
+                    <Button Width="150" Height="35" Content="Step 1. 도면 분석" Click="OnScanStructureClick" Background="#007BFF" Foreground="White"/>
+                    <Button Width="150" Height="35" Content="Step 2. 분류/나열" Click="OnAutoSortClick" Margin="8,0,0,0" Background="#28A745" Foreground="White"/>
+                </StackPanel>
+                <StackPanel Orientation="Horizontal" HorizontalAlignment="Right">
+                    <Button Content="치수 제거" Click="OnStripDimsClick" Margin="0,0,8,0" Padding="10,0"/>
+                    <Button Content="데이터 초기화" Click="OnAnalyzeClick" Padding="10,0"/>
+                </StackPanel>
+            </DockPanel>
+        </Border>
 
-        <TextBlock Grid.Row="1" Margin="0,8,0,8" Text="{Binding TotalText}"/>
+        <UniformGrid Grid.Row="1" Columns="3" Margin="0,0,0,8">
+            <Border BorderBrush="#DEE2E6" BorderThickness="1" Margin="0,0,4,0" Padding="10">
+                <StackPanel>
+                    <TextBlock Text="검출된 총 격자(Cell)" FontSize="11" Foreground="Gray"/>
+                    <TextBlock Text="{Binding TotalBlocks}" FontSize="20" FontWeight="Bold" Foreground="#343A40"/>
+                </StackPanel>
+            </Border>
+            <Border BorderBrush="#DEE2E6" BorderThickness="1" Margin="4,0,4,0" Padding="10">
+                <StackPanel>
+                    <TextBlock Text="식별된 가공 부품" FontSize="11" Foreground="Gray"/>
+                    <TextBlock Text="{Binding IdentifiedParts}" FontSize="20" FontWeight="Bold" Foreground="#28A745"/>
+                </StackPanel>
+            </Border>
+            <Border BorderBrush="#DEE2E6" BorderThickness="1" Margin="4,0,0,0" Padding="10">
+                <StackPanel>
+                    <TextBlock Text="분석 소요 시간" FontSize="11" Foreground="Gray"/>
+                    <TextBlock Text="{Binding ProcessingTime}" FontSize="20" FontWeight="Bold" Foreground="#17A2B8"/>
+                </StackPanel>
+            </Border>
+        </UniformGrid>
 
-        <Grid Grid.Row="2">
+        <GroupBox Grid.Row="2" Header="공간 레이아웃 트리 (Spatial Logic Map)" Margin="0,4">
+            <TreeView ItemsSource="{Binding SpatialTree}">
+                <TreeView.ItemTemplate>
+                    <HierarchicalDataTemplate ItemsSource="{Binding Children}" DataType="{x:Type adpt:SpatialNode}">
+                        <StackPanel Orientation="Horizontal" Margin="2">
+                            <TextBlock Text="{Binding Name}" FontWeight="Bold"/>
+                            <TextBlock Text=" → " Foreground="Silver"/>
+                            <TextBlock Text="{Binding Material}" Foreground="Blue" Width="60"/>
+                            <TextBlock Text="{Binding Thickness}" Foreground="DarkGreen" Width="50"/>
+                            <Border Background="#F1F3F5" CornerRadius="2" Padding="4,0" Margin="8,0">
+                                <TextBlock Text="{Binding Quantity}" Foreground="Crimson" FontWeight="Bold"/>
+                            </Border>
+                            <TextBlock Text="{Binding Status}" FontSize="10" VerticalAlignment="Center" Style="{StaticResource StatusTextStyle}"/>
+                        </StackPanel>
+                    </HierarchicalDataTemplate>
+                </TreeView.ItemTemplate>
+            </TreeView>
+        </GroupBox>
+
+        <Grid Grid.Row="3" Margin="0,8,0,0">
             <Grid.ColumnDefinitions>
                 <ColumnDefinition Width="*"/>
                 <ColumnDefinition Width="*"/>
             </Grid.ColumnDefinitions>
-
-            <GroupBox Header="By Type" Margin="0,0,8,0">
-                <DataGrid ItemsSource="{Binding ByType}" AutoGenerateColumns="False" IsReadOnly="True">
+            <GroupBox Header="레이어별 개수" Margin="0,0,4,0">
+                <DataGrid ItemsSource="{Binding ByLayer}" AutoGenerateColumns="False" IsReadOnly="True" FontSize="10">
                     <DataGrid.Columns>
-                        <DataGridTextColumn Header="Type" Binding="{Binding Name}" Width="*"/>
-                        <DataGridTextColumn Header="Count" Binding="{Binding Count}" Width="120"/>
+                        <DataGridTextColumn Header="Layer Name" Binding="{Binding Name}" Width="*"/>
+                        <DataGridTextColumn Header="Count" Binding="{Binding Count}" Width="60"/>
                     </DataGrid.Columns>
                 </DataGrid>
             </GroupBox>
-
-            <GroupBox Grid.Column="1" Header="By Layer (Top)" Margin="8,0,0,0">
-                <DataGrid ItemsSource="{Binding ByLayer}" AutoGenerateColumns="False" IsReadOnly="True">
+            <GroupBox Header="엔티티 타입" Grid.Column="1" Margin="4,0,0,0">
+                <DataGrid ItemsSource="{Binding ByType}" AutoGenerateColumns="False" IsReadOnly="True" FontSize="10">
                     <DataGrid.Columns>
-                        <DataGridTextColumn Header="Layer" Binding="{Binding Name}" Width="*"/>
-                        <DataGridTextColumn Header="Count" Binding="{Binding Count}" Width="120"/>
+                        <DataGridTextColumn Header="Type" Binding="{Binding Name}" Width="*"/>
+                        <DataGridTextColumn Header="Count" Binding="{Binding Count}" Width="60"/>
                     </DataGrid.Columns>
                 </DataGrid>
             </GroupBox>
         </Grid>
+
+        <Border Grid.RowSpan="4" Background="#AAFFFFFF" Visibility="{Binding IsBusy, Converter={StaticResource BooleanToVisibilityConverter}}">
+            <StackPanel VerticalAlignment="Center">
+                <ProgressBar IsIndeterminate="True" Width="200" Height="4"/>
+                <TextBlock Text="도면의 공간적 인과관계를 추론 중입니다..." HorizontalAlignment="Center" Margin="0,10" Foreground="#495057"/>
+            </StackPanel>
+        </Border>
     </Grid>
 </UserControl>
