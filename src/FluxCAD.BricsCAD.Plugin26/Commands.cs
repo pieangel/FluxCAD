@@ -11,6 +11,40 @@ namespace FluxCAD.BricsCAD.Plugin26
 {
     public class Commands
     {
+        [CommandMethod("RUN_EXTRACTOR")]
+        public void RunExtractorCommand()
+        {
+            var ed = Application.DocumentManager.MdiActiveDocument.Editor;
+
+            try
+            {
+                string jsonPath = @"F:\Projects\FluxCAD\data\spatial_tree.json";
+
+                // 1. JSON을 JsonSpatialNode(트리 구조)로 읽어옵니다.
+                // LoadSpatialTree의 반환 타입을 JsonSpatialNode로 수정했다고 가정합니다.
+                var engine = new LaserAutomationEngine(jsonPath);
+                //var root = engine.LoadSpatialTree(jsonPath);
+
+                ed.WriteMessage("\n[2/3] 부품 인식 및 속성 매칭 시작...");
+
+                // 2. 에러 발생 지점: 이제 root 객체를 인자로 넘겨줍니다.
+                //engine.ProcessAutoRecognition(root);
+
+                // 3. 결과 보고
+                var inventory = engine.GetInventory(); // 인벤토리를 가져오는 public 메서드 필요
+                ed.WriteMessage($"\n[3/3] 분석 완료! 총 {inventory.Count}개의 부품을 찾았습니다.");
+
+                foreach (var part in inventory.Take(10)) // 상위 10개만 샘플 출력
+                {
+                    ed.WriteMessage($"\n - 부품 ID: {part.PartId}, 재질: {part.Material}, 수량: {part.Quantity}");
+                }
+            }
+            catch (System.Exception ex)
+            {
+                ed.WriteMessage($"\n[에러 발생]: {ex.Message}");
+            }
+        }
+
         [CommandMethod("EXTRACT_SPATIAL_JSON")]
         public void RunExtractSpatialJson()
         {
