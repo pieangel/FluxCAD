@@ -5,12 +5,148 @@ using System.IO;
 using Teigha.DatabaseServices;
 using Teigha.Runtime;
 using Teigha.Geometry; // Point3d, Vector3d 등이 정의된 곳
-
+using System.Drawing;
+using System.Drawing.Imaging;
+using Newtonsoft.Json.Linq;
+using Teigha.GraphicsSystem;
 
 namespace FluxCAD.BricsCAD.Plugin26
 {
     public class Commands
     {
+        [CommandMethod("FLUX_EXPORT_PARTS")]
+        public void FluxExportParts()
+        {
+            Document doc = Application.DocumentManager.MdiActiveDocument;
+            Editor ed = doc.Editor;
+
+            try
+            {
+                // 1. JSON 파일 선택
+                var ofd = new PromptOpenFileOptions("\n분석된 spatial_tree.json 파일을 선택하세요")
+                {
+                    Filter = "JSON Files (*.json)|*.json"
+                };
+                var res = ed.GetFileNameForOpen(ofd);
+                if (res.Status != PromptStatus.OK) return;
+
+                string jsonPath = res.StringResult;
+                string outputDir = Path.Combine(Path.GetDirectoryName(jsonPath)!, "Extracted_Parts");
+
+                if (!Directory.Exists(outputDir)) Directory.CreateDirectory(outputDir);
+
+                // 2. JSON 파싱
+                string jsonContent = File.ReadAllText(jsonPath);
+                JObject root = JObject.Parse(jsonContent);
+
+                ed.WriteMessage("\n[FluxCAD] 고화질 이미지 추출 프로세스 시작...");
+
+                int count = 0;
+                // 루트 노드의 자식부터 탐색 시작
+                if (root["Children"] != null)
+                {
+                    ProcessJsonNodeRecursive(root, doc, outputDir, ref count);
+                }
+
+                ed.WriteMessage($"\n[완료] 총 {count}개의 부품 이미지가 저장되었습니다: {outputDir}");
+            }
+            catch (System.Exception ex)
+            {
+                ed.WriteMessage($"\n[오류] 추출 명령 중 문제 발생: {ex.Message}");
+            }
+        }
+
+        private void ProcessJsonNodeRecursive(JToken node, Document doc, string outputDir, ref int count)
+        {
+            var id = node["Id"]?.ToString();
+            var type = node["Type"]?.ToString();
+            var bounds = node["Bounds"];
+
+            // 실제 객체 좌표가 있는 경우 캡처 진행
+            if (id != null && id != "ROOT" && bounds != null && bounds.HasValues)
+            {
+                double minX = (double)bounds["MinPoint"]["X"];
+                double minY = (double)bounds["MinPoint"]["Y"];
+                double maxX = (double)bounds["MaxPoint"]["X"];
+                double maxY = (double)bounds["MaxPoint"]["Y"];
+
+                // 유효한 크기를 가진 객체만 처리
+                if (Math.Abs(maxX - minX) > 0.001)
+                {
+                    CaptureGsSnapshot(doc, id, type, new Point2d(minX, minY), new Point2d(maxX, maxY), outputDir);
+                    count++;
+                }
+            }
+
+            // 자식 노드 재귀 탐색
+            var children = node["Children"];
+            if (children != null)
+            {
+                foreach (var child in children)
+                {
+                    ProcessJsonNodeRecursive(child, doc, outputDir, ref count);
+                }
+            }
+        }
+
+        private void CaptureGsSnapshot(Document doc, string id, string type, Point2d min, Point2d max, string outputDir)
+        {
+            Editor ed = doc.Editor;
+
+            // 1. 해당 영역으로 View 설정 (Zoom Window)
+            using (ViewTableRecord view = new ViewTableRecord())
+            {
+                double width = max.X - min.X;
+                double height = max.Y - min.Y;
+                view.CenterPoint = new Point2d(min.X + width / 2, min.Y + height / 2);
+
+                // AI 인식을 위한 마진 (15%)
+                view.Height = height * 1.15;
+                view.Width = width * 1.15;
+
+                ed.SetCurrentView(view);
+            }
+
+            // 화면 동기화
+            ed.UpdateScreen();
+
+            // 2. GsView 스냅샷 촬영
+            using (Teigha.GraphicsSystem.View gsView = doc.GraphicsManager.GetGsView(0, false))
+            {
+                if (gsView != null)
+                {
+                    int resolution = 2048; // 고화질 설정
+                    using (Bitmap bmp = gsView.GetSnapshot(new Rectangle(0, 0, resolution, resolution)))
+                    {
+                        string fileName = $"Part_{id}_{type}.png";
+                        string fullPath = Path.Combine(outputDir, fileName);
+                        bmp.Save(fullPath, ImageFormat.Png);
+                    }
+                }
+            }
+        }
+
+        [CommandMethod("FLUX_AI_RECOGNIZE")]
+        public void FluxAiRecognize()
+        {
+            var ed = Application.DocumentManager.MdiActiveDocument.Editor;
+
+            try
+            {
+                ed.WriteMessage("\n[FluxCAD] 멀티모달(Vector + Vision) 분석 모드 가동...");
+
+                // 1. 이미지 엔진 호출 (Adapter 네임스페이스 경유)
+                string imagePath = VisualExportAdapter.ExportToVisionPdf("flux_vision_input.pdf");
+                ed.WriteMessage($"\n[FluxCAD] 분석용 시각 데이터 확보 완료: {imagePath}");
+
+                // 2. 이후 JSON 추출 및 파이썬 엔진 실행 로직 연결...
+            }
+            catch (System.Exception ex)
+            {
+                ed.WriteMessage($"\n[Error] 어댑터 실행 중 오류 발생: {ex.Message}");
+            }
+        }
+        
         [CommandMethod("RUN_EXTRACTOR")]
         public void RunExtractorCommand()
         {
