@@ -13,6 +13,8 @@ namespace FluxCAD.BricsCAD.Adapter26
         public string Quantity { get; set; } = "-";
         public string Status { get; set; } = "Pending"; // 분석 상태 (OK, Warning, Error)
 
+        public string? Layer { get; set; }
+
         public List<SpatialNode> Children { get; set; } = new List<SpatialNode>();
         public List<string> EntityHandles { get; set; } = new List<string>(); // 포함된 객체 핸들
 

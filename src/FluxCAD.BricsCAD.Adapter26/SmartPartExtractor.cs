@@ -20,6 +20,44 @@ namespace FluxCAD.BricsCAD.Adapter26
         // 추출된 결과를 담을 내부 리스트
         private List<ExtractedPart> _extractedParts = new List<ExtractedPart>();
 
+
+        public void CollectNodesForVisual(BlockTableRecord btr, Transaction tr, Matrix3d transform, List<SpatialNode> nodeList)
+        {
+            // 기존 CollectNodesRecursive 내용을 그대로 복사해도 되고,
+            // private 함수를 internal/public으로 바꿔도 됩니다.
+            // 핵심: 월드 Extents 계산 + nodeList.Add
+            foreach (ObjectId id in btr)
+            {
+                Entity ent = tr.GetObject(id, OpenMode.ForRead) as Entity;
+                if (ent == null || !ent.Visible) continue;
+
+                if (ent is BlockReference br)
+                {
+                    var subBtr = (BlockTableRecord)tr.GetObject(br.BlockTableRecord, OpenMode.ForRead);
+                    CollectNodesForVisual(subBtr, tr, transform.PreMultiplyBy(br.BlockTransform), nodeList);
+                }
+                else
+                {
+                    try
+                    {
+                        Extents3d worldExtents = ent.GeometricExtents;
+                        worldExtents.TransformBy(transform);
+
+                        var node = new SpatialNode
+                        {
+                            Id = ent.Handle.ToString(),
+                            Type = ent.GetType().Name.ToUpper(),
+                            Bounds = worldExtents,
+                            Content = (ent is DBText t) ? t.TextString : (ent is MText m) ? m.Contents : ""
+                        };
+
+                        nodeList.Add(node);
+                    }
+                    catch { }
+                }
+            }
+        }
+
         public void ExportSpatialTreeToJson(Database db, string outputFilePath)
         {
             List<SpatialNode> allNodes = new List<SpatialNode>();

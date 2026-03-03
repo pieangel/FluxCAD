@@ -1,19 +1,923 @@
 ﻿using Bricscad.ApplicationServices;
 using Bricscad.EditorInput;
 using FluxCAD.BricsCAD.Adapter26;
-using System.IO;
-using Teigha.DatabaseServices;
-using Teigha.Runtime;
-using Teigha.Geometry; // Point3d, Vector3d 등이 정의된 곳
+using Newtonsoft.Json;
+using Newtonsoft.Json.Linq;
+using System;
 using System.Drawing;
 using System.Drawing.Imaging;
-using Newtonsoft.Json.Linq;
+using System.IO;
+using Teigha.DatabaseServices;
+using Teigha.Geometry; // Point3d, Vector3d 등이 정의된 곳
 using Teigha.GraphicsSystem;
+using Teigha.Runtime;
+//using static System.Net.Mime.MediaTypeNames;
 
 namespace FluxCAD.BricsCAD.Plugin26
 {
     public class Commands
     {
+        List<Entity> _flattened = new List<Entity>();
+        [CommandMethod("FLATTEN_ALL")]
+        public void FlattenAll()
+        {
+            Document doc = Application.DocumentManager.MdiActiveDocument;
+            Database db = doc.Database;
+
+            using (Transaction tr = db.TransactionManager.StartTransaction())
+            {
+                BlockTable bt =
+                    (BlockTable)tr.GetObject(db.BlockTableId, OpenMode.ForRead);
+
+                BlockTableRecord ms =
+                    (BlockTableRecord)tr.GetObject(
+                        bt[BlockTableRecord.ModelSpace],
+                        OpenMode.ForRead);
+
+                foreach (ObjectId id in ms)
+                {
+                    Entity ent =
+                        tr.GetObject(id, OpenMode.ForRead) as Entity;
+
+                    if (ent != null)
+                    {
+                        FlattenEntity(ent, Matrix3d.Identity, tr);
+                    }
+                }
+
+                tr.Commit();
+            }
+            DebugEntityStatistics(_flattened);
+            DebugSpatialDistribution(_flattened);
+            DebugCenterClusters(_flattened);    
+            Application.ShowAlertDialog(
+                $"Flatten 완료: {_flattened.Count} entities");
+        }
+
+        void DebugEntityStatistics(List<Entity> entities)
+        {
+            var typeCount = new Dictionary<string, int>();
+            var layerCount = new Dictionary<string, int>();
+
+            foreach (var ent in entities)
+            {
+                string typeName = ent.GetType().Name;
+                string layerName = ent.Layer;
+
+                // 타입 카운트
+                if (!typeCount.ContainsKey(typeName))
+                    typeCount[typeName] = 0;
+                typeCount[typeName]++;
+
+                // 레이어 카운트
+                if (!layerCount.ContainsKey(layerName))
+                    layerCount[layerName] = 0;
+                layerCount[layerName]++;
+            }
+
+            Editor ed = Application.DocumentManager
+                .MdiActiveDocument.Editor;
+
+            ed.WriteMessage("\n=== Entity Type Statistics ===\n");
+            foreach (var kv in typeCount.OrderByDescending(x => x.Value))
+            {
+                ed.WriteMessage($"{kv.Key} : {kv.Value}\n");
+            }
+
+            ed.WriteMessage("\n=== Layer Statistics ===\n");
+            foreach (var kv in layerCount.OrderByDescending(x => x.Value))
+            {
+                ed.WriteMessage($"{kv.Key} : {kv.Value}\n");
+            }
+        }
+        void FlattenEntity(
+            Entity ent,
+            Matrix3d parentTransform,
+            Transaction tr)
+        {
+            if (ent is BlockReference br)
+            {
+                // 누적 변환
+                Matrix3d currentTransform = parentTransform * br.BlockTransform;
+
+                BlockTableRecord btr =
+                    (BlockTableRecord)tr.GetObject(
+                        br.BlockTableRecord,
+                        OpenMode.ForRead);
+
+                foreach (ObjectId id in btr)
+                {
+                    Entity child =
+                        tr.GetObject(id, OpenMode.ForRead) as Entity;
+
+                    if (child != null)
+                    {
+                        FlattenEntity(child, currentTransform, tr);
+                    }
+                }
+            }
+            else
+            {
+                // 실제 기하 엔티티
+                Entity clone = ent.GetTransformedCopy(parentTransform);
+                _flattened.Add(clone);
+            }
+        }
+
+        void DebugSpatialDistribution(List<Entity> entities)
+        {
+            Editor ed = Application.DocumentManager.MdiActiveDocument.Editor;
+
+            double minX = double.MaxValue;
+            double maxX = double.MinValue;
+            double minY = double.MaxValue;
+            double maxY = double.MinValue;
+
+            foreach (var ent in entities)
+            {
+                try
+                {
+                    var ext = ent.GeometricExtents;
+                    minX = Math.Min(minX, ext.MinPoint.X);
+                    maxX = Math.Max(maxX, ext.MaxPoint.X);
+                    minY = Math.Min(minY, ext.MinPoint.Y);
+                    maxY = Math.Max(maxY, ext.MaxPoint.Y);
+                }
+                catch { }
+            }
+
+            ed.WriteMessage("\n=== Global Spatial Range ===\n");
+            ed.WriteMessage($"X: {minX} ~ {maxX}\n");
+            ed.WriteMessage($"Y: {minY} ~ {maxY}\n");
+        }
+
+        void DebugCenterClusters(List<Entity> entities)
+        {
+            Editor ed = Application.DocumentManager.MdiActiveDocument.Editor;
+
+            var centers = new List<Point2d>();
+
+            foreach (var ent in entities)
+            {
+                try
+                {
+                    var ext = ent.GeometricExtents;
+                    var center = new Point2d(
+                        (ext.MinPoint.X + ext.MaxPoint.X) / 2,
+                        (ext.MinPoint.Y + ext.MaxPoint.Y) / 2
+                    );
+                    centers.Add(center);
+                }
+                catch { }
+            }
+
+            ed.WriteMessage($"\nTotal centers collected: {centers.Count}\n");
+        }
+
+        [CommandMethod("RUN_SHEET_DETECT")]
+        public void RunSheetDetect()
+        {
+            var detector = new FluxCAD.BricsCAD.Adapter26.SheetFrameDetector2();
+            detector.DetectSheetFrame();
+        }
+        [CommandMethod("RUN_MINIMAL_ANALYSIS")]
+        public void RunMinimalAnalysis()
+        {
+            var ed = Application.DocumentManager.MdiActiveDocument.Editor;
+
+            var analyzer = new MinimalCadAnalyzer();
+            analyzer.AnalyzeCurrentDrawing();
+
+            var entities = analyzer.GetEntities();
+
+            ed.WriteMessage($"\n총 엔티티 수: {entities.Count}");
+
+            var sheet = analyzer.DetectSheetBounds();
+
+            ed.WriteMessage($"\n[쉬트 영역 추정]");
+            ed.WriteMessage($"\nMinX: {sheet.MinX}");
+            ed.WriteMessage($"\nMinY: {sheet.MinY}");
+            ed.WriteMessage($"\nMaxX: {sheet.MaxX}");
+            ed.WriteMessage($"\nMaxY: {sheet.MaxY}");
+        }
+
+        [CommandMethod("PART_TRACE_TEST")]
+        public void RunPartTraceTest()
+        {
+            var doc = Application.DocumentManager.MdiActiveDocument;
+            var db = doc.Database;
+            var ed = doc.Editor;
+
+            ed.WriteMessage("\n[1] Extract 시작");
+
+            var boundaries = ExtractPartBoundaries(db, ed);
+
+            ed.WriteMessage("\n[2] Extract 완료");
+
+            ed.WriteMessage($"\n[결과] 개수: {boundaries.Count}");
+
+            // 시각적으로 강조 표시 (Layer 변경)
+            using (var tr = db.TransactionManager.StartTransaction())
+            {
+                var btr = (BlockTableRecord)tr.GetObject(
+                    db.CurrentSpaceId,
+                    OpenMode.ForWrite);
+
+                foreach (var pl in boundaries)
+                {
+                    pl.SetDatabaseDefaults();
+                    pl.ColorIndex = 1; // 빨간색
+
+                    btr.AppendEntity(pl);
+                    tr.AddNewlyCreatedDBObject(pl, true);
+                }
+
+                tr.Commit();
+            }
+        }
+
+        private List<Polyline> ExtractPartBoundaries(Database db, Editor ed)
+        {
+            var results = new List<Polyline>();
+            var seen = new List<(Point3d center, double area)>();
+
+            using (var tr = db.TransactionManager.StartTransaction())
+            {
+                var bt = (BlockTable)tr.GetObject(db.BlockTableId, OpenMode.ForRead);
+                var ms = (BlockTableRecord)tr.GetObject(bt[BlockTableRecord.ModelSpace], OpenMode.ForRead);
+
+                Extents3d drawingExt = GetDrawingExtents(ms, tr);
+                double drawingArea =
+                    (drawingExt.MaxPoint.X - drawingExt.MinPoint.X) *
+                    (drawingExt.MaxPoint.Y - drawingExt.MinPoint.Y);
+
+                double minArea = drawingArea * 0.0005;
+
+                var seedPoints = new List<Point3d>();
+
+                foreach (ObjectId id in ms)
+                {
+                    var ent = tr.GetObject(id, OpenMode.ForRead) as Entity;
+                    if (ent is Dimension dim)
+                    {
+                        var ext = dim.GeometricExtents;
+                        var center = new Point3d(
+                            (ext.MinPoint.X + ext.MaxPoint.X) * 0.5,
+                            (ext.MinPoint.Y + ext.MaxPoint.Y) * 0.5,
+                            0);
+
+                        seedPoints.Add(center);
+                    }
+                }
+
+                foreach (var seed in seedPoints)
+                {
+                    var curves = ed.TraceBoundary(seed, false);
+                    if (curves == null || curves.Count == 0)
+                        continue;
+
+                    foreach (Entity c in curves)
+                    {
+                        if (c is Polyline pl && pl.Closed)
+                        {
+                            double area = Math.Abs(pl.Area);
+                            if (area < minArea)
+                                continue;
+
+                            var ext = pl.GeometricExtents;
+                            var center = new Point3d(
+                                (ext.MinPoint.X + ext.MaxPoint.X) * 0.5,
+                                (ext.MinPoint.Y + ext.MaxPoint.Y) * 0.5,
+                                0);
+
+                            bool duplicate = seen.Any(s =>
+                                center.DistanceTo(s.center) < 1.0 &&
+                                Math.Abs(area - s.area) < area * 0.05);
+
+                            if (duplicate)
+                                continue;
+
+                            seen.Add((center, area));
+                            results.Add(pl);
+                        }
+                    }
+                }
+
+                tr.Commit();
+            }
+
+            return results;
+        }
+
+        private Extents3d GetDrawingExtents(BlockTableRecord btr, Transaction tr)
+        {
+            bool first = true;
+            Extents3d ext = new Extents3d();
+
+            foreach (ObjectId id in btr)
+            {
+                var ent = tr.GetObject(id, OpenMode.ForRead) as Entity;
+                if (ent == null) continue;
+
+                try
+                {
+                    var e = ent.GeometricExtents;
+                    if (first)
+                    {
+                        ext = e;
+                        first = false;
+                    }
+                    else
+                    {
+                        ext.AddExtents(e);
+                    }
+                }
+                catch { }
+            }
+
+            return ext;
+        }
+
+        [CommandMethod("CHECK_GROUPS")]
+        public void CheckGroups()
+        {
+            var doc = Application.DocumentManager.MdiActiveDocument;
+            var db = doc.Database;
+            var ed = doc.Editor;
+
+            using (var tr = db.TransactionManager.StartTransaction())
+            {
+                var groupDict = tr.GetObject(db.GroupDictionaryId, OpenMode.ForRead) as DBDictionary;
+
+                if (groupDict == null || groupDict.Count == 0)
+                {
+                    ed.WriteMessage("\n[결과] GroupDictionary가 비어 있습니다.");
+                    return;
+                }
+
+                ed.WriteMessage($"\n[정보] 총 그룹 개수: {groupDict.Count}");
+
+                int gi = 1;
+
+                foreach (DBDictionaryEntry entry in groupDict)
+                {
+                    var group = tr.GetObject(entry.Value, OpenMode.ForRead) as Group;
+
+                    if (group == null)
+                        continue;
+
+                    var ids = group.GetAllEntityIds();
+
+                    ed.WriteMessage($"\n--------------------------------");
+                    ed.WriteMessage($"\n[Group {gi++}] 이름: {entry.Key}");
+                    ed.WriteMessage($"\n  엔티티 수: {ids.Length}");
+
+                    double minX = double.MaxValue, minY = double.MaxValue;
+                    double maxX = double.MinValue, maxY = double.MinValue;
+
+                    foreach (ObjectId id in ids)
+                    {
+                        var ent = tr.GetObject(id, OpenMode.ForRead) as Entity;
+                        if (ent == null) continue;
+
+                        try
+                        {
+                            var ext = ent.GeometricExtents;
+
+                            minX = Math.Min(minX, ext.MinPoint.X);
+                            minY = Math.Min(minY, ext.MinPoint.Y);
+                            maxX = Math.Max(maxX, ext.MaxPoint.X);
+                            maxY = Math.Max(maxY, ext.MaxPoint.Y);
+                        }
+                        catch
+                        {
+                            // 일부 엔티티는 Extents가 없을 수 있음
+                        }
+                    }
+
+                    if (minX < double.MaxValue)
+                    {
+                        ed.WriteMessage($"\n  BBox: ({minX:F2}, {minY:F2}) ~ ({maxX:F2}, {maxY:F2})");
+                    }
+                }
+
+                tr.Commit();
+            }
+
+            ed.WriteMessage("\n\n[완료] 그룹 검사 종료.");
+        }
+
+        public static List<SpatialNode> ReadSpatialNodes(Database db)
+        {
+            var result = new List<SpatialNode>();
+
+            using var tr = db.TransactionManager.StartTransaction();
+
+            var bt = (BlockTable)tr.GetObject(db.BlockTableId, OpenMode.ForRead);
+            var ms = (BlockTableRecord)tr.GetObject(bt[BlockTableRecord.ModelSpace], OpenMode.ForRead);
+
+            foreach (ObjectId id in ms)
+            {
+                var ent = tr.GetObject(id, OpenMode.ForRead) as Entity;
+                if (ent == null) continue;
+
+                try
+                {
+                    var ext = ent.GeometricExtents;
+
+                    System.Diagnostics.Debug.WriteLine(
+                        $"{ent.GetRXClass().DxfName} | Layer={ent.Layer} | " +
+                        $"Min=({ext.MinPoint.X:F2},{ext.MinPoint.Y:F2}) " +
+                        $"Max=({ext.MaxPoint.X:F2},{ext.MaxPoint.Y:F2})"
+                    );
+                }
+                catch
+                {
+                    System.Diagnostics.Debug.WriteLine(
+                        $"{ent.GetRXClass().DxfName} | GeometricExtents FAILED"
+                    );
+                }
+
+
+                if (ent is BlockReference br)
+                {
+                    var btr = (BlockTableRecord)tr.GetObject(br.BlockTableRecord, OpenMode.ForRead);
+
+                    foreach (ObjectId subId in btr)
+                    {
+                        var subEnt = tr.GetObject(subId, OpenMode.ForRead) as Entity;
+                        if (subEnt == null) continue;
+
+                        try
+                        {
+                            var ext = subEnt.GeometricExtents;
+
+                            // 🔥 여기서 Transform 적용
+                            ext.TransformBy(br.BlockTransform);
+
+                            System.Diagnostics.Debug.WriteLine(
+                            $"[BLOCK] {br.Name} | " +
+                            $"Min=({ext.MinPoint.X:F2},{ext.MinPoint.Y:F2}) " +
+                            $"Max=({ext.MaxPoint.X:F2},{ext.MaxPoint.Y:F2})"
+                            );
+                        }
+                        catch { }
+                    }
+                }
+                else
+                {
+                    try
+                    {
+                        var ext = ent.GeometricExtents;
+
+                        var node = new SpatialNode
+                        {
+                            Id = ent.Handle.ToString(),
+                            Name = ent.GetType().Name,
+                            Type = ent.GetRXClass().DxfName,
+                            Layer = ent.Layer,
+                            Bounds = ext
+                        };
+
+                        result.Add(node);
+                    }
+                    catch
+                    {
+                        // GeometricExtents 실패하는 경우 (예: Proxy, 빈 객체)
+                        continue;
+                    }
+                }
+            }
+
+            tr.Commit();
+            return result;
+        }
+
+        [CommandMethod("EXTRACT_VISUAL_JSON")]
+        public void RunExtractVisualJson()
+        {
+            Document doc = Application.DocumentManager.MdiActiveDocument;
+            Database db = doc.Database;
+
+
+            System.Diagnostics.Debug.WriteLine(
+                $"DB Extents: {db.Extmin.X},{db.Extmin.Y} ~ {db.Extmax.X},{db.Extmax.Y}"
+            );
+
+            Editor ed = doc.Editor;
+
+            try
+            {
+                var nodes = ReadSpatialNodes(db);
+
+                var engine = new VisualHierarchyEngine();
+                var root = engine.BuildVisualTree(nodes);
+
+                DumpTree(root, 0);
+            }
+            catch (System.Exception ex)
+            {
+                ed.WriteMessage($"\n[오류] {ex}");
+            }
+        }
+
+        private static void DumpTree(SpatialNode node, int depth)
+        {
+            string indent = new string(' ', depth * 2);
+
+            System.Diagnostics.Debug.WriteLine($"{indent}{node.Name} ({node.Type}) " +
+                              $"[{node.MinX:F0},{node.MinY:F0} ~ {node.MaxX:F0},{node.MaxY:F0}]");
+
+            if (node.Children == null) return;
+
+            foreach (var child in node.Children)
+                DumpTree(child, depth + 1);
+        }
+
+        /*
+        [CommandMethod("FLUX_EXPORT_VECTOR_PDF")]
+        public void ExportVectorPdf()
+        {
+            Document doc = Application.DocumentManager.MdiActiveDocument;
+            Database db = doc.Database;
+            Editor ed = doc.Editor;
+
+            // 1. 시스템 변수 설정 (글자 뭉개짐 방지 핵심)
+            // PDFSHX: 0 (SHX 글자를 주석으로 처리 안함 -> 선으로 그림)
+            //Application.SetSystemVariable("PDFSHX", 0);
+
+            try
+            {
+                using (Transaction tr = db.TransactionManager.StartTransaction())
+                {
+                    // 1. 시스템 변수 설정 (예외 방지를 위해 try-catch로 감싸거나 직접 설정)
+                    try
+                    {
+                        // 문자열로 직접 명령어를 날리는 방식이 API보다 안정적일 때가 있습니다.
+                        Application.SetSystemVariable("PDFSHX", 0);
+                    }
+                    catch
+                    {
+                        ed.WriteMessage("\n[주의] PDFSHX 변수를 설정할 수 없습니다. 기본값으로 진행합니다.");
+                    }
+
+                    BlockTableRecord btr = (BlockTableRecord)tr.GetObject(SymbolUtilityServices.GetBlockModelSpaceId(db), OpenMode.ForRead);
+
+                    // 2. 출력 설정 (PlotSettings)
+                    PlotSettings ps = new PlotSettings(true);
+                    PlotSettingsValidator psv = PlotSettingsValidator.Current;
+
+                    // 전체 범위를 출력 영역으로 설정 (Zoom Extents 효과)
+                    psv.SetPlotType(ps, Teigha.DatabaseServices.PlotType.Extents);
+                    psv.SetUseStandardScale(ps, true);
+                    psv.SetStdScaleType(ps, StdScaleType.ScaleToFit); // 화면에 맞춤
+                    psv.SetPlotConfigurationName(ps, "Print As PDF.pc3", "ISO_full_bleed_A0_(841.00_x_1189.00_MM)"); // 대형 사이즈 지정
+                    psv.SetPlotCentered(ps, true);
+
+                    // 3. 텍스트를 선으로 변환하는 핵심 옵션 (가상 프린터 설정에 따라 다를 수 있음)
+                    // BricsCAD의 경우 기본 PDF 내보내기 엔진이 이 설정을 따릅니다.
+
+                    string dwgName = Path.GetFileNameWithoutExtension(db.Filename);
+                    string outputDir = Path.GetDirectoryName(db.Filename);
+                    string pdfPath = Path.Combine(outputDir, dwgName + "_Vector.pdf");
+
+                    // 4. 내보내기 실행 (간이 방식: EXPORT 명령 호출이 가장 안정적일 때가 많습니다)
+                    // 하이픈(-)을 붙여 대화상자를 억제합니다.
+                    ed.Command("-EXPORT", pdfPath);
+
+                    tr.Commit();
+                    ed.WriteMessage($"\n[성공] 글자가 선으로 변환된 PDF 생성 완료: {pdfPath}");
+                }
+            }
+            catch (System.Exception ex)
+            {
+                ed.WriteMessage($"\n[실패] PDF 내보내기 중 오류: {ex.Message}");
+            }
+        }
+        */
+
+        [CommandMethod("FLUX_EXPORT_VECTOR_PDF")]
+        public void ExportVectorPdf()
+        {
+            Document doc = Application.DocumentManager.MdiActiveDocument;
+            if (doc == null) return;
+
+            Database db = doc.Database;
+
+            // 1. 경로 자동 계산
+            string dwgPath = db.Filename;
+            if (string.IsNullOrEmpty(dwgPath)) return;
+
+            string pdfPath = Path.Combine(Path.GetDirectoryName(dwgPath),
+                             Path.GetFileNameWithoutExtension(dwgPath) + "_Vector.pdf");
+
+            // 2. 명령어 문자열 구성
+            // -EXPORT -> PDF -> 파일경로
+            // 마지막에 공백(" ")은 엔터(Enter) 키 역할을 합니다.
+            string cmd = $"-EXPORT\nPDF\n\"{pdfPath}\"\n";
+
+            // 3. 엔진에 직접 명령 전달 (비동기 안전 방식)
+            doc.SendStringToExecute(cmd, true, false, false);
+
+            doc.Editor.WriteMessage($"\n[실행] PDF 내보내기 명령을 전달했습니다: {pdfPath}");
+        }
+
+        [CommandMethod("FLUX_EXPORT_HD_FULL")]
+        public void FluxExportHdFull()
+        {
+            Document doc = Application.DocumentManager.MdiActiveDocument;
+            Editor ed = doc.Editor;
+
+            // GsView가 null인 경우, 시스템 환경을 강제로 고화질로 세팅하고 명령어로 밀어붙입니다.
+            Application.SetSystemVariable("ANTIALIASSCREEN", 2); // 안티앨리어싱 ON
+            Application.SetSystemVariable("LWDISPLAY", 0);      // 선 두께 OFF (선명도 확보)
+
+            ed.Command("._ZOOM", "_E");
+            ed.Regen();
+
+            string path = Path.Combine(Path.GetDirectoryName(doc.Database.Filename), "Full_Drawing_HD.png");
+
+            // 만약 PNGOUT이 해상도가 낮다면, BricsCAD 창을 최대한 키운 상태에서 
+            // 아래 명령어를 날리는 것이 현재로선 가장 확실합니다.
+            ed.Command("PNGOUT", "\"" + path + "\"", "_ALL", "");
+
+            ed.WriteMessage($"\n[완료] 전체 이미지 생성 시도 완료: {path}");
+        }
+
+        
+
+        [CommandMethod("FLUX_EXPORT_FULL")]
+        public void FluxExportFull()
+        {
+            Document doc = Application.DocumentManager.MdiActiveDocument;
+            Database db = doc.Database;
+            Editor ed = doc.Editor;
+
+            try
+            {
+                // 1. 전체 화면 줌 (모든 객체가 보이게 함)
+                ed.Command("._ZOOM", "_E");
+                ed.Regen();
+
+                // 2. 경로 설정 (도면과 같은 폴더)
+                string dwgPath = db.Filename;
+                string outputDir = Path.GetDirectoryName(dwgPath) ?? "F:\\temp";
+                string fullPath = Path.Combine(outputDir, "Full_Drawing.png");
+
+                // 3. 전체 내보내기 (PNGOUT 활용)
+                // PNGOUT -> 파일경로 -> ALL(모든객체) -> 엔터
+                ed.Command("PNGOUT", "\"" + fullPath + "\"", "_ALL", "");
+
+                ed.WriteMessage($"\n[완료] 전체 도면 이미지 생성: {fullPath}");
+                ed.WriteMessage("\n이제 이 이미지를 파이썬 분석 프로그램에 넣으세요.");
+            }
+            catch (System.Exception ex)
+            {
+                ed.WriteMessage($"\n[오류] 전체 내보내기 실패: {ex.Message}");
+            }
+        }
+
+        [CommandMethod("FLUX_SMART_CAPTURE")]
+        public void FluxSmartCapture()
+        {
+            Document doc = Application.DocumentManager.MdiActiveDocument;
+            Editor ed = doc.Editor;
+
+            try
+            {
+                // 1. 파이썬이 생성한 capture_plan.json 선택
+                var ofd = new PromptOpenFileOptions("\ncapture_plan.json을 선택하세요") { Filter = "JSON Files (*.json)|*.json" };
+                var res = ed.GetFileNameForOpen(ofd);
+                if (res.Status != PromptStatus.OK) return;
+
+                // 2. 플랜 로드
+                string jsonContent = File.ReadAllText(res.StringResult);
+                JArray plan = JArray.Parse(jsonContent);
+
+                string outputDir = Path.Combine(Path.GetDirectoryName(res.StringResult), "Final_Gold_Images");
+                if (!Directory.Exists(outputDir)) Directory.CreateDirectory(outputDir);
+
+                ed.WriteMessage($"\n[FluxCAD] 총 {plan.Count}개의 유효 구역을 발견했습니다. 추출을 시작합니다...");
+
+                int count = 0;
+                foreach (var zone in plan)
+                {
+                    string id = zone["id"].ToString();
+                    double minX = (double)zone["min"][0];
+                    double minY = (double)zone["min"][1];
+                    double maxX = (double)zone["max"][0];
+                    double maxY = (double)zone["max"][1];
+
+                    // 3. 정확한 좌표로 줌 및 캡처
+                    CaptureTargetZone(doc, id, new Point2d(minX, minY), new Point2d(maxX, maxY), outputDir);
+                    count++;
+
+                    if (count % 10 == 0) ed.WriteMessage($"\n[진행중] {count}/{plan.Count} 완료...");
+                }
+
+                ed.WriteMessage($"\n[완료] 빈 화면 없이 {count}개의 핵심 이미지가 저장되었습니다: {outputDir}");
+            }
+            catch (System.Exception ex) { ed.WriteMessage($"\n[오류] {ex.Message}"); }
+        }
+
+        private void CaptureTargetZone(Document doc, string id, Point2d min, Point2d max, string outputDir)
+        {
+            Editor ed = doc.Editor;
+            using (ViewTableRecord view = new ViewTableRecord())
+            {
+                view.CenterPoint = new Point2d((min.X + max.X) / 2, (min.Y + max.Y) / 2);
+                view.Height = (max.Y - min.Y) * 1.1; // 10% 여유
+                view.Width = (max.X - min.X) * 1.1;
+                ed.SetCurrentView(view);
+            }
+            ed.Regen();
+
+            string fullPath = Path.Combine(outputDir, $"Zone_{id}.png");
+            ed.Command("PNGOUT", "\"" + fullPath + "\"", "ALL", "");
+        }
+
+        [CommandMethod("FLUX_SMART_GRID")]
+        public void FluxSmartGridExport()
+        {
+            Document doc = Application.DocumentManager.MdiActiveDocument;
+            Database db = doc.Database;
+            Editor ed = doc.Editor;
+
+            try
+            {
+                // 1. JSON 읽기 및 모든 객체 경계(Bounds) 리스트화
+                var ofd = new PromptOpenFileOptions("\nspatial_tree.json을 선택하세요") { Filter = "JSON Files (*.json)|*.json" };
+                var res = ed.GetFileNameForOpen(ofd);
+                if (res.Status != PromptStatus.OK) return;
+
+                string jsonContent = File.ReadAllText(res.StringResult);
+                JObject root = JObject.Parse(jsonContent);
+
+                // 모든 객체의 Bounding Box를 리스트에 담음
+                List<Extents2d> objectBounds = new List<Extents2d>();
+                CollectBounds(root, objectBounds);
+
+                if (objectBounds.Count == 0)
+                {
+                    ed.WriteMessage("\n[오류] JSON에서 유효한 객체 정보를 찾을 수 없습니다.");
+                    return;
+                }
+
+                // 2. 실제 콘텐츠의 전체 범위 산출
+                double minX = objectBounds.Min(b => b.MinPoint.X);
+                double minY = objectBounds.Min(b => b.MinPoint.Y);
+                double maxX = objectBounds.Max(b => b.MaxPoint.X);
+                double maxY = objectBounds.Max(b => b.MaxPoint.Y);
+
+                // 3. 타일 설정 (더 작게 잡을수록 해상도가 올라감)
+                double tileWorldSize = 500.0; // 1000에서 500으로 줄여 해상도 2배 확보
+                double overlap = tileWorldSize * 0.2; // 20% 중첩
+
+                string outputDir = Path.Combine(Path.GetDirectoryName(res.StringResult), "Smart_Tiles");
+                if (!Directory.Exists(outputDir)) Directory.CreateDirectory(outputDir);
+
+                int colCount = (int)Math.Ceiling((maxX - minX) / (tileWorldSize - overlap));
+                int rowCount = (int)Math.Ceiling((maxY - minY) / (tileWorldSize - overlap));
+
+                ed.WriteMessage($"\n[FluxCAD] 분석 완료: {objectBounds.Count}개 객체 식별됨.");
+                ed.WriteMessage($"\n[FluxCAD] {colCount}x{rowCount} 그리드 중 유효 구역만 추출을 시작합니다...");
+
+                int savedCount = 0;
+                for (int r = 0; r < rowCount; r++)
+                {
+                    for (int c = 0; c < colCount; c++)
+                    {
+                        double tMinX = minX + (c * (tileWorldSize - overlap));
+                        double tMinY = minY + (r * (tileWorldSize - overlap));
+                        Extents2d tileExt = new Extents2d(tMinX, tMinY, tMinX + tileWorldSize, tMinY + tileWorldSize);
+
+                        // 핵심: 해당 타일에 객체가 하나라도 걸쳐있는지 확인
+                        if (objectBounds.Any(obj => Intersects(obj, tileExt)))
+                        {
+                            CaptureTile(doc, $"R{r}_C{c}", tileExt.MinPoint, tileExt.MaxPoint, outputDir);
+                            savedCount++;
+                        }
+                    }
+                }
+                ed.WriteMessage($"\n[완료] 빈 타일 제외 총 {savedCount}개의 고해상도 이미지가 저장되었습니다.");
+            }
+            catch (System.Exception ex)
+            {
+                ed.WriteMessage($"\n[오류] 실행 중 에러: {ex.Message}");
+            }
+        }
+
+        // JSON 트리를 돌며 객체 좌표만 수집하는 헬퍼 함수
+        private void CollectBounds(JToken node, List<Extents2d> list)
+        {
+            var b = node["Bounds"];
+            if (b != null && node["Id"]?.ToString() != "ROOT")
+            {
+                try
+                {
+                    list.Add(new Extents2d(
+                        (double)b["MinPoint"]["X"], (double)b["MinPoint"]["Y"],
+                        (double)b["MaxPoint"]["X"], (double)b["MaxPoint"]["Y"]
+                    ));
+                }
+                catch { }
+            }
+            foreach (var child in node["Children"] ?? Enumerable.Empty<JToken>()) CollectBounds(child, list);
+        }
+
+        // 타일과 객체가 겹치는지 판정하는 간단한 함수
+        private bool Intersects(Extents2d a, Extents2d b)
+        {
+            return (a.MinPoint.X <= b.MaxPoint.X && a.MaxPoint.X >= b.MinPoint.X &&
+                    a.MinPoint.Y <= b.MaxPoint.Y && a.MaxPoint.Y >= b.MinPoint.Y);
+        }
+
+        [CommandMethod("FLUX_GRID_EXPORT")]
+        public void FluxGridExport()
+        {
+            Document doc = Application.DocumentManager.MdiActiveDocument;
+            Database db = doc.Database;
+            Editor ed = doc.Editor;
+
+            try
+            {
+                // 1. 도면 전체 범위 산출 (가장 안전한 방법)
+                Point3d min, max;
+
+                // 도면에 데이터가 하나도 없을 경우를 대비해 초기화
+                // Extentsmin/max는 시스템 변수이며 도면의 데이터 한계점을 나타냅니다.
+                min = db.Extmin;
+                max = db.Extmax;
+
+                double dwgWidth = max.X - min.X;
+                double dwgHeight = max.Y - min.Y;
+
+                // 만약 도면이 비어있거나 범위가 비정상적이면 중단
+                if (dwgWidth <= 0 || dwgHeight <= 0)
+                {
+                    ed.WriteMessage("\n[오류] 도면의 범위가 올바르지 않습니다. 객체가 있는지 확인하세요.");
+                    return;
+                }
+
+                // 2. 타일 설정 (도면 단위 기준, 예: 1000mm x 1000mm)
+                // AI가 식별 가능한 해상도를 위해 타일 크기를 적절히 조절하세요.
+                double tileWorldSize = 1000.0;
+                double overlap = tileWorldSize * 0.1; // 10% 중첩 (경계 객체 소실 방지)
+
+                string outputDir = Path.Combine(Path.GetDirectoryName(db.Filename) ?? "F:\\temp", "Grid_Tiles");
+                if (!Directory.Exists(outputDir)) Directory.CreateDirectory(outputDir);
+
+                // 타일 개수 계산
+                int colCount = (int)Math.Ceiling(dwgWidth / (tileWorldSize - overlap));
+                int rowCount = (int)Math.Ceiling(dwgHeight / (tileWorldSize - overlap));
+
+                ed.WriteMessage($"\n[FluxCAD] 전체 범위: {min} to {max}");
+                ed.WriteMessage($"\n[FluxCAD] 그리드 추출 시작: {colCount}x{rowCount} 타일 생성 중...");
+
+                for (int r = 0; r < rowCount; r++)
+                {
+                    for (int c = 0; c < colCount; c++)
+                    {
+                        double curX = min.X + (c * (tileWorldSize - overlap));
+                        double curY = min.Y + (r * (tileWorldSize - overlap));
+
+                        Point2d tileMin = new Point2d(curX, curY);
+                        Point2d tileMax = new Point2d(curX + tileWorldSize, curY + tileWorldSize);
+
+                        string tileId = $"Row{r}_Col{c}";
+                        CaptureTile(doc, tileId, tileMin, tileMax, outputDir);
+                    }
+                }
+                ed.WriteMessage($"\n[완료] {colCount * rowCount}개의 타일이 저장되었습니다: {outputDir}");
+            }
+            catch (System.Exception ex)
+            {
+                ed.WriteMessage($"\n[오류] 그리드 추출 중 에러: {ex.Message}");
+            }
+        }
+
+        private void CaptureTile(Document doc, string tileId, Point2d min, Point2d max, string outputDir)
+        {
+            Editor ed = doc.Editor;
+
+            // Viewport 설정
+            using (ViewTableRecord view = new ViewTableRecord())
+            {
+                view.CenterPoint = new Point2d((min.X + max.X) / 2, (min.Y + max.Y) / 2);
+                view.Height = max.Y - min.Y;
+                view.Width = max.X - min.X;
+                ed.SetCurrentView(view);
+            }
+
+            ed.Regen(); // 화면 갱신
+
+            string fullPath = Path.Combine(outputDir, $"Tile_{tileId}.png");
+            string cmdPath = "\"" + fullPath + "\"";
+
+            // PNGOUT 시퀀스: 파일경로 -> 전체(ALL) -> 엔터
+            ed.Command("PNGOUT", cmdPath, "ALL", "");
+        }
+
         [CommandMethod("FLUX_EXPORT_PARTS")]
         public void FluxExportParts()
         {
@@ -93,6 +997,47 @@ namespace FluxCAD.BricsCAD.Plugin26
         {
             Editor ed = doc.Editor;
 
+            // 1. 해당 영역으로 View 설정
+            using (ViewTableRecord view = new ViewTableRecord())
+            {
+                double width = max.X - min.X;
+                double height = max.Y - min.Y;
+                view.CenterPoint = new Point2d(min.X + width / 2, min.Y + height / 2);
+                view.Height = height * 1.1; // 10% 여유
+                view.Width = width * 1.1;
+                ed.SetCurrentView(view);
+            }
+
+            ed.Regen(); // 그래픽 갱신
+
+            // 2. 파일 경로 설정
+            string fileName = $"Part_{id}_{type}.png";
+            string fullPath = Path.Combine(outputDir, fileName);
+
+            // BricsCAD 명령어 내에서 경로 공백 문제를 방지하기 위해 따옴표 처리
+            string cmdPath = "\"" + fullPath + "\"";
+
+            try
+            {
+                // PNGOUT 명령어 실행 흐름:
+                // 1. 파일 경로 입력
+                // 2. 객체 선택 (현재 화면 전체를 잡기 위해 'ALL' 입력)
+                // 3. 엔터(빈 문자열 "")를 입력하여 선택 완료
+                ed.Command("PNGOUT", cmdPath, "ALL", "");
+
+                ed.WriteMessage($"\n[성공] 저장됨: {fileName}");
+            }
+            catch (System.Exception ex)
+            {
+                ed.WriteMessage($"\n[실패] {id} 저장 중 오류: {ex.Message}");
+            }
+        }
+
+        /*
+        private void CaptureGsSnapshot(Document doc, string id, string type, Point2d min, Point2d max, string outputDir)
+        {
+            Editor ed = doc.Editor;
+
             // 1. 해당 영역으로 View 설정 (Zoom Window)
             using (ViewTableRecord view = new ViewTableRecord())
             {
@@ -125,6 +1070,7 @@ namespace FluxCAD.BricsCAD.Plugin26
                 }
             }
         }
+        */
 
         [CommandMethod("FLUX_AI_RECOGNIZE")]
         public void FluxAiRecognize()

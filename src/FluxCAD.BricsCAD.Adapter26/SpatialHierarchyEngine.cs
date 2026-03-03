@@ -10,6 +10,21 @@ namespace FluxCAD.BricsCAD.Adapter26
 {
     public class SpatialHierarchyEngine
     {
+        public SpatialNode BuildTree2(List<SpatialNode> allNodes)
+        {
+            // 1. 면적이 큰 순서대로 정렬 (큰 놈이 부모가 될 확률이 높음)
+            var sortedNodes = allNodes.OrderByDescending(n => GetArea(n.Bounds)).ToList();
+
+            SpatialNode root = new SpatialNode { Id = "ROOT", Type = "ROOT" };
+
+            foreach (var node in sortedNodes)
+            {
+                InsertNode(root, node);
+            }
+            return root;
+        }
+
+
         public SpatialNode BuildTree(List<SpatialNode> allNodes)
         {
             // 1. 면적이 큰 순서대로 정렬 (큰 놈이 부모가 될 확률이 높음)
