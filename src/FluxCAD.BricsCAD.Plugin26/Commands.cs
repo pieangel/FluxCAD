@@ -18,6 +18,2000 @@ namespace FluxCAD.BricsCAD.Plugin26
     public class Commands
     {
         List<Entity> _flattened = new List<Entity>();
+
+        [CommandMethod("FLUX_EXPORT_GRID_TEST")]
+        public void FluxExportGridTest()
+        {
+            var doc = Application.DocumentManager.MdiActiveDocument;
+            var db = doc.Database;
+            var ed = doc.Editor;
+
+            const int COLS = 10;
+            const double GAP = 200.0;
+
+            using (var tr = db.TransactionManager.StartTransaction())
+            {
+                var ms = (BlockTableRecord)tr.GetObject(
+                    SymbolUtilityServices.GetBlockModelSpaceId(db),
+                    OpenMode.ForRead);
+
+                var allBlocks = new List<(BlockReference br, Extents3d ext)>();
+
+                foreach (ObjectId id in ms)
+                {
+                    if (!id.ObjectClass.IsDerivedFrom(
+                        RXClass.GetClass(typeof(BlockReference))))
+                        continue;
+
+                    var br = tr.GetObject(id, OpenMode.ForRead) as BlockReference;
+                    if (br == null) continue;
+
+                    try
+                    {
+                        allBlocks.Add((br, br.GeometricExtents));
+                    }
+                    catch { }
+                }
+
+                var sheets = new List<(BlockReference br, Extents3d ext)>();
+
+                for (int i = 0; i < allBlocks.Count; i++)
+                {
+                    bool inside = false;
+
+                    for (int j = 0; j < allBlocks.Count; j++)
+                    {
+                        if (i == j) continue;
+
+                        if (IsInside(allBlocks[j].ext, allBlocks[i].ext))
+                        {
+                            inside = true;
+                            break;
+                        }
+                    }
+
+                    if (!inside)
+                        sheets.Add(allBlocks[i]);
+                }
+
+                ed.WriteMessage($"\n[FLUX] Sheet Count: {sheets.Count}");
+
+                sheets = sheets
+                    .OrderByDescending(s => s.ext.MinPoint.Y)
+                    .ThenBy(s => s.ext.MinPoint.X)
+                    .ToList();
+
+                double maxWidth = 0;
+                double maxHeight = 0;
+
+                foreach (var s in sheets)
+                {
+                    double w = s.ext.MaxPoint.X - s.ext.MinPoint.X;
+                    double h = s.ext.MaxPoint.Y - s.ext.MinPoint.Y;
+
+                    if (w > maxWidth)
+                        maxWidth = w;
+
+                    if (h > maxHeight)
+                        maxHeight = h;
+                }
+
+                // 안전 margin
+                maxWidth += 200;
+                maxHeight += 200;
+
+                string folder = Path.GetDirectoryName(doc.Name);
+                string name = Path.GetFileNameWithoutExtension(doc.Name);
+
+                string tempFolder = Path.Combine(folder, name + "_sheets");
+
+                if (Directory.Exists(tempFolder))
+                {
+                    Directory.Delete(tempFolder, true);
+                }
+
+                Directory.CreateDirectory(tempFolder);
+
+                List<string> sheetFiles = new List<string>();
+
+                for (int i = 0; i < sheets.Count; i++)
+                {
+                    string path = Path.Combine(
+                        tempFolder,
+                        $"{name}_sheet_{i + 1:D3}.dwg");
+
+                    ExportSheet(db, tr, sheets[i].ext, path);
+
+                    sheetFiles.Add(path);
+                }
+
+                tr.Commit();
+
+                string masterPath = Path.Combine(folder, name + "_grid.dwg");
+
+                CreateMasterDrawing(
+                    sheetFiles,
+                    masterPath,
+                    COLS,
+                    GAP,
+                    maxWidth,
+                    maxHeight);
+
+                ed.WriteMessage($"\n[FLUX] Grid drawing created: {masterPath}");
+            }
+        }
+
+        private void CreateMasterDrawing(
+            List<string> sheetFiles,
+            string outputPath,
+            int cols,
+            double gap,
+            double sheetWidth,
+            double sheetHeight)
+        {
+            Database masterDb = new Database(true, true);
+
+            using (var tr = masterDb.TransactionManager.StartTransaction())
+            {
+                var ms = (BlockTableRecord)tr.GetObject(
+                    SymbolUtilityServices.GetBlockModelSpaceId(masterDb),
+                    OpenMode.ForWrite);
+
+
+                for (int i = 0; i < sheetFiles.Count; i++)
+                {
+                    int row = i / cols;
+                    int col = i % cols;
+
+                    double dx = col * (sheetWidth + gap);
+                    double dy = -row * (sheetHeight + gap);
+
+                    using (Database sheetDb = new Database(false, true))
+                    {
+                        sheetDb.ReadDwgFile(sheetFiles[i], FileShare.Read, true, "");
+
+                        ObjectId blockId =
+                            masterDb.Insert(
+                                Path.GetFileNameWithoutExtension(sheetFiles[i]),
+                                sheetDb,
+                                false);
+
+                        BlockReference br = new BlockReference(
+                            new Point3d(dx, dy, 0),
+                            blockId);
+
+                        ms.AppendEntity(br);
+                        tr.AddNewlyCreatedDBObject(br, true);
+                    }
+                }
+
+                tr.Commit();
+            }
+
+            masterDb.SaveAs(outputPath, DwgVersion.Current);
+        }
+
+
+        void ExportSheet(
+            Database sourceDb,
+            Transaction tr,
+            Extents3d sheetExt,
+            string filePath)
+        {
+            var ms = (BlockTableRecord)tr.GetObject(
+                SymbolUtilityServices.GetBlockModelSpaceId(sourceDb),
+                OpenMode.ForRead);
+
+            ObjectIdCollection ids = new ObjectIdCollection();
+
+            foreach (ObjectId id in ms)
+            {
+                var ent = tr.GetObject(id, OpenMode.ForRead) as Entity;
+                if (ent == null) continue;
+
+                try
+                {
+                    var ext = ent.GeometricExtents;
+
+                    if (IsInside(sheetExt, ext))
+                        ids.Add(id);
+                }
+                catch { }
+            }
+
+            Database newDb = new Database(true, true);
+
+            using (var tr2 = newDb.TransactionManager.StartTransaction())
+            {
+                var bt = (BlockTable)tr2.GetObject(
+                    newDb.BlockTableId,
+                    OpenMode.ForRead);
+
+                var newMs = (BlockTableRecord)tr2.GetObject(
+                    bt[BlockTableRecord.ModelSpace],
+                    OpenMode.ForWrite);
+
+                IdMapping mapping = new IdMapping();
+
+                // 객체 복사
+                sourceDb.WblockCloneObjects(
+                    ids,
+                    newMs.ObjectId,
+                    mapping,
+                    DuplicateRecordCloning.Ignore,
+                    false);
+
+                // ⭐ 핵심 수정: Sheet 좌표를 (0,0) 기준으로 이동
+                Matrix3d move =
+                    Matrix3d.Displacement(
+                        new Vector3d(
+                            -sheetExt.MinPoint.X,
+                            -sheetExt.MinPoint.Y,
+                            0));
+
+                foreach (IdPair pair in mapping)
+                {
+                    if (!pair.IsCloned) continue;
+
+                    var ent = tr2.GetObject(
+                        pair.Value,
+                        OpenMode.ForWrite) as Entity;
+
+                    if (ent == null) continue;
+
+                    ent.TransformBy(move);
+                }
+
+                tr2.Commit();
+            }
+
+            newDb.SaveAs(filePath, DwgVersion.Current);
+        }
+
+        private void CreateMasterDrawing(
+            List<string> sheetFiles,
+            string outputPath,
+            int cols,
+            double gap)
+        {
+            Database masterDb = new Database(true, true);
+
+            using (var tr = masterDb.TransactionManager.StartTransaction())
+            {
+                var ms = (BlockTableRecord)tr.GetObject(
+                    SymbolUtilityServices.GetBlockModelSpaceId(masterDb),
+                    OpenMode.ForWrite);
+
+                double sheetWidth = 0;
+                double sheetHeight = 0;
+
+                for (int i = 0; i < sheetFiles.Count; i++)
+                {
+                    int row = i / cols;
+                    int col = i % cols;
+
+                    using (Database sheetDb = new Database(false, true))
+                    {
+                        sheetDb.ReadDwgFile(
+                            sheetFiles[i],
+                            FileShare.Read,
+                            true,
+                            "");
+
+                        ObjectId blockId =
+                            masterDb.Insert(
+                                Path.GetFileNameWithoutExtension(sheetFiles[i]),
+                                sheetDb,
+                                false);
+
+                        double dx = col * (sheetWidth + gap);
+                        double dy = -row * (sheetHeight + gap);
+
+                        BlockReference br = new BlockReference(
+                            new Point3d(dx, dy, 0),
+                            blockId);
+
+                        ms.AppendEntity(br);
+                        tr.AddNewlyCreatedDBObject(br, true);
+                    }
+                }
+
+                tr.Commit();
+            }
+
+            masterDb.SaveAs(outputPath, DwgVersion.Current);
+        }
+
+        [CommandMethod("FLUX_EXPORT_SHEETS_GRID")]
+        public void ExportSheets_Grid_BricsCAD()
+        {
+            var doc = Application.DocumentManager.MdiActiveDocument;
+            var db = doc.Database;
+            var ed = doc.Editor;
+
+            using (var tr = db.TransactionManager.StartTransaction())
+            {
+                var ms = (BlockTableRecord)tr.GetObject(
+                    SymbolUtilityServices.GetBlockModelSpaceId(db),
+                    OpenMode.ForRead);
+
+                var allBlocks = new List<(BlockReference br, Extents3d ext)>();
+
+                foreach (ObjectId id in ms)
+                {
+                    if (!id.ObjectClass.IsDerivedFrom(
+                        RXClass.GetClass(typeof(BlockReference))))
+                        continue;
+
+                    var br = tr.GetObject(id, OpenMode.ForRead) as BlockReference;
+                    if (br == null) continue;
+
+                    try
+                    {
+                        allBlocks.Add((br, br.GeometricExtents));
+                    }
+                    catch { }
+                }
+
+                var sheets = new List<(BlockReference br, Extents3d ext)>();
+
+                for (int i = 0; i < allBlocks.Count; i++)
+                {
+                    bool inside = false;
+
+                    for (int j = 0; j < allBlocks.Count; j++)
+                    {
+                        if (i == j) continue;
+
+                        if (IsInside(allBlocks[j].ext, allBlocks[i].ext))
+                        {
+                            inside = true;
+                            break;
+                        }
+                    }
+
+                    if (!inside)
+                        sheets.Add(allBlocks[i]);
+                }
+
+                ed.WriteMessage($"\n[FLUX] Sheet Count: {sheets.Count}");
+
+                sheets = sheets
+                    .OrderByDescending(s => s.ext.MinPoint.Y)
+                    .ThenBy(s => s.ext.MinPoint.X)
+                    .ToList();
+
+                string folder = Path.GetDirectoryName(doc.Name);
+
+                string path = Path.Combine(folder, "all_sheets_grid.dwg");
+
+                ExportSheetsToSingleFile(db, tr, sheets, path);
+
+                tr.Commit();
+            }
+        }
+
+        private void ExportSheetsToSingleFile(
+    Database sourceDb,
+    Transaction tr,
+    List<(BlockReference br, Extents3d ext)> sheets,
+    string outputPath)
+        {
+            const double GAP = 50.0;
+            const int COLS = 10;
+            const double START_MARGIN = 200.0;
+
+            Database newDb = new Database(true, true);
+
+            using (var newTr = newDb.TransactionManager.StartTransaction())
+            {
+                var newMs = (BlockTableRecord)newTr.GetObject(
+                    SymbolUtilityServices.GetBlockModelSpaceId(newDb),
+                    OpenMode.ForWrite);
+
+                for (int i = 0; i < sheets.Count; i++)
+                {
+                    var sheet = sheets[i];
+
+                    int row = i / COLS;
+                    int col = i % COLS;
+
+                    double width = sheet.ext.MaxPoint.X - sheet.ext.MinPoint.X;
+                    double height = sheet.ext.MaxPoint.Y - sheet.ext.MinPoint.Y;
+
+                    double dx = START_MARGIN + col * (width + GAP) - sheet.ext.MinPoint.X;
+                    double dy = -row * (height + GAP) - sheet.ext.MinPoint.Y;
+
+                    Matrix3d move = Matrix3d.Displacement(
+                        new Vector3d(dx, dy, 0));
+
+                    ObjectIdCollection ids =
+                        CollectEntitiesInside(sourceDb, tr, sheet.ext);
+
+//                     IdMapping map = new IdMapping();
+// 
+//                     sourceDb.DeepCloneObjects(
+//                         ids,
+//                         newMs.ObjectId,
+//                         map,
+//                         false);
+
+//                     IdMapping map = new IdMapping();
+// 
+//                     sourceDb.WblockCloneObjects(
+//                         ids,
+//                         newMs.ObjectId,
+//                         map,
+//                         DuplicateRecordCloning.Ignore,
+//                         false);
+
+
+                    IdMapping map = new IdMapping();
+
+                    sourceDb.WblockCloneObjects(
+                        ids,
+                        newMs.ObjectId,
+                        map,
+                        DuplicateRecordCloning.Ignore,
+                        false);
+
+                    foreach (IdPair pair in map)
+                    {
+                        if (!pair.IsCloned) continue;
+
+                        var ent = newTr.GetObject(pair.Value, OpenMode.ForWrite) as Entity;
+                        ent?.TransformBy(move);
+                    }
+                }
+
+                newTr.Commit();
+            }
+
+            newDb.SaveAs(outputPath, DwgVersion.Current);
+        }
+
+        private ObjectIdCollection CollectEntitiesInside(
+    Database db,
+    Transaction tr,
+    Extents3d sheetExt)
+        {
+            var ids = new ObjectIdCollection();
+
+            var ms = (BlockTableRecord)tr.GetObject(
+                SymbolUtilityServices.GetBlockModelSpaceId(db),
+                OpenMode.ForRead);
+
+            foreach (ObjectId id in ms)
+            {
+                var ent = tr.GetObject(id, OpenMode.ForRead) as Entity;
+                if (ent == null) continue;
+
+                try
+                {
+                    // ⭐ BlockReference는 Position으로 판단
+                    if (ent is BlockReference br)
+                    {
+                        var p = br.Position;
+
+                        if (p.X >= sheetExt.MinPoint.X &&
+                            p.X <= sheetExt.MaxPoint.X &&
+                            p.Y >= sheetExt.MinPoint.Y &&
+                            p.Y <= sheetExt.MaxPoint.Y)
+                        {
+                            ids.Add(id);
+                        }
+
+                        continue;
+                    }
+
+                    // 일반 entity는 extents 사용
+                    var e = ent.GeometricExtents;
+
+                    if (IsInside(sheetExt, e))
+                        ids.Add(id);
+                }
+                catch
+                {
+                    // ignore
+                }
+            }
+
+            return ids;
+        }
+
+
+        private ObjectIdCollection CollectEntitiesInside_old2(
+    Database db,
+    Transaction tr,
+    Extents3d ext)
+        {
+            var ids = new ObjectIdCollection();
+
+            var ms = (BlockTableRecord)tr.GetObject(
+                SymbolUtilityServices.GetBlockModelSpaceId(db),
+                OpenMode.ForRead);
+
+            foreach (ObjectId id in ms)
+            {
+                var ent = tr.GetObject(id, OpenMode.ForRead) as Entity;
+                if (ent == null) continue;
+
+                try
+                {
+                    var e = ent.GeometricExtents;
+
+                    if (!IsInside(ext, e))
+                        continue;
+
+                    ids.Add(id);
+
+                    // ⭐ BlockReference면 definition도 복사
+                    if (ent is BlockReference br)
+                    {
+                        var btr = (BlockTableRecord)tr.GetObject(
+                            br.BlockTableRecord,
+                            OpenMode.ForRead);
+
+                        ids.Add(btr.ObjectId);
+                    }
+                }
+                catch { }
+            }
+
+            return ids;
+        }
+
+        private ObjectIdCollection CollectEntitiesInside_old(
+    Database db,
+    Transaction tr,
+    Extents3d ext)
+        {
+            var ids = new ObjectIdCollection();
+
+            var ms = (BlockTableRecord)tr.GetObject(
+                SymbolUtilityServices.GetBlockModelSpaceId(db),
+                OpenMode.ForRead);
+
+            foreach (ObjectId id in ms)
+            {
+                var ent = tr.GetObject(id, OpenMode.ForRead) as Entity;
+                if (ent == null) continue;
+
+                try
+                {
+                    var e = ent.GeometricExtents;
+
+                    if (IsInside(ext, e))
+                        ids.Add(id);
+                }
+                catch { }
+            }
+
+            return ids;
+        }
+
+        [CommandMethod("FLUX_BUILD_SPATIAL_GROUPS")]
+        public void BuildSpatialGroupsCommand()
+        {
+            var doc = Application.DocumentManager.MdiActiveDocument;
+            var db = doc.Database;
+            var ed = doc.Editor;
+
+            using (var tr = db.TransactionManager.StartTransaction())
+            {
+                var bt = (BlockTable)tr.GetObject(db.BlockTableId, OpenMode.ForRead);
+                var ms = (BlockTableRecord)tr.GetObject(bt[BlockTableRecord.ModelSpace], OpenMode.ForWrite);
+
+                // 모든 entity 수집
+                var entityIds = new List<ObjectId>();
+
+                foreach (ObjectId id in ms)
+                {
+                    var ent = tr.GetObject(id, OpenMode.ForRead) as Entity;
+                    if (ent == null) continue;
+
+                    entityIds.Add(id);
+                }
+
+                ed.WriteMessage($"\n[FluxCAD] Entity count : {entityIds.Count}");
+
+                // Spatial Groups 생성
+                var groups = BuildSpatialGroups(entityIds, tr, 10.0);
+
+                ed.WriteMessage($"\n[FluxCAD] Groups detected : {groups.Count}");
+
+                int index = 1;
+
+                foreach (var g in groups)
+                {
+                    ed.WriteMessage(
+                        $"\nGroup {index} | Entities : {g.Entities.Count}");
+
+                    DrawBoundsRectangle(ms, g.Bounds);
+
+                    index++;
+                }
+
+                tr.Commit();
+            }
+        }
+
+        static void DrawBoundsRectangle(
+            BlockTableRecord ms,
+            Extents3d bounds)
+        {
+            var rect = new Polyline(4);
+
+            rect.AddVertexAt(0,
+                new Point2d(bounds.MinPoint.X, bounds.MinPoint.Y), 0, 0, 0);
+
+            rect.AddVertexAt(1,
+                new Point2d(bounds.MaxPoint.X, bounds.MinPoint.Y), 0, 0, 0);
+
+            rect.AddVertexAt(2,
+                new Point2d(bounds.MaxPoint.X, bounds.MaxPoint.Y), 0, 0, 0);
+
+            rect.AddVertexAt(3,
+                new Point2d(bounds.MinPoint.X, bounds.MaxPoint.Y), 0, 0, 0);
+
+            rect.Closed = true;
+
+            ms.AppendEntity(rect);
+        }
+        public static List<SpatialGroup> BuildSpatialGroups(
+            List<ObjectId> entityIds,
+            Transaction tr,
+            double eps = 10.0)
+        {
+            var boxes = new Dictionary<ObjectId, Extents3d>();
+
+            foreach (var id in entityIds)
+            {
+                var ent = tr.GetObject(id, OpenMode.ForRead) as Entity;
+                if (ent == null) continue;
+
+                try
+                {
+                    boxes[id] = ent.GeometricExtents;
+                }
+                catch { }
+            }
+
+            var visited = new HashSet<ObjectId>();
+            var groups = new List<SpatialGroup>();
+
+            foreach (var startId in boxes.Keys)
+            {
+                if (visited.Contains(startId))
+                    continue;
+
+                var group = new SpatialGroup();
+                var queue = new Queue<ObjectId>();
+
+                queue.Enqueue(startId);
+                visited.Add(startId);
+
+                while (queue.Count > 0)
+                {
+                    var current = queue.Dequeue();
+                    group.Entities.Add(current);
+
+                    foreach (var other in boxes.Keys)
+                    {
+                        if (visited.Contains(other))
+                            continue;
+
+                        if (BoxesTouch(boxes[current], boxes[other], eps))
+                        {
+                            visited.Add(other);
+                            queue.Enqueue(other);
+                        }
+                    }
+                }
+
+                group.Bounds = ComputeBounds(group.Entities, boxes);
+                groups.Add(group);
+            }
+
+            return groups;
+        }
+
+        static bool BoxesTouch(Extents3d a, Extents3d b, double eps)
+        {
+            if (a.MaxPoint.X + eps < b.MinPoint.X) return false;
+            if (b.MaxPoint.X + eps < a.MinPoint.X) return false;
+
+            if (a.MaxPoint.Y + eps < b.MinPoint.Y) return false;
+            if (b.MaxPoint.Y + eps < a.MinPoint.Y) return false;
+
+            return true;
+        }
+
+        static Extents3d ComputeBounds(
+            List<ObjectId> ids,
+            Dictionary<ObjectId, Extents3d> boxes)
+        {
+            var first = boxes[ids[0]];
+
+            double minX = first.MinPoint.X;
+            double minY = first.MinPoint.Y;
+            double maxX = first.MaxPoint.X;
+            double maxY = first.MaxPoint.Y;
+
+            foreach (var id in ids)
+            {
+                var b = boxes[id];
+
+                minX = Math.Min(minX, b.MinPoint.X);
+                minY = Math.Min(minY, b.MinPoint.Y);
+                maxX = Math.Max(maxX, b.MaxPoint.X);
+                maxY = Math.Max(maxY, b.MaxPoint.Y);
+            }
+
+            return new Extents3d(
+                new Point3d(minX, minY, 0),
+                new Point3d(maxX, maxY, 0));
+        }
+
+        [CommandMethod("FLUX_EXPORT_SHEETS")]
+        public void ExportSheets_BricsCAD()
+        {
+            var doc = Application.DocumentManager.MdiActiveDocument;
+            var db = doc.Database;
+            var ed = doc.Editor;
+
+            const double GAP = 50.0;
+            const int COLS = 10;
+            const double START_MARGIN = 200.0;
+
+            using (var tr = db.TransactionManager.StartTransaction())
+            {
+                var ms = (BlockTableRecord)tr.GetObject(
+                    SymbolUtilityServices.GetBlockModelSpaceId(db),
+                    OpenMode.ForRead);
+
+                var allBlocks = new List<(BlockReference br, Extents3d ext)>();
+
+                foreach (ObjectId id in ms)
+                {
+                    if (!id.ObjectClass.IsDerivedFrom(
+                        RXClass.GetClass(typeof(BlockReference))))
+                        continue;
+
+                    var br = tr.GetObject(id, OpenMode.ForRead) as BlockReference;
+                    if (br == null) continue;
+
+                    try
+                    {
+                        allBlocks.Add((br, br.GeometricExtents));
+                    }
+                    catch { }
+                }
+
+                var sheets = new List<(BlockReference br, Extents3d ext)>();
+
+                for (int i = 0; i < allBlocks.Count; i++)
+                {
+                    bool inside = false;
+
+                    for (int j = 0; j < allBlocks.Count; j++)
+                    {
+                        if (i == j) continue;
+
+                        if (IsInside(allBlocks[j].ext, allBlocks[i].ext))
+                        {
+                            inside = true;
+                            break;
+                        }
+                    }
+
+                    if (!inside)
+                        sheets.Add(allBlocks[i]);
+                }
+
+                ed.WriteMessage($"\n[FLUX] Sheet Count: {sheets.Count}");
+
+                sheets = sheets
+                    .OrderByDescending(s => s.ext.MinPoint.Y)
+                    .ThenBy(s => s.ext.MinPoint.X)
+                    .ToList();
+
+                string folder = Path.GetDirectoryName(doc.Name);
+
+                for (int i = 0; i < sheets.Count; i++)
+                {
+                    string path = Path.Combine(
+                        folder,
+                        $"sheet_{i + 1:D3}.dwg");
+
+                    ExportSheet(db, tr, sheets[i].ext, path);
+                }
+
+                tr.Commit();
+            }
+        }
+
+        void ExportSheetWithOriginalPos(
+            Database sourceDb,
+            Transaction tr,
+            Extents3d sheetExt,
+            string filePath)
+        {
+            var ms = (BlockTableRecord)tr.GetObject(
+                SymbolUtilityServices.GetBlockModelSpaceId(sourceDb),
+                OpenMode.ForRead);
+
+            ObjectIdCollection ids = new ObjectIdCollection();
+
+            foreach (ObjectId id in ms)
+            {
+                var ent = tr.GetObject(id, OpenMode.ForRead) as Entity;
+                if (ent == null) continue;
+
+                try
+                {
+                    var ext = ent.GeometricExtents;
+
+                    if (IsInside(sheetExt, ext))
+                        ids.Add(id);
+                }
+                catch { }
+            }
+
+            Database newDb = new Database(true, true);
+
+            using (var tr2 = newDb.TransactionManager.StartTransaction())
+            {
+                var bt = (BlockTable)tr2.GetObject(
+                    newDb.BlockTableId,
+                    OpenMode.ForRead);
+
+                var newMs = (BlockTableRecord)tr2.GetObject(
+                    bt[BlockTableRecord.ModelSpace],
+                    OpenMode.ForWrite);
+
+                IdMapping mapping = new IdMapping();
+
+                // ⭐ 핵심 수정
+                sourceDb.WblockCloneObjects(
+                    ids,
+                    newMs.ObjectId,
+                    mapping,
+                    DuplicateRecordCloning.Ignore,
+                    false);
+
+                tr2.Commit();
+            }
+
+            newDb.SaveAs(filePath, DwgVersion.Current);
+        }
+
+
+        [CommandMethod("FLUX_EXPORT_REARRANGED_DWG")]
+        public void ExportRearrangedSheets()
+        {
+            var doc = Application.DocumentManager.MdiActiveDocument;
+            var db = doc.Database;
+            var ed = doc.Editor;
+
+            string src = db.Filename;
+            string dir = Path.GetDirectoryName(src);
+            string name = Path.GetFileNameWithoutExtension(src);
+
+            string outPath = Path.Combine(dir, name + "_normalized.dwg");
+
+            using (var newDb = new Database(true, true))
+            {
+                using (var tr = db.TransactionManager.StartTransaction())
+                using (var newTr = newDb.TransactionManager.StartTransaction())
+                {
+                    var bt = (BlockTable)tr.GetObject(db.BlockTableId, OpenMode.ForRead);
+                    var ms = (BlockTableRecord)tr.GetObject(
+                        bt[BlockTableRecord.ModelSpace],
+                        OpenMode.ForRead);
+
+                    var newBt = (BlockTable)newTr.GetObject(
+                        newDb.BlockTableId,
+                        OpenMode.ForRead);
+
+                    var newMs = (BlockTableRecord)newTr.GetObject(
+                        newBt[BlockTableRecord.ModelSpace],
+                        OpenMode.ForWrite);
+
+                    ObjectIdCollection ids = new ObjectIdCollection();
+
+                    foreach (ObjectId id in ms)
+                    {
+                        var ent = tr.GetObject(id, OpenMode.ForRead) as Entity;
+                        if (ent == null) continue;
+
+                        //if (!HasCopyXData(ent, out _, out _))
+                        //    continue;
+
+                        ids.Add(id);
+                    }
+
+                    ed.WriteMessage($"\n[FLUX] 복사 대상 엔티티 수: {ids.Count}");
+
+                    IdMapping map = new IdMapping();
+
+                    db.WblockCloneObjects(
+                        ids,
+                        newMs.ObjectId,
+                        map,
+                        DuplicateRecordCloning.Replace,
+                        false
+                    );
+
+                    tr.Commit();
+                    newTr.Commit();
+                }
+
+                newDb.SaveAs(outPath, DwgVersion.Current);
+            }
+
+            ed.WriteMessage($"\n[FLUX] Normalized DWG 생성: {outPath}");
+        }
+
+        [CommandMethod("FLUX_PRINT_TEXT")]
+        public void PrintAllVisibleTexts()
+        {
+            var doc = Application.DocumentManager.MdiActiveDocument;
+            var db = doc.Database;
+            var ed = doc.Editor;
+            using (var tr = db.TransactionManager.StartTransaction())
+            {
+                var bt = (BlockTable)tr.GetObject(db.BlockTableId, OpenMode.ForRead);
+                var ms = (BlockTableRecord)tr.GetObject(bt[BlockTableRecord.ModelSpace], OpenMode.ForRead);
+                foreach (ObjectId id in ms)
+                {
+                    var obj = tr.GetObject(id, OpenMode.ForRead);
+                    var ent = obj as Entity;
+                    if (ent != null)
+                    {
+                        ProcessEntity(ent, tr, ed, Matrix3d.Identity);
+                    }
+                }
+                tr.Commit();
+            }
+        }
+
+        private void ProcessEntity(Entity ent, Transaction tr, Editor ed, Matrix3d parentTransform)
+        {
+            if (ent is DBText dt)
+            {
+                var pos = dt.Position.TransformBy(parentTransform);
+                ed.WriteMessage($"\n[DBText] \"{dt.TextString}\" @ {pos.X:F2},{pos.Y:F2}");
+            }
+            else if (ent is MText mt)
+            {
+                var pos = mt.Location.TransformBy(parentTransform);
+                ed.WriteMessage($"\n[MText] \"{mt.Text}\" @ {pos.X:F2},{pos.Y:F2}");
+            }
+            else if (ent is BlockReference br)
+            {
+                var blockTransform = parentTransform * br.BlockTransform;
+
+                var btr = (BlockTableRecord)tr.GetObject(br.BlockTableRecord, OpenMode.ForRead);
+
+                foreach (ObjectId childId in btr)
+                {
+                    var childObj = tr.GetObject(childId, OpenMode.ForRead);
+                    var childEnt = childObj as Entity;
+
+                    if (childEnt != null)
+                    {
+                        ProcessEntity(childEnt, tr, ed, blockTransform);
+                    }
+                }
+            }
+        }
+
+
+        [CommandMethod("FLUX_PARSE_SHEET_META")]
+        public void FluxParseSheetMeta()
+        {
+            var doc = Application.DocumentManager.MdiActiveDocument;
+            var db = doc.Database;
+            var ed = doc.Editor;
+
+            using (var tr = db.TransactionManager.StartTransaction())
+            {
+                var bt = (BlockTable)tr.GetObject(db.BlockTableId, OpenMode.ForRead);
+                var ms = (BlockTableRecord)tr.GetObject(bt[BlockTableRecord.ModelSpace], OpenMode.ForRead);
+
+                // 1️⃣ 쉬트 BlockReference 찾기 (이미 구현한 로직 사용 권장)
+                var sheetBlocks = new List<BlockReference>();
+
+                foreach (ObjectId id in ms)
+                {
+                    var ent = tr.GetObject(id, OpenMode.ForRead) as Entity;
+                    if (ent is BlockReference br)
+                    {
+                        // TODO: 기존 쉬트 판별 로직으로 필터
+                        // 여기선 예시로 전부 추가
+                        sheetBlocks.Add(br);
+                    }
+                }
+
+                if (sheetBlocks.Count == 0)
+                {
+                    ed.WriteMessage("\n[ERROR] 쉬트 블록을 찾지 못했습니다.");
+                    return;
+                }
+
+                var sheet = sheetBlocks.First();
+                var ext = sheet.GeometricExtents;
+
+                ed.WriteMessage($"\n[INFO] 분석 대상 쉬트 Handle: {sheet.Handle}");
+                ed.WriteMessage($"\n[INFO] Bounds: X={ext.MinPoint.X}~{ext.MaxPoint.X}, Y={ext.MinPoint.Y}~{ext.MaxPoint.Y}");
+
+                // 2️⃣ 쉬트 내부 텍스트 수집
+                var texts = new List<string>();
+
+                foreach (ObjectId id in ms)
+                {
+                    var ent = tr.GetObject(id, OpenMode.ForRead) as Entity;
+                    if (ent == null) continue;
+
+                    if (ent is DBText dbText)
+                    {
+                        if (IsInside(ext, dbText.Position))
+                            texts.Add(dbText.TextString);
+                    }
+                    else if (ent is MText mText)
+                    {
+                        if (IsInside(ext, mText.Location))
+                            texts.Add(mText.Text);
+                    }
+                }
+
+                // 3️⃣ 단위 / 스케일 추출
+                string detectedUnit = "Unknown";
+                string detectedScale = "Unknown";
+
+                foreach (var t in texts)
+                {
+                    var lower = t.ToLower();
+
+                    if (lower.Contains("mm"))
+                        detectedUnit = "mm";
+                    else if (lower.Contains("inch") || lower.Contains("in"))
+                        detectedUnit = "inch";
+
+                    if (lower.Contains("1:1"))
+                        detectedScale = "1:1";
+                    else if (lower.Contains("1/1"))
+                        detectedScale = "1:1";
+                }
+
+                ed.WriteMessage("\n=== SHEET META RESULT ===");
+                ed.WriteMessage($"\nUnit  : {detectedUnit}");
+                ed.WriteMessage($"\nScale : {detectedScale}");
+
+                tr.Commit();
+            }
+        }
+
+        [CommandMethod("FLUX_REARRANGE_SHEETS")]
+        public void RearrangeSheets_Final()
+        {
+            var doc = Application.DocumentManager.MdiActiveDocument;
+            var db = doc.Database;
+            var ed = doc.Editor;
+
+            const double GAP = 50.0;
+            const int COLS = 10;
+            const double START_MARGIN = 200.0;
+
+            using (var tr = db.TransactionManager.StartTransaction())
+            {
+                var ms = (BlockTableRecord)tr.GetObject(
+                    SymbolUtilityServices.GetBlockModelSpaceId(db),
+                    OpenMode.ForRead);
+
+                // 🔥 1️⃣ 원본 ObjectId 스냅샷
+                var originalIds = ms.Cast<ObjectId>().ToList();
+
+                var allBlocks = new List<(BlockReference br, Extents3d ext)>();
+
+                foreach (var id in originalIds)
+                {
+                    if (!id.ObjectClass.IsDerivedFrom(
+                        RXClass.GetClass(typeof(BlockReference))))
+                        continue;
+
+                    var br = tr.GetObject(id, OpenMode.ForRead) as BlockReference;
+                    if (br == null) continue;
+
+                    try
+                    {
+                        allBlocks.Add((br, br.GeometricExtents));
+                    }
+                    catch { }
+                }
+
+                // 🔥 2️⃣ 쉬트 판별
+                var sheets = new List<(BlockReference br, Extents3d ext)>();
+
+                for (int i = 0; i < allBlocks.Count; i++)
+                {
+                    bool inside = false;
+
+                    for (int j = 0; j < allBlocks.Count; j++)
+                    {
+                        if (i == j) continue;
+
+                        if (IsInside(allBlocks[j].ext, allBlocks[i].ext))
+                        {
+                            inside = true;
+                            break;
+                        }
+                    }
+
+                    if (!inside)
+                        sheets.Add(allBlocks[i]);
+                }
+
+                ed.WriteMessage($"\n[FLUX] 쉬트 개수: {sheets.Count}");
+
+                // 🔥 3️⃣ 정렬
+                sheets = sheets
+                    .OrderByDescending(s => s.ext.MinPoint.Y)
+                    .ThenBy(s => s.ext.MinPoint.X)
+                    .ToList();
+
+                // RegApp 준비
+                EnsureRegApp(db, tr);
+                string batchId = DateTime.Now.ToString("yyyyMMdd_HHmmss");
+
+                double maxX = sheets.Max(s => s.ext.MaxPoint.X);
+                double maxY = sheets.Max(s => s.ext.MaxPoint.Y);
+
+                double maxW = sheets.Max(s => s.ext.MaxPoint.X - s.ext.MinPoint.X);
+                double maxH = sheets.Max(s => s.ext.MaxPoint.Y - s.ext.MinPoint.Y);
+
+                double cellW = maxW + GAP;
+                double cellH = maxH + GAP;
+
+                double startX = maxX + START_MARGIN;
+                double startY = maxY + START_MARGIN;
+
+                ms.UpgradeOpen();
+
+                // 🔥 4️⃣ 복사 루프
+                for (int i = 0; i < sheets.Count; i++)
+                {
+                    var sheet = sheets[i];
+
+                    int col = i % COLS;
+                    int row = i / COLS;
+
+                    Point3d targetMin = new Point3d(
+                        startX + col * cellW,
+                        startY - row * cellH,
+                        0);
+
+                    Vector3d disp = targetMin - sheet.ext.MinPoint;
+                    Matrix3d mx = Matrix3d.Displacement(disp);
+
+                    // 4-1 쉬트 Block 복사
+                    var sheetClone = sheet.br.Clone() as BlockReference;
+                    sheetClone.TransformBy(mx);
+                    SetCopyXData(sheetClone, batchId, i + 1);
+
+                    ms.AppendEntity(sheetClone);
+                    tr.AddNewlyCreatedDBObject(sheetClone, true);
+
+                    // 4-2 쉬트 Bounds 내부 원본 Entity 복사
+                    foreach (var id in originalIds)
+                    {
+                        if (id == sheet.br.Id)
+                            continue;
+
+                        var ent = tr.GetObject(id, OpenMode.ForRead) as Entity;
+                        if (ent == null)
+                            continue;
+
+                        try
+                        {
+                            var eext = ent.GeometricExtents;
+
+                            if (!IsInside(sheet.ext, eext))
+                                continue;
+
+                            var clone = ent.Clone() as Entity;
+                            clone.TransformBy(mx);
+
+                            ms.AppendEntity(clone);
+                            tr.AddNewlyCreatedDBObject(clone, true);
+                        }
+                        catch { }
+                    }
+                }
+
+                ed.WriteMessage($"\n[FLUX] BatchId: {batchId}");
+                ed.WriteMessage($"\n[FLUX] 정렬 복사 완료.");
+
+                tr.Commit();
+            }
+        }
+
+        private bool IsInside(Extents3d ext, Point3d pt)
+        {
+            return pt.X >= ext.MinPoint.X &&
+                   pt.X <= ext.MaxPoint.X &&
+                   pt.Y >= ext.MinPoint.Y &&
+                   pt.Y <= ext.MaxPoint.Y;
+        }
+
+        [CommandMethod("FLUX_REARRANGE_SHEETS_OLD")]
+        public void RearrangeSheets_WithXData()
+        {
+            var doc = Application.DocumentManager.MdiActiveDocument;
+            var db = doc.Database;
+            var ed = doc.Editor;
+
+            const double GAP = 50.0;
+            const int COLS = 10;
+            const double START_MARGIN = 200.0;
+
+            using (var tr = db.TransactionManager.StartTransaction())
+            {
+                var ms = (BlockTableRecord)tr.GetObject(
+                    SymbolUtilityServices.GetBlockModelSpaceId(db),
+                    OpenMode.ForRead);
+
+                var allBlocks = new List<(BlockReference br, Extents3d ext)>();
+
+                foreach (ObjectId id in ms)
+                {
+                    if (!id.ObjectClass.IsDerivedFrom(
+                        RXClass.GetClass(typeof(BlockReference))))
+                        continue;
+
+                    var br = tr.GetObject(id, OpenMode.ForRead) as BlockReference;
+                    if (br == null) continue;
+
+                    try
+                    {
+                        allBlocks.Add((br, br.GeometricExtents));
+                    }
+                    catch { }
+                }
+
+                // 쉬트 판별
+                var sheets = new List<(BlockReference br, Extents3d ext)>();
+
+                for (int i = 0; i < allBlocks.Count; i++)
+                {
+                    bool inside = false;
+
+                    for (int j = 0; j < allBlocks.Count; j++)
+                    {
+                        if (i == j) continue;
+
+                        if (IsInside(allBlocks[j].ext, allBlocks[i].ext))
+                        {
+                            inside = true;
+                            break;
+                        }
+                    }
+
+                    if (!inside)
+                        sheets.Add(allBlocks[i]);
+                }
+
+                ed.WriteMessage($"\n[FLUX] 쉬트 개수: {sheets.Count}");
+
+                sheets = sheets
+                    .OrderByDescending(s => s.ext.MinPoint.Y)
+                    .ThenBy(s => s.ext.MinPoint.X)
+                    .ToList();
+
+                // RegApp 등록
+                EnsureRegApp(db, tr);
+
+                string batchId = DateTime.Now.ToString("yyyyMMdd_HHmmss");
+
+                double maxX = sheets.Max(s => s.ext.MaxPoint.X);
+                double maxY = sheets.Max(s => s.ext.MaxPoint.Y);
+
+                double maxW = sheets.Max(s => s.ext.MaxPoint.X - s.ext.MinPoint.X);
+                double maxH = sheets.Max(s => s.ext.MaxPoint.Y - s.ext.MinPoint.Y);
+
+                double cellW = maxW + GAP;
+                double cellH = maxH + GAP;
+
+                double startX = maxX + START_MARGIN;
+                double startY = maxY + START_MARGIN;
+
+                ms.UpgradeOpen();
+
+                for (int i = 0; i < sheets.Count; i++)
+                {
+                    var sheet = sheets[i];
+
+                    int col = i % COLS;
+                    int row = i / COLS;
+
+                    Point3d targetMin = new Point3d(
+                        startX + col * cellW,
+                        startY - row * cellH,
+                        0);
+
+                    Vector3d disp = targetMin - sheet.ext.MinPoint;
+                    Matrix3d mx = Matrix3d.Displacement(disp);
+
+                    var clone = sheet.br.Clone() as BlockReference;
+                    clone.TransformBy(mx);
+
+                    // 🔥 여기서 XData 부착
+                    SetCopyXData(clone, batchId, i + 1);
+
+                    ms.AppendEntity(clone);
+                    tr.AddNewlyCreatedDBObject(clone, true);
+                }
+
+                ed.WriteMessage($"\n[FLUX] BatchId: {batchId}");
+                ed.WriteMessage($"\n[FLUX] 정렬 복사 완료.");
+
+                tr.Commit();
+            }
+        }
+
+        [CommandMethod("FLUX_REARRANGE_SHEETS")]
+        public void RearrangeSheets_BricsCAD()
+        {
+            var doc = Application.DocumentManager.MdiActiveDocument;
+            var db = doc.Database;
+            var ed = doc.Editor;
+
+            const double GAP = 50.0;
+            const int COLS = 10;
+            const double START_MARGIN = 200.0;
+
+            using (var tr = db.TransactionManager.StartTransaction())
+            {
+                var ms = (BlockTableRecord)tr.GetObject(
+                    SymbolUtilityServices.GetBlockModelSpaceId(db),
+                    OpenMode.ForRead);
+
+                var allBlocks = new List<(BlockReference br, Extents3d ext)>();
+
+                foreach (ObjectId id in ms)
+                {
+                    if (!id.ObjectClass.IsDerivedFrom(
+                        RXClass.GetClass(typeof(BlockReference))))
+                        continue;
+
+                    var br = tr.GetObject(id, OpenMode.ForRead) as BlockReference;
+                    if (br == null) continue;
+
+                    try
+                    {
+                        allBlocks.Add((br, br.GeometricExtents));
+                    }
+                    catch { }
+                }
+
+                // 쉬트 판별 (포함 안된 것)
+                var sheets = new List<(BlockReference br, Extents3d ext)>();
+
+                for (int i = 0; i < allBlocks.Count; i++)
+                {
+                    bool inside = false;
+
+                    for (int j = 0; j < allBlocks.Count; j++)
+                    {
+                        if (i == j) continue;
+
+                        if (IsInside(allBlocks[j].ext, allBlocks[i].ext))
+                        {
+                            inside = true;
+                            break;
+                        }
+                    }
+
+                    if (!inside)
+                        sheets.Add(allBlocks[i]);
+                }
+
+                ed.WriteMessage($"\n[FLUX] 쉬트 개수: {sheets.Count}");
+
+                // 정렬: 상→하, 좌→우
+                sheets = sheets
+                    .OrderByDescending(s => s.ext.MinPoint.Y)
+                    .ThenBy(s => s.ext.MinPoint.X)
+                    .ToList();
+
+                // 전체 extents 계산 (BricsCAD 안정 버전)
+                double maxX = sheets.Max(s => s.ext.MaxPoint.X);
+                double maxY = sheets.Max(s => s.ext.MaxPoint.Y);
+
+                double maxW = sheets.Max(s => s.ext.MaxPoint.X - s.ext.MinPoint.X);
+                double maxH = sheets.Max(s => s.ext.MaxPoint.Y - s.ext.MinPoint.Y);
+
+                double cellW = maxW + GAP;
+                double cellH = maxH + GAP;
+
+                double startX = maxX + START_MARGIN;
+                double startY = maxY + START_MARGIN;
+
+                ms.UpgradeOpen();
+
+                for (int i = 0; i < sheets.Count; i++)
+                {
+                    var sheet = sheets[i];
+
+                    int col = i % COLS;
+                    int row = i / COLS;
+
+                    Point3d targetMin = new Point3d(
+                        startX + col * cellW,
+                        startY - row * cellH,
+                        0);
+
+                    Vector3d disp = targetMin - sheet.ext.MinPoint;
+                    Matrix3d mx = Matrix3d.Displacement(disp);
+
+                    var clone = sheet.br.Clone() as Entity;
+                    clone.TransformBy(mx);
+
+                    ms.AppendEntity(clone);
+                    tr.AddNewlyCreatedDBObject(clone, true);
+                }
+
+                tr.Commit();
+            }
+        }
+
+        bool IsInside(Extents3d outer, Extents3d inner)
+        {
+            return inner.MinPoint.X >= outer.MinPoint.X &&
+                   inner.MaxPoint.X <= outer.MaxPoint.X &&
+                   inner.MinPoint.Y >= outer.MinPoint.Y &&
+                   inner.MaxPoint.Y <= outer.MaxPoint.Y;
+        }
+
+        private const string FluxRegApp = "FLUXCAD_COPY";
+
+        private void EnsureRegApp(Database db, Transaction tr)
+        {
+            var rat = (RegAppTable)tr.GetObject(db.RegAppTableId, OpenMode.ForRead);
+
+            if (rat.Has(FluxRegApp))
+                return;
+
+            rat.UpgradeOpen();
+
+            var reg = new RegAppTableRecord
+            {
+                Name = FluxRegApp
+            };
+
+            rat.Add(reg);
+            tr.AddNewlyCreatedDBObject(reg, true);
+        }
+
+        private void SetCopyXData(Entity ent, string batchId, int sheetIndex)
+        {
+            ent.XData = new ResultBuffer(
+                new TypedValue((int)DxfCode.ExtendedDataRegAppName, FluxRegApp),
+                new TypedValue((int)DxfCode.ExtendedDataAsciiString, batchId),
+                new TypedValue((int)DxfCode.ExtendedDataInteger32, sheetIndex)
+            );
+        }
+
+        private bool HasCopyXData(Entity ent, out string batchId, out int sheetIndex)
+        {
+            batchId = null;
+            sheetIndex = 0;
+
+            var rb = ent.GetXDataForApplication(FluxRegApp);
+            if (rb == null) return false;
+
+            var arr = rb.AsArray();
+            if (arr.Length >= 3)
+            {
+                batchId = arr[1].Value as string;
+                sheetIndex = (int)arr[2].Value;
+                return true;
+            }
+
+            return false;
+        }
+
+
+        [CommandMethod("FLUX_REARRANGE_SHEETS")]
+        public void RearrangeSheets_LeftToRight_TopToBottom()
+        {
+            var doc = Application.DocumentManager.MdiActiveDocument;
+            var db = doc.Database;
+            var ed = doc.Editor;
+
+            // ====== 조절 파라미터(필요시 여기만 수정) ======
+            const double GAP = 50.0;      // 쉬트 간 간격(도면 단위)
+            const int COLS = 10;          // 한 줄에 배치할 열 개수 (94개면 10열 -> 약 10줄)
+            const double START_MARGIN = 200.0; // 기존 도면에서 얼마나 떨어져 복사본 시작할지
+                                               // ============================================
+
+            using (var tr = db.TransactionManager.StartTransaction())
+            {
+                var ms = (BlockTableRecord)tr.GetObject(
+                    SymbolUtilityServices.GetBlockModelSpaceId(db),
+                    OpenMode.ForRead);
+
+                // 1) ModelSpace의 BlockReference 수집 + Extents
+                var allBlocks = new List<(BlockReference br, Extents3d ext)>();
+                foreach (ObjectId id in ms)
+                {
+                    if (!id.ObjectClass.IsDerivedFrom(RXClass.GetClass(typeof(BlockReference))))
+                        continue;
+
+                    var br = tr.GetObject(id, OpenMode.ForRead) as BlockReference;
+                    if (br == null) continue;
+
+                    try
+                    {
+                        var ext = br.GeometricExtents;
+                        allBlocks.Add((br, ext));
+                    }
+                    catch
+                    {
+                        // Extents 계산 실패는 제외
+                    }
+                }
+
+                if (allBlocks.Count == 0)
+                {
+                    ed.WriteMessage("\n[FLUX] ModelSpace에 BlockReference가 없습니다.");
+                    tr.Commit();
+                    return;
+                }
+
+                // 2) 쉬트 판별: 다른 BlockReference extents에 '완전 포함'되지 않는 것
+                var sheets = new List<(BlockReference br, Extents3d ext)>();
+                for (int i = 0; i < allBlocks.Count; i++)
+                {
+                    var cur = allBlocks[i];
+                    bool insideOther = false;
+
+                    for (int j = 0; j < allBlocks.Count; j++)
+                    {
+                        if (i == j) continue;
+                        if (IsInside(allBlocks[j].ext, cur.ext))
+                        {
+                            insideOther = true;
+                            break;
+                        }
+                    }
+
+                    if (!insideOther)
+                        sheets.Add(cur);
+                }
+
+                ed.WriteMessage($"\n[FLUX] 쉬트 후보: {sheets.Count} / 전체 BlockRef: {allBlocks.Count}");
+
+                if (sheets.Count == 0)
+                {
+                    ed.WriteMessage("\n[FLUX] 쉬트 후보가 0개입니다. 포함 판별 조건을 점검하세요.");
+                    tr.Commit();
+                    return;
+                }
+
+                // 3) 정렬: 상→하(=Y 큰 것부터), 좌→우(=X 작은 것부터)
+                sheets = sheets
+                    .OrderByDescending(s => s.ext.MinPoint.Y)
+                    .ThenBy(s => s.ext.MinPoint.X)
+                    .ToList();
+
+                // 4) 기존 도면 전체 Extents(복사본 배치 시작점 계산)
+                Extents3d dbExt;
+                try
+                {
+                    //dbExt = db.Extmin;
+                    var max = db.Extmax; // 일부 도면에서 Extmin/Extmax 안정적
+                    dbExt = new Extents3d(db.Extmin, max);
+                }
+                catch
+                {
+                    // 혹시 실패하면, 쉬트들의 extents로 대체
+                    var minX = sheets.Min(s => s.ext.MinPoint.X);
+                    var minY = sheets.Min(s => s.ext.MinPoint.Y);
+                    var maxX = sheets.Max(s => s.ext.MaxPoint.X);
+                    var maxY = sheets.Max(s => s.ext.MaxPoint.Y);
+                    dbExt = new Extents3d(new Point3d(minX, minY, 0), new Point3d(maxX, maxY, 0));
+                }
+
+                // 5) 그리드 셀 크기(겹침 방지 위해 최대 쉬트 크기 기준)
+                double maxW = sheets.Max(s => s.ext.MaxPoint.X - s.ext.MinPoint.X);
+                double maxH = sheets.Max(s => s.ext.MaxPoint.Y - s.ext.MinPoint.Y);
+
+                double cellW = maxW + GAP;
+                double cellH = maxH + GAP;
+
+                // 6) 복사 시작 위치(원본 오른쪽 위로 충분히 떨어뜨림)
+                double startX = dbExt.MaxPoint.X + START_MARGIN;
+                double startY = dbExt.MaxPoint.Y + START_MARGIN;
+
+                // 7) 실제 복사: 각 쉬트 블록 자체 + (쉬트 Bounds 안에 있는) ModelSpace의 다른 Entity들
+                int copiedSheets = 0;
+                int copiedEntities = 0;
+
+                // 복사본은 ModelSpace에 그대로 추가
+                ms.UpgradeOpen();
+
+                for (int i = 0; i < sheets.Count; i++)
+                {
+                    var sheet = sheets[i];
+
+                    int col = i % COLS;
+                    int row = i / COLS;
+
+                    // "상→하" 배치이므로 row가 증가할수록 Y는 감소
+                    var targetMin = new Point3d(
+                        startX + col * cellW,
+                        startY - row * cellH,
+                        0);
+
+                    // 쉬트 원래 Min -> targetMin 로 이동
+                    var disp = targetMin - sheet.ext.MinPoint;
+                    var mx = Matrix3d.Displacement(disp);
+
+                    // (A) 쉬트 BlockReference 자체 복사 (이게 쉬트 외곽/내부를 가장 확실하게 가져옵니다)
+                    {
+                        var clone = sheet.br.Clone() as Entity;
+                        if (clone != null)
+                        {
+                            clone.TransformBy(mx);
+                            ms.AppendEntity(clone);
+                            tr.AddNewlyCreatedDBObject(clone, true);
+                            copiedSheets++;
+                            copiedEntities++;
+                        }
+                    }
+
+                    // (B) 혹시 쉬트 블록 밖(=ModelSpace)에 흩어진 엔티티가 쉬트 영역에 들어있다면 같이 복사
+                    //     - 쉬트 블록 자신은 제외
+                    //     - 쉬트끼리 겹치지 않는다는 전제(확인 완료)라 중복 귀속 문제 없음
+                    foreach (ObjectId id in ms)
+                    {
+                        if (id == sheet.br.Id) continue;
+
+                        var ent = tr.GetObject(id, OpenMode.ForRead) as Entity;
+                        if (ent == null) continue;
+
+                        // 이미 방금 추가한 복사본 엔티티는 무한 복사 방지를 위해 스킵:
+                        // (Transaction 내에서 새로 생성된 DBObject는 ObjectId가 달라져도 ms 반복에서 잡힐 수 있습니다)
+                        if (ent.IsNewObject) continue;
+
+                        try
+                        {
+                            var eext = ent.GeometricExtents;
+                            if (!IsInside(sheet.ext, eext))
+                                continue;
+
+                            var clone = ent.Clone() as Entity;
+                            if (clone == null) continue;
+
+                            clone.TransformBy(mx);
+                            ms.AppendEntity(clone);
+                            tr.AddNewlyCreatedDBObject(clone, true);
+                            copiedEntities++;
+                        }
+                        catch
+                        {
+                            // Extents 실패 엔티티는 일단 스킵
+                        }
+                    }
+
+                    if ((i + 1) % 10 == 0 || i == sheets.Count - 1)
+                        ed.WriteMessage($"\n[FLUX] 진행: {i + 1}/{sheets.Count} ...");
+                }
+
+                ed.WriteMessage($"\n[FLUX] 완료: 쉬트 복사 {copiedSheets}개, 전체 복사 엔티티(쉬트블록 포함) {copiedEntities}개");
+                ed.WriteMessage($"\n[FLUX] 복사본 시작점=({startX:F2},{startY:F2}), COLS={COLS}, GAP={GAP}");
+
+                tr.Commit();
+            }
+        }
+
+        private bool IsInsideWithTol(Extents3d outer, Extents3d inner)
+        {
+            // 약간의 오차 허용
+            const double eps = 1e-6;
+
+            return inner.MinPoint.X >= outer.MinPoint.X - eps &&
+                   inner.MaxPoint.X <= outer.MaxPoint.X + eps &&
+                   inner.MinPoint.Y >= outer.MinPoint.Y - eps &&
+                   inner.MaxPoint.Y <= outer.MaxPoint.Y + eps;
+        }
+
+        [CommandMethod("FLUX_GROUP_BY_SHEET")]
+        public void GroupEntitiesBySheet()
+        {
+            var doc = Application.DocumentManager.MdiActiveDocument;
+            var db = doc.Database;
+            var ed = doc.Editor;
+
+            using (var tr = db.TransactionManager.StartTransaction())
+            {
+                var ms = (BlockTableRecord)tr.GetObject(
+                    SymbolUtilityServices.GetBlockModelSpaceId(db),
+                    OpenMode.ForRead);
+
+                var allBlocks = new List<(BlockReference br, Extents3d ext)>();
+
+                // 1️⃣ BlockReference 수집
+                foreach (ObjectId id in ms)
+                {
+                    if (!id.ObjectClass.IsDerivedFrom(
+                        RXClass.GetClass(typeof(BlockReference))))
+                        continue;
+
+                    var br = tr.GetObject(id, OpenMode.ForRead) as BlockReference;
+                    if (br == null) continue;
+
+                    try
+                    {
+                        allBlocks.Add((br, br.GeometricExtents));
+                    }
+                    catch { }
+                }
+
+                // 2️⃣ 쉬트 판별 (포함 안된 것만)
+                var sheets = new List<(BlockReference br, Extents3d ext)>();
+
+                for (int i = 0; i < allBlocks.Count; i++)
+                {
+                    var current = allBlocks[i];
+                    bool isInsideOther = false;
+
+                    for (int j = 0; j < allBlocks.Count; j++)
+                    {
+                        if (i == j) continue;
+
+                        if (IsInside(allBlocks[j].ext, current.ext))
+                        {
+                            isInsideOther = true;
+                            break;
+                        }
+                    }
+
+                    if (!isInsideOther)
+                        sheets.Add(current);
+                }
+
+                ed.WriteMessage($"\n[INFO] 쉬트 개수: {sheets.Count}");
+
+                // 3️⃣ 쉬트별 엔티티 수집
+                int sheetIndex = 1;
+
+                foreach (var sheet in sheets)
+                {
+                    int entityCount = 0;
+
+                    foreach (ObjectId id in ms)
+                    {
+                        var ent = tr.GetObject(id, OpenMode.ForRead) as Entity;
+                        if (ent == null) continue;
+
+                        if (ent.Id == sheet.br.Id) continue;
+
+                        try
+                        {
+                            var ext = ent.GeometricExtents;
+
+                            if (IsInside(sheet.ext, ext))
+                                entityCount++;
+                        }
+                        catch { }
+                    }
+
+                    ed.WriteMessage(
+                        $"\n[{sheetIndex:000}] Handle={sheet.br.Handle} " +
+                        $"Entities={entityCount}");
+
+                    sheetIndex++;
+                }
+
+                tr.Commit();
+            }
+        }
+
+        [CommandMethod("FLUX_DETECT_SHEETS")]
+        public void DetectSheetsByContainment()
+        {
+            var doc = Application.DocumentManager.MdiActiveDocument;
+            var db = doc.Database;
+            var ed = doc.Editor;
+
+            using (var tr = db.TransactionManager.StartTransaction())
+            {
+                var ms = (BlockTableRecord)tr.GetObject(
+                    SymbolUtilityServices.GetBlockModelSpaceId(db),
+                    OpenMode.ForRead);
+
+                var blocks = new List<(BlockReference br, Extents3d ext)>();
+
+                // 1️⃣ ModelSpace BlockReference 수집
+                foreach (ObjectId id in ms)
+                {
+                    if (!id.ObjectClass.IsDerivedFrom(
+                        RXClass.GetClass(typeof(BlockReference))))
+                        continue;
+
+                    var br = tr.GetObject(id, OpenMode.ForRead) as BlockReference;
+                    if (br == null) continue;
+
+                    try
+                    {
+                        var ext = br.GeometricExtents;
+                        blocks.Add((br, ext));
+                    }
+                    catch (Teigha.Runtime.Exception ex)
+                    {
+                        // Extents 계산 실패 블록은 제외
+                        ed.WriteMessage($"\n[WARN] Handle={br.Handle} Extents 계산 실패: {ex.Message}");
+                    }
+                }
+
+                ed.WriteMessage($"\n[INFO] 전체 BlockReference 수: {blocks.Count}");
+
+                var sheetCandidates = new List<(BlockReference br, Extents3d ext)>();
+
+                // 2️⃣ 포함관계 검사
+                for (int i = 0; i < blocks.Count; i++)
+                {
+                    var current = blocks[i];
+                    bool isInsideOther = false;
+
+                    for (int j = 0; j < blocks.Count; j++)
+                    {
+                        if (i == j) continue;
+
+                        var other = blocks[j];
+
+                        if (IsInside(other.ext, current.ext))
+                        {
+                            isInsideOther = true;
+                            break;
+                        }
+                    }
+
+                    if (!isInsideOther)
+                    {
+                        sheetCandidates.Add(current);
+                    }
+                }
+
+                ed.WriteMessage($"\n[RESULT] 쉬트 후보 개수: {sheetCandidates.Count}");
+
+                int index = 1;
+                foreach (var sheet in sheetCandidates)
+                {
+                    var w = sheet.ext.MaxPoint.X - sheet.ext.MinPoint.X;
+                    var h = sheet.ext.MaxPoint.Y - sheet.ext.MinPoint.Y;
+                    var area = w * h;
+
+                    ed.WriteMessage(
+                        $"\n[{index:000}] Handle={sheet.br.Handle} " +
+                        $"W={w:F2} H={h:F2} Area={area:F0}");
+
+                    index++;
+                }
+
+                tr.Commit();
+            }
+        }
+
+        private bool IsInside2(Extents3d outer, Extents3d inner)
+        {
+            const double eps = 1e-6;
+
+            return inner.MinPoint.X >= outer.MinPoint.X - eps &&
+                   inner.MaxPoint.X <= outer.MaxPoint.X + eps &&
+                   inner.MinPoint.Y >= outer.MinPoint.Y - eps &&
+                   inner.MaxPoint.Y <= outer.MaxPoint.Y + eps;
+        }
+
+
+        [CommandMethod("FLUX_REPACK_SPACE")]
+        public void RepackSpace()
+        {
+            var doc = Application.DocumentManager.MdiActiveDocument;
+            var db = doc.Database;
+            var ed = doc.Editor;
+
+            double margin = 1000.0;
+
+            using (var tr = db.TransactionManager.StartTransaction())
+            {
+                var bt = (BlockTable)tr.GetObject(db.BlockTableId, OpenMode.ForRead);
+                var ms = (BlockTableRecord)tr.GetObject(bt[BlockTableRecord.ModelSpace], OpenMode.ForWrite);
+
+                // 1️⃣ 모든 BlockReference 수집
+                List<BlockReference> candidates = new List<BlockReference>();
+
+                foreach (ObjectId id in ms)
+                {
+                    if (!id.ObjectClass.IsDerivedFrom(
+                        RXClass.GetClass(typeof(BlockReference))))
+                        continue;
+
+                    var br = tr.GetObject(id, OpenMode.ForRead) as BlockReference;
+                    if (br == null) continue;
+
+                    // 여기서는 일단 모든 BlockReference를 대상
+                    candidates.Add(br);
+                }
+
+                if (candidates.Count == 0)
+                {
+                    ed.WriteMessage("\n[FLUX] BlockReference가 없습니다.");
+                    return;
+                }
+
+                // 2️⃣ 전체 영역 계산
+                Extents3d globalExt = candidates[0].GeometricExtents;
+
+                foreach (var br in candidates)
+                {
+                    try
+                    {
+                        globalExt.AddExtents(br.GeometricExtents);
+                    }
+                    catch { }
+                }
+
+                double startX = globalExt.MaxPoint.X + margin;
+                double currentY = globalExt.MinPoint.Y;
+
+                ed.WriteMessage($"\n[FLUX] 전체 영역: {globalExt.MinPoint} ~ {globalExt.MaxPoint}");
+                ed.WriteMessage($"\n[FLUX] 시작점: ({startX}, {currentY})");
+
+                // 3️⃣ 세로 정렬 복사
+                foreach (var br in candidates)
+                {
+                    Extents3d ext;
+
+                    try
+                    {
+                        ext = br.GeometricExtents;
+                    }
+                    catch
+                    {
+                        continue;
+                    }
+
+                    double height = ext.MaxPoint.Y - ext.MinPoint.Y;
+
+                    Point3d targetMin =
+                        new Point3d(startX, currentY, 0);
+
+                    Vector3d displacement =
+                        targetMin - ext.MinPoint;
+
+                    Matrix3d move =
+                        Matrix3d.Displacement(displacement);
+
+                    var clone = (BlockReference)br.Clone();
+                    clone.TransformBy(move);
+
+                    ms.AppendEntity(clone);
+                    tr.AddNewlyCreatedDBObject(clone, true);
+
+                    currentY += height + margin;
+                }
+
+                tr.Commit();
+            }
+
+            ed.WriteMessage("\n[FLUX] 공간 재배치 완료.");
+        }
+
+
         [CommandMethod("FLATTEN_ALL")]
         public void FlattenAll()
         {
