@@ -19,7 +19,829 @@ namespace FluxCAD.BricsCAD.Plugin26
     {
         List<Entity> _flattened = new List<Entity>();
 
+        [CommandMethod("FLUX_FIND_TABLE_RECT_V4")]
+        public void FluxFindTableRectV4()
+        {
+            var doc = Application.DocumentManager.MdiActiveDocument;
+            var db = doc.Database;
+            var ed = doc.Editor;
+
+            var vertical = new List<LineInfo>();
+            var horizontal = new List<LineInfo>();
+
+            using (var tr = db.TransactionManager.StartTransaction())
+            {
+                var bt = (BlockTable)tr.GetObject(db.BlockTableId, OpenMode.ForRead);
+                var ms = (BlockTableRecord)tr.GetObject(bt[BlockTableRecord.ModelSpace], OpenMode.ForRead);
+
+                foreach (ObjectId id in ms)
+                {
+                    var ent = tr.GetObject(id, OpenMode.ForRead) as Entity;
+
+                    if (ent is Line ln)
+                    {
+                        double x1 = ln.StartPoint.X;
+                        double y1 = ln.StartPoint.Y;
+                        double x2 = ln.EndPoint.X;
+                        double y2 = ln.EndPoint.Y;
+
+                        double dx = x2 - x1;
+                        double dy = y2 - y1;
+
+                        double len = Math.Sqrt(dx * dx + dy * dy);
+
+                        if (len < 10) continue; // 너무 짧은 선 제거
+
+                        double angle = Math.Abs(Math.Atan2(dy, dx) * 180.0 / Math.PI);
+
+                        // horizontal 판정
+                        if (angle < 5 || angle > 175)
+                        {
+                            horizontal.Add(new LineInfo
+                            {
+                                X1 = x1,
+                                Y1 = y1,
+                                X2 = x2,
+                                Y2 = y2,
+                                Length = len
+                            });
+                        }
+                        // vertical 판정
+                        else if (Math.Abs(angle - 90) < 5)
+                        {
+                            vertical.Add(new LineInfo
+                            {
+                                X1 = x1,
+                                Y1 = y1,
+                                X2 = x2,
+                                Y2 = y2,
+                                Length = len
+                            });
+                        }
+                    }
+                }
+
+                tr.Commit();
+            }
+
+            if (vertical.Count == 0 || horizontal.Count == 0)
+            {
+                ed.WriteMessage("\n[FluxCAD] No candidate lines found.");
+                return;
+            }
+
+            double maxV = vertical.Max(v => v.Length);
+            double maxH = horizontal.Max(h => h.Length);
+
+            double vThreshold = maxV * 0.9;
+            double hThreshold = maxH * 0.9;
+
+            var vCandidates = vertical.Where(v => v.Length >= vThreshold).ToList();
+            var hCandidates = horizontal.Where(h => h.Length >= hThreshold).ToList();
+
+            ed.WriteMessage($"\n[FluxCAD] vertical candidates: {vCandidates.Count}");
+            ed.WriteMessage($"\n[FluxCAD] horizontal candidates: {hCandidates.Count}");
+
+            var xs = vCandidates
+                .Select(v => v.X1)
+                .OrderBy(x => x)
+                .ToList();
+
+            var ys = hCandidates
+                .Select(h => h.Y1)
+                .OrderBy(y => y)
+                .ToList();
+
+            for (int r = 0; r < ys.Count - 1; r++)
+            {
+                for (int c = 0; c < xs.Count - 1; c++)
+                {
+                    double cellMinX = xs[c];
+                    double cellMaxX = xs[c + 1];
+
+                    double cellMinY = ys[r];
+                    double cellMaxY = ys[r + 1];
+
+                    ed.WriteMessage(
+                        $"\nCell {r},{c} : {cellMinX},{cellMinY} -> {cellMaxX},{cellMaxY}");
+                }
+            }
+
+            if (vCandidates.Count < 2 || hCandidates.Count < 2)
+            {
+                ed.WriteMessage("\n[FluxCAD] Table rectangle not found.");
+                return;
+            }
+
+            double minX = vCandidates.Min(v => Math.Min(v.X1, v.X2));
+            double maxX = vCandidates.Max(v => Math.Max(v.X1, v.X2));
+
+            double minY = hCandidates.Min(h => Math.Min(h.Y1, h.Y2));
+            double maxY = hCandidates.Max(h => Math.Max(h.Y1, h.Y2));
+
+            ed.WriteMessage("\n[FluxCAD] TABLE RECT FOUND");
+            ed.WriteMessage($"\nminX = {minX}");
+            ed.WriteMessage($"\nmaxX = {maxX}");
+            ed.WriteMessage($"\nminY = {minY}");
+            ed.WriteMessage($"\nmaxY = {maxY}");
+        }
+
+        [CommandMethod("FLUX_FIND_TABLE_RECT_V3")]
+        public void FluxFindTableRectV3()
+        {
+            var doc = Application.DocumentManager.MdiActiveDocument;
+            var db = doc.Database;
+            var ed = doc.Editor;
+
+            var vertical = new List<LineInfo>();
+            var horizontal = new List<LineInfo>();
+
+            using (var tr = db.TransactionManager.StartTransaction())
+            {
+                var bt = (BlockTable)tr.GetObject(db.BlockTableId, OpenMode.ForRead);
+                var ms = (BlockTableRecord)tr.GetObject(bt[BlockTableRecord.ModelSpace], OpenMode.ForRead);
+
+                foreach (ObjectId id in ms)
+                {
+                    var ent = tr.GetObject(id, OpenMode.ForRead) as Entity;
+
+                    if (ent is Line ln)
+                    {
+                        double x1 = ln.StartPoint.X;
+                        double y1 = ln.StartPoint.Y;
+                        double x2 = ln.EndPoint.X;
+                        double y2 = ln.EndPoint.Y;
+
+                        double dx = Math.Abs(x1 - x2);
+                        double dy = Math.Abs(y1 - y2);
+
+                        double len = ln.Length;
+
+                        if (dx < 0.01)
+                        {
+                            vertical.Add(new LineInfo { X1 = x1, Y1 = y1, X2 = x2, Y2 = y2, Length = len });
+                        }
+
+                        if (dy < 0.01)
+                        {
+                            horizontal.Add(new LineInfo { X1 = x1, Y1 = y1, X2 = x2, Y2 = y2, Length = len });
+                        }
+                    }
+                }
+
+                tr.Commit();
+            }
+
+            if (vertical.Count == 0 || horizontal.Count == 0)
+            {
+                ed.WriteMessage("\n[FluxCAD] No lines found.");
+                return;
+            }
+
+            double maxV = vertical.Max(v => v.Length);
+            double maxH = horizontal.Max(h => h.Length);
+
+            double vThreshold = maxV * 0.9;
+            double hThreshold = maxH * 0.9;
+
+            var vCandidates = vertical.Where(v => v.Length >= vThreshold).ToList();
+            var hCandidates = horizontal.Where(h => h.Length >= hThreshold).ToList();
+
+            ed.WriteMessage($"\n[FluxCAD] vertical candidates: {vCandidates.Count}");
+            ed.WriteMessage($"\n[FluxCAD] horizontal candidates: {hCandidates.Count}");
+
+            if (vCandidates.Count < 2 || hCandidates.Count < 2)
+            {
+                ed.WriteMessage("\n[FluxCAD] Table rectangle not found.");
+                return;
+            }
+
+            double minX = vCandidates.Min(v => v.X1);
+            double maxX = vCandidates.Max(v => v.X1);
+
+            double minY = hCandidates.Min(h => h.Y1);
+            double maxY = hCandidates.Max(h => h.Y1);
+
+            ed.WriteMessage("\n[FluxCAD] TABLE RECT FOUND");
+            ed.WriteMessage($"\nminX = {minX}");
+            ed.WriteMessage($"\nmaxX = {maxX}");
+            ed.WriteMessage($"\nminY = {minY}");
+            ed.WriteMessage($"\nmaxY = {maxY}");
+        }
+
+        [CommandMethod("FLUX_FIND_TABLE_RECT_V2")]
+        public void FluxFindTableRectV2()
+        {
+            var doc = Application.DocumentManager.MdiActiveDocument;
+            var db = doc.Database;
+            var ed = doc.Editor;
+
+            List<LineInfo> vertical = new();
+            List<LineInfo> horizontal = new();
+
+            double minX = double.MaxValue;
+            double minY = double.MaxValue;
+            double maxX = double.MinValue;
+            double maxY = double.MinValue;
+
+            using (var tr = db.TransactionManager.StartTransaction())
+            {
+                var bt = (BlockTable)tr.GetObject(db.BlockTableId, OpenMode.ForRead);
+                var ms = (BlockTableRecord)tr.GetObject(bt[BlockTableRecord.ModelSpace], OpenMode.ForRead);
+
+                foreach (ObjectId id in ms)
+                {
+                    var ent = tr.GetObject(id, OpenMode.ForRead) as Entity;
+
+                    if (ent is Line ln)
+                    {
+                        double x1 = ln.StartPoint.X;
+                        double y1 = ln.StartPoint.Y;
+                        double x2 = ln.EndPoint.X;
+                        double y2 = ln.EndPoint.Y;
+
+                        minX = Math.Min(minX, Math.Min(x1, x2));
+                        minY = Math.Min(minY, Math.Min(y1, y2));
+                        maxX = Math.Max(maxX, Math.Max(x1, x2));
+                        maxY = Math.Max(maxY, Math.Max(y1, y2));
+
+                        double dx = Math.Abs(x1 - x2);
+                        double dy = Math.Abs(y1 - y2);
+                        double len = ln.Length;
+
+                        if (dx < 0.01)
+                        {
+                            vertical.Add(new LineInfo { X1 = x1, Y1 = y1, X2 = x2, Y2 = y2, Length = len });
+                        }
+
+                        if (dy < 0.01)
+                        {
+                            horizontal.Add(new LineInfo { X1 = x1, Y1 = y1, X2 = x2, Y2 = y2, Length = len });
+                        }
+                    }
+                }
+
+                tr.Commit();
+            }
+
+            double width = maxX - minX;
+            double height = maxY - minY;
+
+            double vThreshold = height * 0.7;
+            double hThreshold = width * 0.7;
+
+            var vCandidates = vertical.Where(v => v.Length > vThreshold).ToList();
+            var hCandidates = horizontal.Where(h => h.Length > hThreshold).ToList();
+
+            ed.WriteMessage($"\n[FluxCAD] vertical candidates: {vCandidates.Count}");
+            ed.WriteMessage($"\n[FluxCAD] horizontal candidates: {hCandidates.Count}");
+
+            if (vCandidates.Count < 2 || hCandidates.Count < 2)
+            {
+                ed.WriteMessage("\n[FluxCAD] table rectangle not found");
+                return;
+            }
+
+            double tableMinX = vCandidates.Min(v => v.X1);
+            double tableMaxX = vCandidates.Max(v => v.X1);
+
+            double tableMinY = hCandidates.Min(h => h.Y1);
+            double tableMaxY = hCandidates.Max(h => h.Y1);
+
+            ed.WriteMessage("\n[FluxCAD] TABLE RECT FOUND");
+            ed.WriteMessage($"\nminX = {tableMinX}");
+            ed.WriteMessage($"\nmaxX = {tableMaxX}");
+            ed.WriteMessage($"\nminY = {tableMinY}");
+            ed.WriteMessage($"\nmaxY = {tableMaxY}");
+        }
+
+        class LineInfo
+        {
+            public double X1;
+            public double Y1;
+            public double X2;
+            public double Y2;
+            public double Length;
+        }
+
+        [CommandMethod("FLUX_FIND_TABLE_RECT")]
+        public void FluxFindTableRect()
+        {
+            var doc = Application.DocumentManager.MdiActiveDocument;
+            var db = doc.Database;
+            var ed = doc.Editor;
+
+            var vertical = new List<LineInfo>();
+            var horizontal = new List<LineInfo>();
+
+            double maxLen = 0;
+
+            using (var tr = db.TransactionManager.StartTransaction())
+            {
+                var bt = (BlockTable)tr.GetObject(db.BlockTableId, OpenMode.ForRead);
+                var ms = (BlockTableRecord)tr.GetObject(bt[BlockTableRecord.ModelSpace], OpenMode.ForRead);
+
+                foreach (ObjectId id in ms)
+                {
+                    var ent = tr.GetObject(id, OpenMode.ForRead) as Entity;
+
+                    if (ent is Line ln)
+                    {
+                        double x1 = ln.StartPoint.X;
+                        double y1 = ln.StartPoint.Y;
+                        double x2 = ln.EndPoint.X;
+                        double y2 = ln.EndPoint.Y;
+
+                        double dx = Math.Abs(x1 - x2);
+                        double dy = Math.Abs(y1 - y2);
+                        double len = ln.Length;
+
+                        maxLen = Math.Max(maxLen, len);
+
+                        if (dx < 0.01)
+                        {
+                            vertical.Add(new LineInfo
+                            {
+                                X1 = x1,
+                                Y1 = y1,
+                                X2 = x2,
+                                Y2 = y2,
+                                Length = len
+                            });
+                        }
+
+                        if (dy < 0.01)
+                        {
+                            horizontal.Add(new LineInfo
+                            {
+                                X1 = x1,
+                                Y1 = y1,
+                                X2 = x2,
+                                Y2 = y2,
+                                Length = len
+                            });
+                        }
+                    }
+                }
+
+                tr.Commit();
+            }
+
+            double threshold = maxLen * 0.5;
+
+            var longVertical = vertical.Where(v => v.Length > threshold).ToList();
+            var longHorizontal = horizontal.Where(h => h.Length > threshold).ToList();
+
+            ed.WriteMessage($"\n[FluxCAD] Long vertical lines: {longVertical.Count}");
+            ed.WriteMessage($"\n[FluxCAD] Long horizontal lines: {longHorizontal.Count}");
+
+            if (longVertical.Count < 2 || longHorizontal.Count < 2)
+            {
+                ed.WriteMessage("\n[FluxCAD] Rectangle not found.");
+                return;
+            }
+
+            double minX = longVertical.Min(v => v.X1);
+            double maxX = longVertical.Max(v => v.X1);
+
+            double minY = longHorizontal.Min(h => h.Y1);
+            double maxY = longHorizontal.Max(h => h.Y1);
+
+            double width = maxX - minX;
+            double height = maxY - minY;
+
+            ed.WriteMessage("\n[FluxCAD] TABLE RECTANGLE FOUND");
+            ed.WriteMessage($"\nminX = {minX}");
+            ed.WriteMessage($"\nmaxX = {maxX}");
+            ed.WriteMessage($"\nminY = {minY}");
+            ed.WriteMessage($"\nmaxY = {maxY}");
+            ed.WriteMessage($"\nwidth = {width}");
+            ed.WriteMessage($"\nheight = {height}");
+        }
+
+        [CommandMethod("FLUX_BUILD_GRID")]
+        public void FluxBuildGrid()
+        {
+            var doc = Application.DocumentManager.MdiActiveDocument;
+            var db = doc.Database;
+            var ed = doc.Editor;
+
+            const double EPS = 0.01;
+
+            var verticalXs = new List<double>();
+            var horizontalYs = new List<double>();
+
+            using (var tr = db.TransactionManager.StartTransaction())
+            {
+                var bt = (BlockTable)tr.GetObject(db.BlockTableId, OpenMode.ForRead);
+                var ms = (BlockTableRecord)tr.GetObject(bt[BlockTableRecord.ModelSpace], OpenMode.ForRead);
+
+                foreach (ObjectId id in ms)
+                {
+                    var ent = tr.GetObject(id, OpenMode.ForRead) as Entity;
+
+                    if (ent is Line ln)
+                    {
+                        double dx = Math.Abs(ln.StartPoint.X - ln.EndPoint.X);
+                        double dy = Math.Abs(ln.StartPoint.Y - ln.EndPoint.Y);
+
+                        if (dx < EPS) // vertical
+                        {
+                            verticalXs.Add(ln.StartPoint.X);
+                        }
+                        else if (dy < EPS) // horizontal
+                        {
+                            horizontalYs.Add(ln.StartPoint.Y);
+                        }
+                    }
+                }
+
+                tr.Commit();
+            }
+
+            ed.WriteMessage($"\n[FluxCAD] Raw vertical lines: {verticalXs.Count}");
+            ed.WriteMessage($"\n[FluxCAD] Raw horizontal lines: {horizontalYs.Count}");
+
+            var vClusters = Cluster(verticalXs, 1.0);
+            var hClusters = Cluster(horizontalYs, 1.0);
+
+            ed.WriteMessage($"\n[FluxCAD] Vertical clusters: {vClusters.Count}");
+            ed.WriteMessage($"\n[FluxCAD] Horizontal clusters: {hClusters.Count}");
+
+            int cols = vClusters.Count - 1;
+            int rows = hClusters.Count - 1;
+
+            ed.WriteMessage($"\n[FluxCAD] Grid size: {rows} x {cols}");
+            ed.WriteMessage($"\n[FluxCAD] Cells: {rows * cols}");
+        }
+
+
+        [CommandMethod("FLUX_FIND_OUTER_FRAME")]
+        public void FindOuterFrame()
+        {
+            var doc = Application.DocumentManager.MdiActiveDocument;
+            var db = doc.Database;
+            var ed = doc.Editor;
+
+            using (var tr = db.TransactionManager.StartTransaction())
+            {
+                var bt = (BlockTable)tr.GetObject(db.BlockTableId, OpenMode.ForRead);
+                var ms = (BlockTableRecord)tr.GetObject(bt[BlockTableRecord.ModelSpace], OpenMode.ForRead);
+
+                const double EPS = 0.001;
+
+                Line longestH = null;
+                Line longestV = null;
+
+                double maxH = 0;
+                double maxV = 0;
+
+                foreach (ObjectId id in ms)
+                {
+                    var ent = tr.GetObject(id, OpenMode.ForRead) as Entity;
+
+                    if (ent is not Line line)
+                        continue;
+
+                    double dx = Math.Abs(line.StartPoint.X - line.EndPoint.X);
+                    double dy = Math.Abs(line.StartPoint.Y - line.EndPoint.Y);
+
+                    if (dy < EPS) // horizontal
+                    {
+                        double len = line.Length;
+
+                        if (len > maxH)
+                        {
+                            maxH = len;
+                            longestH = line;
+                        }
+                    }
+
+                    if (dx < EPS) // vertical
+                    {
+                        double len = line.Length;
+
+                        if (len > maxV)
+                        {
+                            maxV = len;
+                            longestV = line;
+                        }
+                    }
+                }
+
+                if (longestH != null)
+                {
+                    ed.WriteMessage($"\nLongest Horizontal : {maxH}");
+                    ed.WriteMessage($"\nStart: {longestH.StartPoint}");
+                    ed.WriteMessage($"\nEnd  : {longestH.EndPoint}");
+                }
+
+                if (longestV != null)
+                {
+                    ed.WriteMessage($"\nLongest Vertical   : {maxV}");
+                    ed.WriteMessage($"\nStart: {longestV.StartPoint}");
+                    ed.WriteMessage($"\nEnd  : {longestV.EndPoint}");
+                }
+
+                tr.Commit();
+            }
+        }
+
+        private List<double> Cluster(List<double> values, double eps)
+        {
+            values.Sort();
+
+            var result = new List<double>();
+
+            foreach (var v in values)
+            {
+                if (result.Count == 0)
+                {
+                    result.Add(v);
+                    continue;
+                }
+
+                if (Math.Abs(result.Last() - v) > eps)
+                {
+                    result.Add(v);
+                }
+            }
+
+            return result;
+        }
+
+        [CommandMethod("FLUX_TEST_GRID_AREA")]
+        public void FluxTestGridArea()
+        {
+            var doc = Application.DocumentManager.MdiActiveDocument;
+            var db = doc.Database;
+            var ed = doc.Editor;
+
+            using (var tr = db.TransactionManager.StartTransaction())
+            {
+                var bt = (BlockTable)tr.GetObject(db.BlockTableId, OpenMode.ForRead);
+                var ms = (BlockTableRecord)tr.GetObject(bt[BlockTableRecord.ModelSpace], OpenMode.ForRead);
+
+                const double EPS = 0.001;
+
+                List<double> verticalX = new();
+                List<double> horizontalY = new();
+
+                foreach (ObjectId id in ms)
+                {
+                    var ent = tr.GetObject(id, OpenMode.ForRead) as Entity;
+                    if (ent is not Line line)
+                        continue;
+
+                    double dx = Math.Abs(line.StartPoint.X - line.EndPoint.X);
+                    double dy = Math.Abs(line.StartPoint.Y - line.EndPoint.Y);
+
+                    if (dx < EPS)
+                        verticalX.Add(line.StartPoint.X);
+
+                    if (dy < EPS)
+                        horizontalY.Add(line.StartPoint.Y);
+                }
+
+                // 정렬
+                verticalX.Sort();
+                horizontalY.Sort();
+
+                // 간단한 클러스터
+                List<double> vClusters = Cluster_old(verticalX, 100);
+                List<double> hClusters = Cluster_old(horizontalY, 100);
+
+                ed.WriteMessage($"\nDetected Columns : {vClusters.Count}");
+                ed.WriteMessage($"\nDetected Rows    : {hClusters.Count}");
+
+                if (vClusters.Count < 2 || hClusters.Count < 2)
+                {
+                    ed.WriteMessage("\nGrid detection failed.");
+                    return;
+                }
+
+                double minX = vClusters.First();
+                double maxX = vClusters.Last();
+                double minY = hClusters.First();
+                double maxY = hClusters.Last();
+
+                ed.WriteMessage($"\nGrid Rectangle:");
+                ed.WriteMessage($"\nX: {minX} ~ {maxX}");
+                ed.WriteMessage($"\nY: {minY} ~ {maxY}");
+
+                int inside = 0;
+                int outside = 0;
+
+                foreach (ObjectId id in ms)
+                {
+                    var ent = tr.GetObject(id, OpenMode.ForRead) as Entity;
+                    if (ent == null)
+                        continue;
+
+                    try
+                    {
+                        var ext = ent.GeometricExtents;
+
+                        bool inRect =
+                            ext.MinPoint.X >= minX &&
+                            ext.MaxPoint.X <= maxX &&
+                            ext.MinPoint.Y >= minY &&
+                            ext.MaxPoint.Y <= maxY;
+
+                        if (inRect)
+                            inside++;
+                        else
+                            outside++;
+                    }
+                    catch
+                    {
+                        continue;
+                    }
+                }
+
+                ed.WriteMessage($"\nEntities inside grid : {inside}");
+                ed.WriteMessage($"\nEntities outside grid: {outside}");
+
+                tr.Commit();
+            }
+        }
+
+        List<double> Cluster_old(List<double> values, double threshold)
+        {
+            List<double> clusters = new();
+
+            if (values.Count == 0)
+                return clusters;
+
+            double current = values[0];
+            clusters.Add(current);
+
+            foreach (var v in values)
+            {
+                if (Math.Abs(v - current) > threshold)
+                {
+                    clusters.Add(v);
+                    current = v;
+                }
+            }
+
+            return clusters;
+        }
+
+        [CommandMethod("FLUX_FIND_TABLE_LINES")]
+        public void FindTableLines()
+        {
+            var doc = Application.DocumentManager.MdiActiveDocument;
+            var db = doc.Database;
+            var ed = doc.Editor;
+
+            using (var tr = db.TransactionManager.StartTransaction())
+            {
+                var bt = (BlockTable)tr.GetObject(db.BlockTableId, OpenMode.ForRead);
+                var ms = (BlockTableRecord)tr.GetObject(bt[BlockTableRecord.ModelSpace], OpenMode.ForRead);
+
+                var dwgExt = new Extents3d(db.Extmin, db.Extmax);
+
+                double margin = (dwgExt.MaxPoint.X - dwgExt.MinPoint.X) * 0.02;
+
+                List<Line> horizontal = new();
+                List<Line> vertical = new();
+
+                foreach (ObjectId id in ms)
+                {
+                    if (!id.ObjectClass.Name.Contains("Line"))
+                        continue;
+
+                    var line = tr.GetObject(id, OpenMode.ForRead) as Line;
+
+                    if (line == null)
+                        continue;
+
+                    
+
+                    var dx = Math.Abs(line.StartPoint.X - line.EndPoint.X);
+                    var dy = Math.Abs(line.StartPoint.Y - line.EndPoint.Y);
+
+                    const double EPS = 0.001;
+
+                    bool isHorizontal = dy < EPS;
+                    bool isVertical = dx < EPS;
+
+                    if (!isHorizontal && !isVertical)
+                        continue;
+
+                    double length = line.Length;
+                    double dwgHeight = dwgExt.MaxPoint.Y - dwgExt.MinPoint.Y;
+
+                    // 최소 길이 (DWG 높이의 30%)
+                    double minLength = dwgHeight * 0.1;
+
+                    if (length < minLength)
+                        continue;
+
+                    var minX = Math.Min(line.StartPoint.X, line.EndPoint.X);
+                    var maxX = Math.Max(line.StartPoint.X, line.EndPoint.X);
+                    var minY = Math.Min(line.StartPoint.Y, line.EndPoint.Y);
+                    var maxY = Math.Max(line.StartPoint.Y, line.EndPoint.Y);
+
+                    bool nearLeft = Math.Abs(minX - dwgExt.MinPoint.X) < margin;
+                    bool nearRight = Math.Abs(maxX - dwgExt.MaxPoint.X) < margin;
+                    bool nearBottom = Math.Abs(minY - dwgExt.MinPoint.Y) < margin;
+                    bool nearTop = Math.Abs(maxY - dwgExt.MaxPoint.Y) < margin;
+
+                    bool nearBoundary = nearLeft || nearRight || nearTop || nearBottom;
+
+                    if (!nearBoundary)
+                        continue;
+
+                    if (isHorizontal)
+                        horizontal.Add(line);
+
+                    if (isVertical)
+                        vertical.Add(line);
+                }
+
+                ed.WriteMessage("\n=== TABLE LINE DETECTION ===");
+                ed.WriteMessage($"\nHorizontal lines : {horizontal.Count}");
+                ed.WriteMessage($"\nVertical lines   : {vertical.Count}");
+
+                tr.Commit();
+            }
+        }
+
+        [CommandMethod("FLUX_DETECT_DRAWING_TYPE")]
+        public void FluxDetectDrawingType()
+        {
+            var doc = Application.DocumentManager.MdiActiveDocument;
+            var db = doc.Database;
+            var ed = doc.Editor;
+
+            var type = DetectDrawingType(db);
+
+            ed.WriteMessage($"\n[FLUX] Drawing Type = {type}");
+        }
+
+        DrawingType DetectDrawingType(Database db)
+        {
+            var doc = Application.DocumentManager.MdiActiveDocument;
+            var ed = doc.Editor;
+
+            int blockCount = 0;
+            int horizontalLines = 0;
+            int verticalLines = 0;
+
+            using (var tr = db.TransactionManager.StartTransaction())
+            {
+                var ms = (BlockTableRecord)tr.GetObject(
+                    SymbolUtilityServices.GetBlockModelSpaceId(db),
+                    OpenMode.ForRead);
+
+                foreach (ObjectId id in ms)
+                {
+                    var ent = tr.GetObject(id, OpenMode.ForRead) as Entity;
+                    if (ent == null) continue;
+
+                    if (ent is BlockReference)
+                        blockCount++;
+
+                    if (ent is Line line)
+                    {
+                        if (IsHorizontal(line))
+                            horizontalLines++;
+
+                        if (IsVertical(line))
+                            verticalLines++;
+                    }
+                }
+
+                tr.Commit();
+            }
+
+            ed.WriteMessage($"\nBlocks: {blockCount}");
+            ed.WriteMessage($"\nHorizontal lines: {horizontalLines}");
+            ed.WriteMessage($"\nVertical lines: {verticalLines}");
+
+            if (blockCount <= 1)
+                return DrawingType.SingleSheet;
+
+            if (horizontalLines > 40 && verticalLines > 40)
+                return DrawingType.TableLayout;
+
+            return DrawingType.MultiSheet;
+        }
+
+        bool IsHorizontal(Line line)
+        {
+            return Math.Abs(line.StartPoint.Y - line.EndPoint.Y) < 1e-3;
+        }
+
+        bool IsVertical(Line line)
+        {
+            return Math.Abs(line.StartPoint.X - line.EndPoint.X) < 1e-3;
+        }
+
         [CommandMethod("FLUX_EXPORT_GRID_TEST")]
+
         public void FluxExportGridTest()
         {
             var doc = Application.DocumentManager.MdiActiveDocument;
