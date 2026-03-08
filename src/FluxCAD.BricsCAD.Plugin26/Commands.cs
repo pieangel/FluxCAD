@@ -191,8 +191,77 @@ namespace FluxCAD.BricsCAD.Plugin26
             masterDb.SaveAs(outputPath, DwgVersion.Current);
         }
 
-
         void ExportSheet(
+            Database sourceDb,
+            Transaction tr,
+            Extents3d sheetExt,
+            string filePath)
+        {
+            var ms = (BlockTableRecord)tr.GetObject(
+                SymbolUtilityServices.GetBlockModelSpaceId(sourceDb),
+                OpenMode.ForRead);
+
+            ObjectIdCollection ids = new ObjectIdCollection();
+
+            foreach (ObjectId id in ms)
+            {
+                var ent = tr.GetObject(id, OpenMode.ForRead) as Entity;
+                if (ent == null) continue;
+
+                try
+                {
+                    var ext = ent.GeometricExtents;
+
+                    if (IsInside(sheetExt, ext))
+                        ids.Add(id);
+                }
+                catch { }
+            }
+
+            Database newDb = new Database(true, true);
+
+            using (var tr2 = newDb.TransactionManager.StartTransaction())
+            {
+                var bt = (BlockTable)tr2.GetObject(
+                    newDb.BlockTableId,
+                    OpenMode.ForRead);
+
+                var newMs = (BlockTableRecord)tr2.GetObject(
+                    bt[BlockTableRecord.ModelSpace],
+                    OpenMode.ForWrite);
+
+                IdMapping mapping = new IdMapping();
+
+                sourceDb.WblockCloneObjects(
+                    ids,
+                    newMs.ObjectId,
+                    mapping,
+                    DuplicateRecordCloning.Ignore,
+                    false);
+
+                // ⭐ ModelSpace 전체 이동
+                Matrix3d move =
+                    Matrix3d.Displacement(
+                        new Vector3d(
+                            -sheetExt.MinPoint.X,
+                            -sheetExt.MinPoint.Y,
+                            0));
+
+                foreach (ObjectId id in newMs)
+                {
+                    var ent = tr2.GetObject(id, OpenMode.ForWrite) as Entity;
+                    if (ent == null) continue;
+
+                    ent.TransformBy(move);
+                }
+
+                tr2.Commit();
+            }
+
+            newDb.SaveAs(filePath, DwgVersion.Current);
+        }
+
+        void ExportSheet2(
             Database sourceDb,
             Transaction tr,
             Extents3d sheetExt,
