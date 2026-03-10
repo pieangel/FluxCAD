@@ -13,8 +13,12 @@ namespace FluxCAD.BricsCAD.Plugin26
 
         public Extents3d Bounds { get; set; }
 
-        public double Area
-            => (Bounds.MaxPoint.X - Bounds.MinPoint.X) *
-               (Bounds.MaxPoint.Y - Bounds.MinPoint.Y);
+        public double Area =>
+        Math.Max(0.0, Bounds.MaxPoint.X - Bounds.MinPoint.X) *
+        Math.Max(0.0, Bounds.MaxPoint.Y - Bounds.MinPoint.Y);
+
+        //         public double Area
+        //             => (Bounds.MaxPoint.X - Bounds.MinPoint.X) *
+        //                (Bounds.MaxPoint.Y - Bounds.MinPoint.Y);
     }
 }

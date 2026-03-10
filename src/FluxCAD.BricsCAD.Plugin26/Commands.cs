@@ -19,7 +19,193 @@ namespace FluxCAD.BricsCAD.Plugin26
     {
         List<Entity> _flattened = new List<Entity>();
 
-        
+        [CommandMethod("FLUX_DEBUG_SHEETS")]
+        public void DebugSheets()
+        {
+            var doc = Application.DocumentManager.MdiActiveDocument;
+            if (doc == null) return;
+
+            var db = doc.Database;
+            var ed = doc.Editor;
+
+            try
+            {
+                var detector = new SheetAnchorDetector();
+                var sheets = detector.Detect(db);
+
+                ed.WriteMessage($"\n[FluxCAD] Debug Sheets Count: {sheets.Count}");
+
+                using (var tr = db.TransactionManager.StartTransaction())
+                {
+                    var bt = (BlockTable)tr.GetObject(db.BlockTableId, OpenMode.ForRead);
+                    var ms = (BlockTableRecord)tr.GetObject(bt[BlockTableRecord.ModelSpace], OpenMode.ForWrite);
+
+                    ObjectId debugLayerId = GetOrCreateLayer(db, tr, "FLUX_DEBUG_SHEETS");
+
+                    int index = 1;
+                    foreach (var sheet in sheets)
+                    {
+                        DrawSheetBounds(ms, tr, sheet.Bounds, debugLayerId);
+                        DrawSheetLabel(ms, tr, sheet.Bounds, $"S{index}", debugLayerId);
+                        DrawAnchorMarker(ms, tr, sheet.AnchorId, debugLayerId);
+
+                        ed.WriteMessage(
+                            $"\n[Sheet {index}] Anchor={sheet.AnchorId.Handle} " +
+                            $"Min=({sheet.Bounds.MinPoint.X:F2},{sheet.Bounds.MinPoint.Y:F2}) " +
+                            $"Max=({sheet.Bounds.MaxPoint.X:F2},{sheet.Bounds.MaxPoint.Y:F2})");
+
+                        index++;
+                    }
+
+                    tr.Commit();
+                }
+
+                ed.WriteMessage("\n[FluxCAD] Debug geometry created on layer: FLUX_DEBUG_SHEETS");
+            }
+            catch (System.Exception ex)
+            {
+                ed.WriteMessage($"\n[FluxCAD][ERROR] {ex.Message}\n{ex.StackTrace}");
+            }
+        }
+
+        private ObjectId GetOrCreateLayer(Database db, Transaction tr, string layerName)
+        {
+            var lt = (LayerTable)tr.GetObject(db.LayerTableId, OpenMode.ForRead);
+
+            if (lt.Has(layerName))
+                return lt[layerName];
+
+            lt.UpgradeOpen();
+
+            var layer = new LayerTableRecord
+            {
+                Name = layerName
+            };
+
+            var id = lt.Add(layer);
+            tr.AddNewlyCreatedDBObject(layer, true);
+
+            return id;
+        }
+
+        private void DrawSheetBounds(BlockTableRecord ms, Transaction tr, Extents3d ext, ObjectId layerId)
+        {
+            var p1 = new Point3d(ext.MinPoint.X, ext.MinPoint.Y, 0);
+            var p2 = new Point3d(ext.MaxPoint.X, ext.MinPoint.Y, 0);
+            var p3 = new Point3d(ext.MaxPoint.X, ext.MaxPoint.Y, 0);
+            var p4 = new Point3d(ext.MinPoint.X, ext.MaxPoint.Y, 0);
+
+            AddLine(ms, tr, p1, p2, layerId);
+            AddLine(ms, tr, p2, p3, layerId);
+            AddLine(ms, tr, p3, p4, layerId);
+            AddLine(ms, tr, p4, p1, layerId);
+        }
+
+        private void DrawSheetLabel(BlockTableRecord ms, Transaction tr, Extents3d ext, string text, ObjectId layerId)
+        {
+            double width = ext.MaxPoint.X - ext.MinPoint.X;
+            double height = ext.MaxPoint.Y - ext.MinPoint.Y;
+
+            double textHeight = Math.Max(Math.Min(width, height) * 0.08, 30.0);
+
+            var pos = new Point3d(
+                ext.MinPoint.X + width * 0.05,
+                ext.MaxPoint.Y - height * 0.10,
+                0);
+
+            var dbText = new DBText
+            {
+                Position = pos,
+                Height = textHeight,
+                TextString = text,
+                LayerId = layerId
+            };
+
+            ms.AppendEntity(dbText);
+            tr.AddNewlyCreatedDBObject(dbText, true);
+        }
+
+        private void DrawAnchorMarker(BlockTableRecord ms, Transaction tr, ObjectId anchorId, ObjectId layerId)
+        {
+            if (anchorId.IsNull || !anchorId.IsValid)
+                return;
+
+            var ent = tr.GetObject(anchorId, OpenMode.ForRead) as Entity;
+            if (ent == null)
+                return;
+
+            Extents3d ext;
+            try
+            {
+                ext = ent.GeometricExtents;
+            }
+            catch
+            {
+                return;
+            }
+
+            var center = new Point3d(
+                (ext.MinPoint.X + ext.MaxPoint.X) * 0.5,
+                (ext.MinPoint.Y + ext.MaxPoint.Y) * 0.5,
+                0);
+
+            double radius = Math.Max(
+                Math.Min(ext.MaxPoint.X - ext.MinPoint.X, ext.MaxPoint.Y - ext.MinPoint.Y) * 0.05,
+                20.0);
+
+            var circle = new Circle
+            {
+                Center = center,
+                Radius = radius,
+                LayerId = layerId
+            };
+
+            ms.AppendEntity(circle);
+            tr.AddNewlyCreatedDBObject(circle, true);
+        }
+
+        private void AddLine(BlockTableRecord ms, Transaction tr, Point3d start, Point3d end, ObjectId layerId)
+        {
+            var line = new Line(start, end)
+            {
+                LayerId = layerId
+            };
+
+            ms.AppendEntity(line);
+            tr.AddNewlyCreatedDBObject(line, true);
+        }
+
+        [CommandMethod("FLUX_DETECT_SHEETS")]
+        public void DetectSheets()
+        {
+            var doc = Bricscad.ApplicationServices.Application.DocumentManager.MdiActiveDocument;
+            var db = doc.Database;
+            var ed = doc.Editor;
+
+            var detector = new FluxCAD.BricsCAD.Adapter26.SheetAnchorDetector();
+            var sheets = detector.Detect(db);
+
+            ed.WriteMessage($"\n[FluxCAD] Detected Sheets: {sheets.Count}");
+
+            foreach (var s in sheets)
+            {
+                ed.WriteMessage(
+                    $"\nSheet {s.Index} | Anchor={s.AnchorId.Handle} | " +
+                    $"Min=({s.Bounds.MinPoint.X:F2},{s.Bounds.MinPoint.Y:F2}) " +
+                    $"Max=({s.Bounds.MaxPoint.X:F2},{s.Bounds.MaxPoint.Y:F2})");
+            }
+
+            var partition = new FluxCAD.BricsCAD.Adapter26.SheetPartitionEngine()
+                .Partition(db, sheets);
+
+            ed.WriteMessage($"\n[FluxCAD] Global Entities: {partition.GlobalEntities.Count}");
+
+            foreach (var s in partition.Sheets)
+            {
+                ed.WriteMessage($"\nSheet {s.Index} Entities = {s.Entities.Count}");
+            }
+        }
+
 
         [CommandMethod("FLUX_PRINT_TABLE_CELLS")]
         public void FluxPrintTableCells()
