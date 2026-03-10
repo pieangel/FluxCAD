@@ -19,6 +19,271 @@ namespace FluxCAD.BricsCAD.Plugin26
     {
         List<Entity> _flattened = new List<Entity>();
 
+        [CommandMethod("FLUX_DETECT_SHEET_CANDIDATES")]
+        public void DetectSheetCandidates()
+        {
+            var doc = Application.DocumentManager.MdiActiveDocument;
+            var db = doc.Database;
+            var ed = doc.Editor;
+
+            using (var tr = db.TransactionManager.StartTransaction())
+            {
+                var blockInfos = CollectBlockCandidates(db, tr);
+
+                if (blockInfos.Count == 0)
+                {
+                    ed.WriteMessage("\n[FluxCAD] BlockReference 후보가 없습니다.");
+                    return;
+                }
+
+                BuildRepeatedPatternScores(blockInfos);
+
+                foreach (var info in blockInfos)
+                {
+                    info.FinalScore =
+                        info.KeywordScore * 3 +
+                        info.TextDensityScore * 2 +
+                        info.MetaRegionScore * 2 +
+                        info.RepeatedTextScore * 3 +
+                        info.RepeatedLayoutScore * 2 +
+                        info.SizeScore;
+
+                    info.Grade = ClassifyGrade(info);
+                }
+
+                var ordered = blockInfos
+                    .OrderByDescending(x => x.Grade)
+                    .ThenByDescending(x => x.FinalScore)
+                    .ToList();
+
+                ed.WriteMessage($"\n[FluxCAD] 총 Block 후보 수: {ordered.Count}");
+
+                int aCount = ordered.Count(x => x.Grade == CandidateGrade.A);
+                int bCount = ordered.Count(x => x.Grade == CandidateGrade.B);
+                int cCount = ordered.Count(x => x.Grade == CandidateGrade.None);
+
+                ed.WriteMessage($"\n[A급] {aCount}, [B급] {bCount}, [제외] {cCount}");
+
+                foreach (var info in ordered)
+                {
+                    ed.WriteMessage(
+                        $"\n[{info.Grade}] Handle={info.Handle} " +
+                        $"Score={info.FinalScore} " +
+                        $"Keywords={info.KeywordScore} RepeatedText={info.RepeatedTextScore} " +
+                        $"RepeatedLayout={info.RepeatedLayoutScore} Meta={info.MetaRegionScore} " +
+                        $"Texts={info.TextCount} BBox=({info.Bounds.MinPoint.X:F2},{info.Bounds.MinPoint.Y:F2})~({info.Bounds.MaxPoint.X:F2},{info.Bounds.MaxPoint.Y:F2})"
+                    );
+                }
+
+                tr.Commit();
+            }
+        }
+
+        private List<BlockCandidateInfo> CollectBlockCandidates(Database db, Transaction tr)
+        {
+            var result = new List<BlockCandidateInfo>();
+
+            var bt = (BlockTable)tr.GetObject(db.BlockTableId, OpenMode.ForRead);
+            var ms = (BlockTableRecord)tr.GetObject(bt[BlockTableRecord.ModelSpace], OpenMode.ForRead);
+
+            foreach (ObjectId id in ms)
+            {
+                var br = tr.GetObject(id, OpenMode.ForRead) as BlockReference;
+                if (br == null)
+                    continue;
+
+                if (!TryGetEntityExtents(br, out var bounds))
+                    continue;
+
+                var info = new BlockCandidateInfo
+                {
+                    Id = br.ObjectId,
+                    Handle = br.Handle.ToString(),
+                    Bounds = bounds
+                };
+
+                ExtractBlockMetaFeatures(br, tr, info);
+                ComputeAbsoluteScores(info);
+
+                result.Add(info);
+            }
+
+            return result;
+        }
+
+        private void ExtractBlockMetaFeatures(BlockReference br, Transaction tr, BlockCandidateInfo info)
+        {
+            var btr = (BlockTableRecord)tr.GetObject(br.BlockTableRecord, OpenMode.ForRead);
+
+            double minX = info.Bounds.MinPoint.X;
+            double minY = info.Bounds.MinPoint.Y;
+            double maxX = info.Bounds.MaxPoint.X;
+            double maxY = info.Bounds.MaxPoint.Y;
+            double width = Math.Max(1e-6, maxX - minX);
+            double height = Math.Max(1e-6, maxY - minY);
+
+            foreach (ObjectId entId in btr)
+            {
+                var ent = tr.GetObject(entId, OpenMode.ForRead) as Entity;
+                if (ent == null)
+                    continue;
+
+                if (ent is DBText dbText)
+                {
+                    string text = NormalizeText(dbText.TextString);
+                    if (!string.IsNullOrWhiteSpace(text))
+                    {
+                        info.Texts.Add(text);
+                        info.TextCount++;
+
+                        var p = dbText.Position.TransformBy(br.BlockTransform);
+                        double rx = (p.X - minX) / width;
+                        double ry = (p.Y - minY) / height;
+                        info.TextPositions.Add(new RelativePoint(rx, ry));
+                    }
+                }
+                else if (ent is MText mtext)
+                {
+                    string text = NormalizeText(mtext.Text);
+                    if (!string.IsNullOrWhiteSpace(text))
+                    {
+                        info.Texts.Add(text);
+                        info.TextCount++;
+
+                        var p = mtext.Location.TransformBy(br.BlockTransform);
+                        double rx = (p.X - minX) / width;
+                        double ry = (p.Y - minY) / height;
+                        info.TextPositions.Add(new RelativePoint(rx, ry));
+                    }
+                }
+            }
+        }
+
+        private void ComputeAbsoluteScores(BlockCandidateInfo info)
+        {
+            string[] keywords =
+            {
+                "SCALE", "DATE", "NO", "DRAWN", "CHECK", "APPROVED",
+                "DWG", "TITLE", "NAME", "REV",
+                "변경", "변경사항", "성명", "년월일", "년", "월", "일",
+                "도면", "도면명", "품명", "재질", "수량"
+            };
+
+            foreach (var text in info.Texts)
+            {
+                if (keywords.Any(k => text.Contains(k, StringComparison.OrdinalIgnoreCase)))
+                    info.KeywordScore++;
+            }
+
+            if (info.TextCount >= 5) info.TextDensityScore = 1;
+            if (info.TextCount >= 10) info.TextDensityScore = 2;
+            if (info.TextCount >= 20) info.TextDensityScore = 3;
+
+            // 우하단 메타 영역 간단 체크
+            int bottomRightCount = info.TextPositions.Count(p => p.X >= 0.65 && p.Y <= 0.35);
+            if (bottomRightCount >= 3) info.MetaRegionScore = 1;
+            if (bottomRightCount >= 6) info.MetaRegionScore = 2;
+            if (bottomRightCount >= 10) info.MetaRegionScore = 3;
+
+            double width = info.Bounds.MaxPoint.X - info.Bounds.MinPoint.X;
+            double height = info.Bounds.MaxPoint.Y - info.Bounds.MinPoint.Y;
+            double area = width * height;
+            double ratio = width / Math.Max(1e-6, height);
+
+            if (area > 1000) info.SizeScore++;
+            if (ratio >= 1.1 && ratio <= 3.5) info.SizeScore++;
+        }
+
+        private void BuildRepeatedPatternScores(List<BlockCandidateInfo> blocks)
+        {
+            // 1) 반복 텍스트 점수
+            var textFrequency = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+
+            foreach (var block in blocks)
+            {
+                foreach (var text in block.Texts.Distinct(StringComparer.OrdinalIgnoreCase))
+                {
+                    if (string.IsNullOrWhiteSpace(text))
+                        continue;
+
+                    if (!textFrequency.ContainsKey(text))
+                        textFrequency[text] = 0;
+
+                    textFrequency[text]++;
+                }
+            }
+
+            foreach (var block in blocks)
+            {
+                foreach (var text in block.Texts.Distinct(StringComparer.OrdinalIgnoreCase))
+                {
+                    if (textFrequency.TryGetValue(text, out int freq) && freq >= 2)
+                    {
+                        block.RepeatedTextScore++;
+                    }
+                }
+            }
+
+            // 2) 반복 레이아웃 점수
+            // 매우 단순화된 버전: 우하단/하단에 텍스트가 비슷하게 몰려 있는지
+            foreach (var block in blocks)
+            {
+                int bottomBand = block.TextPositions.Count(p => p.Y <= 0.25);
+                int rightBand = block.TextPositions.Count(p => p.X >= 0.70);
+                int bottomRight = block.TextPositions.Count(p => p.X >= 0.65 && p.Y <= 0.35);
+
+                if (bottomBand >= 4) block.RepeatedLayoutScore++;
+                if (rightBand >= 3) block.RepeatedLayoutScore++;
+                if (bottomRight >= 3) block.RepeatedLayoutScore++;
+            }
+        }
+
+        private CandidateGrade ClassifyGrade(BlockCandidateInfo info)
+        {
+            // 강한 후보
+            if (info.KeywordScore >= 2 &&
+                info.RepeatedTextScore >= 2 &&
+                info.MetaRegionScore >= 1)
+                return CandidateGrade.A;
+
+            if (info.FinalScore >= 12)
+                return CandidateGrade.A;
+
+            // 의심 후보
+            if (info.FinalScore >= 6)
+                return CandidateGrade.B;
+
+            return CandidateGrade.None;
+        }
+
+        private bool TryGetEntityExtents(Entity ent, out Extents3d ext)
+        {
+            ext = default;
+            try
+            {
+                ext = ent.GeometricExtents;
+                return true;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        private string NormalizeText(string text)
+        {
+            if (string.IsNullOrWhiteSpace(text))
+                return string.Empty;
+
+            string s = text.Trim().ToUpperInvariant();
+            s = s.Replace("\\P", " ");
+            s = s.Replace("\r", " ").Replace("\n", " ");
+            while (s.Contains("  "))
+                s = s.Replace("  ", " ");
+
+            return s;
+        }
+
         [CommandMethod("FLUX_DEBUG_SHEETS")]
         public void DebugSheets()
         {
