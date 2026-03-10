@@ -19,6 +19,157 @@ namespace FluxCAD.BricsCAD.Plugin26
     {
         List<Entity> _flattened = new List<Entity>();
 
+        
+
+        [CommandMethod("FLUX_PRINT_TABLE_CELLS")]
+        public void FluxPrintTableCells()
+        {
+            var doc = Application.DocumentManager.MdiActiveDocument;
+            var db = doc.Database;
+            var ed = doc.Editor;
+
+            var vertical = new List<LineInfo>();
+            var horizontal = new List<LineInfo>();
+
+            using (var tr = db.TransactionManager.StartTransaction())
+            {
+                var bt = (BlockTable)tr.GetObject(db.BlockTableId, OpenMode.ForRead);
+                var ms = (BlockTableRecord)tr.GetObject(bt[BlockTableRecord.ModelSpace], OpenMode.ForRead);
+
+                foreach (ObjectId id in ms)
+                {
+                    var ent = tr.GetObject(id, OpenMode.ForRead) as Entity;
+
+                    if (ent is Line ln)
+                    {
+                        double x1 = ln.StartPoint.X;
+                        double y1 = ln.StartPoint.Y;
+                        double x2 = ln.EndPoint.X;
+                        double y2 = ln.EndPoint.Y;
+
+                        double dx = x2 - x1;
+                        double dy = y2 - y1;
+
+                        double len = Math.Sqrt(dx * dx + dy * dy);
+
+                        if (len < 10) continue;
+
+                        double angle = Math.Abs(Math.Atan2(dy, dx) * 180.0 / Math.PI);
+
+                        if (angle < 5 || angle > 175)
+                        {
+                            horizontal.Add(new LineInfo
+                            {
+                                X1 = x1,
+                                Y1 = y1,
+                                X2 = x2,
+                                Y2 = y2,
+                                Length = len
+                            });
+                        }
+                        else if (Math.Abs(angle - 90) < 5)
+                        {
+                            vertical.Add(new LineInfo
+                            {
+                                X1 = x1,
+                                Y1 = y1,
+                                X2 = x2,
+                                Y2 = y2,
+                                Length = len
+                            });
+                        }
+                    }
+                }
+
+                if (vertical.Count == 0 || horizontal.Count == 0)
+                {
+                    ed.WriteMessage("\n[FluxCAD] No table lines found.");
+                    return;
+                }
+
+                double maxV = vertical.Max(v => v.Length);
+                double maxH = horizontal.Max(h => h.Length);
+
+                var vCandidates = vertical.Where(v => v.Length >= maxV * 0.9).ToList();
+                var hCandidates = horizontal.Where(h => h.Length >= maxH * 0.9).ToList();
+
+                var xs = vCandidates.Select(v => v.X1).OrderBy(x => x).ToList();
+                var ys = hCandidates.Select(h => h.Y1).OrderBy(y => y).ToList();
+
+                ed.WriteMessage($"\n[FluxCAD] Grid size: {xs.Count - 1} x {ys.Count - 1}");
+
+                var cells = new CellInfo[ys.Count - 1, xs.Count - 1];
+
+                for (int r = 0; r < ys.Count - 1; r++)
+                    for (int c = 0; c < xs.Count - 1; c++)
+                    {
+                        cells[r, c] = new CellInfo();
+
+                        var cell = cells[r, c];
+
+                        ed.WriteMessage(
+                            $"\nCell[{r},{c}]  E:{cell.EntityCount}  T:{cell.TextCount}  B:{cell.BlockCount}");
+                    }
+
+                foreach (ObjectId id in ms)
+                {
+                    var ent = tr.GetObject(id, OpenMode.ForRead) as Entity;
+                    if (ent == null) continue;
+
+                    var center = GetEntityCenter(ent);
+
+                    bool found = false;
+
+                    for (int r = 0; r < ys.Count - 1 && !found; r++)
+                    {
+                        for (int c = 0; c < xs.Count - 1; c++)
+                        {
+                            double minX = xs[c];
+                            double maxX = xs[c + 1];
+                            double minY = ys[r];
+                            double maxY = ys[r + 1];
+
+                            if (center.X >= minX && center.X <= maxX &&
+                                center.Y >= minY && center.Y <= maxY)
+                            {
+                                var cell = cells[r, c];
+
+                                if (ent is DBText || ent is MText)
+                                    cell.TextCount++;
+
+                                else if (ent is BlockReference)
+                                    cell.BlockCount++;
+
+                                else
+                                    cell.EntityCount++;
+
+                                found = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+
+                tr.Commit();
+            }
+        }
+        private Point3d GetEntityCenter(Entity ent)
+        {
+            try
+            {
+                var ext = ent.GeometricExtents;
+
+                double cx = (ext.MinPoint.X + ext.MaxPoint.X) * 0.5;
+                double cy = (ext.MinPoint.Y + ext.MaxPoint.Y) * 0.5;
+
+                return new Point3d(cx, cy, 0);
+            }
+            catch
+            {
+                return Point3d.Origin;
+            }
+        }
+
         [CommandMethod("FLUX_FIND_TABLE_RECT_V4")]
         public void FluxFindTableRectV4()
         {
@@ -1082,6 +1233,15 @@ namespace FluxCAD.BricsCAD.Plugin26
 
             newDb.SaveAs(filePath, DwgVersion.Current);
         }
+
+        bool IsInside(Extents3d outer, Extents3d inner)
+        {
+            return inner.MinPoint.X >= outer.MinPoint.X &&
+                   inner.MaxPoint.X <= outer.MaxPoint.X &&
+                   inner.MinPoint.Y >= outer.MinPoint.Y &&
+                   inner.MaxPoint.Y <= outer.MaxPoint.Y;
+        }
+
 
         void ExportSheet2(
             Database sourceDb,
@@ -2357,14 +2517,7 @@ namespace FluxCAD.BricsCAD.Plugin26
             }
         }
 
-        bool IsInside(Extents3d outer, Extents3d inner)
-        {
-            return inner.MinPoint.X >= outer.MinPoint.X &&
-                   inner.MaxPoint.X <= outer.MaxPoint.X &&
-                   inner.MinPoint.Y >= outer.MinPoint.Y &&
-                   inner.MaxPoint.Y <= outer.MaxPoint.Y;
-        }
-
+        
         private const string FluxRegApp = "FLUXCAD_COPY";
 
         private void EnsureRegApp(Database db, Transaction tr)
