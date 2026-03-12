@@ -7,6 +7,7 @@ using System;
 using System.Drawing;
 using System.Drawing.Imaging;
 using System.IO;
+using System.Text.RegularExpressions;
 using Teigha.DatabaseServices;
 using Teigha.Geometry; // Point3d, Vector3d 등이 정의된 곳
 using Teigha.GraphicsSystem;
@@ -19,6 +20,487 @@ namespace FluxCAD.BricsCAD.Plugin26
     {
         List<Entity> _flattened = new List<Entity>();
 
+        [CommandMethod("FLUX_EXPORT_GIANT_CANDIDATES")]
+        public void ExportGiantCandidates()
+        {
+            var doc = Application.DocumentManager.MdiActiveDocument;
+            var sourceDb = doc.Database;
+            var ed = doc.Editor;
+
+            string outputPath = @"C:\Temp\Flux_GiantCandidates.dwg";
+
+            using var tr = sourceDb.TransactionManager.StartTransaction();
+
+            var blocks = CollectTopLevelBlocks(sourceDb, tr);
+            var giantCandidates = SelectGiantCandidates(blocks);
+
+            ed.WriteMessage($"\n[FluxCAD] Export giant candidates count = {giantCandidates.Count}");
+
+            if (giantCandidates.Count == 0)
+            {
+                ed.WriteMessage("\n[FluxCAD] 후보가 없습니다.");
+                return;
+            }
+
+            var idsToClone = new ObjectIdCollection();
+            foreach (var b in giantCandidates)
+                idsToClone.Add(b.Id);
+
+            using var destDb = new Database(true, true);
+
+            using (var destTr = destDb.TransactionManager.StartTransaction())
+            {
+                var destBt = (BlockTable)destTr.GetObject(destDb.BlockTableId, OpenMode.ForRead);
+                var destMs = (BlockTableRecord)destTr.GetObject(destBt[BlockTableRecord.ModelSpace], OpenMode.ForWrite);
+
+                var mapping = new IdMapping();
+
+                sourceDb.WblockCloneObjects(
+                    idsToClone,
+                    destMs.ObjectId,
+                    mapping,
+                    DuplicateRecordCloning.Ignore,
+                    false);
+
+                destTr.Commit();
+            }
+
+            tr.Commit();
+
+            destDb.SaveAs(outputPath, DwgVersion.Current);
+
+            ed.WriteMessage($"\n[FluxCAD] 저장 완료: {outputPath}");
+        }
+
+        [CommandMethod("FLUX_FIND_GIANT_BLOCKS")]
+        public void FindGiantBlocks()
+        {
+            var doc = Application.DocumentManager.MdiActiveDocument;
+            var db = doc.Database;
+            var ed = doc.Editor;
+
+            var blocks = new List<TopLevelBlockInfo>();
+
+            using (var tr = db.TransactionManager.StartTransaction())
+            {
+                var bt = (BlockTable)tr.GetObject(db.BlockTableId, OpenMode.ForRead);
+                var ms = (BlockTableRecord)tr.GetObject(bt[BlockTableRecord.ModelSpace], OpenMode.ForRead);
+
+                ed.WriteMessage("\n[FluxCAD] FLUX_FIND_GIANT_BLOCKS 시작");
+
+                foreach (ObjectId id in ms)
+                {
+                    var obj = tr.GetObject(id, OpenMode.ForRead);
+                    if (obj is not BlockReference br)
+                        continue;
+
+                    Extents3d ext;
+                    try
+                    {
+                        ext = br.GeometricExtents;
+                    }
+                    catch
+                    {
+                        continue;
+                    }
+
+                    double w = Math.Abs(ext.MaxPoint.X - ext.MinPoint.X);
+                    double h = Math.Abs(ext.MaxPoint.Y - ext.MinPoint.Y);
+                    double area = w * h;
+
+                    string name = "";
+                    try
+                    {
+                        var btr = (BlockTableRecord)tr.GetObject(br.BlockTableRecord, OpenMode.ForRead);
+                        name = btr.Name ?? "";
+                    }
+                    catch
+                    {
+                    }
+
+                    blocks.Add(new TopLevelBlockInfo
+                    {
+                        Handle = br.Handle.ToString(),
+                        Name = name,
+                        Bounds = ext,
+                        Width = w,
+                        Height = h,
+                        Area = area
+                    });
+                }
+
+                // 포함 관계 계산
+                for (int i = 0; i < blocks.Count; i++)
+                {
+                    for (int j = 0; j < blocks.Count; j++)
+                    {
+                        if (i == j)
+                            continue;
+
+                        if (ContainsExtents(blocks[i].Bounds, blocks[j].Bounds))
+                        {
+                            blocks[i].ContainsCount++;
+                            blocks[j].ContainedByCount++;
+                        }
+                    }
+                }
+
+                tr.Commit();
+            }
+
+            ed.WriteMessage($"\n[FluxCAD] Top-level BlockReferences = {blocks.Count}");
+
+            // 면적 상위 출력
+            ed.WriteMessage("\n================ AREA TOP 20 ================");
+            foreach (var b in blocks.OrderByDescending(x => x.Area).Take(20))
+            {
+                ed.WriteMessage(
+                    $"\nHandle={b.Handle}" +
+                    $" Name={b.Name}" +
+                    $" | W={b.Width:F2}, H={b.Height:F2}, Area={b.Area:F2}" +
+                    $" | Contains={b.ContainsCount}, ContainedBy={b.ContainedByCount}"
+                );
+            }
+
+            // 포함 수 상위 출력
+            ed.WriteMessage("\n================ CONTAINS TOP 20 ================");
+            foreach (var b in blocks.OrderByDescending(x => x.ContainsCount).ThenByDescending(x => x.Area).Take(20))
+            {
+                ed.WriteMessage(
+                    $"\nHandle={b.Handle}" +
+                    $" Name={b.Name}" +
+                    $" | W={b.Width:F2}, H={b.Height:F2}, Area={b.Area:F2}" +
+                    $" | Contains={b.ContainsCount}, ContainedBy={b.ContainedByCount}"
+                );
+            }
+
+            // giant 후보 간단 판정
+            // 기준:
+            // 1) 포함 수가 10개 이상이거나
+            // 2) area 상위권 + 포함 수가 있음
+            var areaSorted = blocks.OrderByDescending(x => x.Area).ToList();
+            double areaCut = areaSorted.Count > 0
+                ? areaSorted[Math.Min(areaSorted.Count - 1, Math.Max(0, areaSorted.Count / 20))].Area
+                : 0; // 대략 상위 5% 경계
+
+            var giantCandidates = blocks
+                .Where(x =>
+                    x.ContainsCount >= 10 ||
+                    (x.Area >= areaCut && x.ContainsCount >= 3))
+                .OrderByDescending(x => x.ContainsCount)
+                .ThenByDescending(x => x.Area)
+                .ToList();
+
+            ed.WriteMessage("\n================ GIANT CANDIDATES ================");
+            foreach (var b in giantCandidates)
+            {
+                ed.WriteMessage(
+                    $"\n[GIANT] Handle={b.Handle}" +
+                    $" Name={b.Name}" +
+                    $" | W={b.Width:F2}, H={b.Height:F2}, Area={b.Area:F2}" +
+                    $" | Contains={b.ContainsCount}, ContainedBy={b.ContainedByCount}"
+                );
+            }
+
+            ed.WriteMessage(
+                $"\n==================================================" +
+                $"\n[FluxCAD] Giant 후보 수 = {giantCandidates.Count}" +
+                $"\n=================================================="
+            );
+        }
+
+        private static bool ContainsExtents(Extents3d outer, Extents3d inner, double eps = 1e-4)
+        {
+            return
+                outer.MinPoint.X <= inner.MinPoint.X + eps &&
+                outer.MinPoint.Y <= inner.MinPoint.Y + eps &&
+                outer.MaxPoint.X >= inner.MaxPoint.X - eps &&
+                outer.MaxPoint.Y >= inner.MaxPoint.Y - eps;
+        }
+
+        private List<TopLevelBlockInfo> CollectTopLevelBlocks(Database db, Transaction tr)
+        {
+            var result = new List<TopLevelBlockInfo>();
+
+            var bt = (BlockTable)tr.GetObject(db.BlockTableId, OpenMode.ForRead);
+            var ms = (BlockTableRecord)tr.GetObject(bt[BlockTableRecord.ModelSpace], OpenMode.ForRead);
+
+            foreach (ObjectId id in ms)
+            {
+                var obj = tr.GetObject(id, OpenMode.ForRead);
+                if (obj is not BlockReference br)
+                    continue;
+
+                Extents3d ext;
+                try
+                {
+                    ext = br.GeometricExtents;
+                }
+                catch
+                {
+                    continue;
+                }
+
+                double w = Math.Abs(ext.MaxPoint.X - ext.MinPoint.X);
+                double h = Math.Abs(ext.MaxPoint.Y - ext.MinPoint.Y);
+                double area = w * h;
+
+                string name = "";
+                try
+                {
+                    var btr = (BlockTableRecord)tr.GetObject(br.BlockTableRecord, OpenMode.ForRead);
+                    name = btr.Name ?? "";
+                }
+                catch
+                {
+                }
+
+                result.Add(new TopLevelBlockInfo
+                {
+                    Id = id,
+                    Handle = br.Handle.ToString(),
+                    Name = name,
+                    Bounds = ext,
+                    Width = w,
+                    Height = h,
+                    Area = area
+                });
+            }
+
+            for (int i = 0; i < result.Count; i++)
+            {
+                for (int j = 0; j < result.Count; j++)
+                {
+                    if (i == j)
+                        continue;
+
+                    if (ContainsExtents(result[i].Bounds, result[j].Bounds))
+                    {
+                        result[i].ContainsCount++;
+                        result[j].ContainedByCount++;
+                    }
+                }
+            }
+
+            return result;
+        }
+
+        private List<TopLevelBlockInfo> SelectGiantCandidates(List<TopLevelBlockInfo> blocks)
+        {
+            var areaSorted = blocks.OrderByDescending(x => x.Area).ToList();
+
+            double areaCut = areaSorted.Count > 0
+                ? areaSorted[Math.Min(areaSorted.Count - 1, Math.Max(0, areaSorted.Count / 20))].Area
+                : 0; // 대략 상위 5%
+
+            var giantCandidates = blocks
+                .Where(x =>
+                    x.ContainsCount >= 10 ||
+                    (x.Area >= areaCut && x.ContainsCount >= 3))
+                .OrderByDescending(x => x.ContainsCount)
+                .ThenByDescending(x => x.Area)
+                .ToList();
+
+            return giantCandidates;
+        }
+
+        private static bool ContainsExtents2(Extents3d outer, Extents3d inner, double eps = 1e-4)
+        {
+            return
+                outer.MinPoint.X <= inner.MinPoint.X + eps &&
+                outer.MinPoint.Y <= inner.MinPoint.Y + eps &&
+                outer.MaxPoint.X >= inner.MaxPoint.X - eps &&
+                outer.MaxPoint.Y >= inner.MaxPoint.Y - eps;
+        }
+
+
+        [CommandMethod("FLUX_CLASSIFY_BLOCK_ROLES")]
+        public void ClassifyBlockRoles()
+        {
+            var doc = Application.DocumentManager.MdiActiveDocument;
+            var db = doc.Database;
+            var ed = doc.Editor;
+
+            var classifier = new BlockRoleClassifier();
+            int totalBlocks = 0;
+            int metaCount = 0;
+            int geometryCount = 0;
+            int frameCount = 0;
+            int unknownCount = 0;
+
+            using (var tr = db.TransactionManager.StartTransaction())
+            {
+                var bt = (BlockTable)tr.GetObject(db.BlockTableId, OpenMode.ForRead);
+                var ms = (BlockTableRecord)tr.GetObject(bt[BlockTableRecord.ModelSpace], OpenMode.ForRead);
+
+                ed.WriteMessage("\n[FluxCAD] FLUX_CLASSIFY_BLOCK_ROLES 시작");
+
+                foreach (ObjectId id in ms)
+                {
+                    var obj = tr.GetObject(id, OpenMode.ForRead);
+                    if (obj is not BlockReference br)
+                        continue;
+
+                    totalBlocks++;
+
+                    BlockAnalysisResult result;
+                    try
+                    {
+                        result = classifier.AnalyzeBlockReference(br, tr);
+                    }
+                    catch (System.Exception ex)
+                    {
+                        ed.WriteMessage($"\n[ERROR] Block 분석 실패 Handle={br.Handle}: {ex.Message}");
+                        unknownCount++;
+                        continue;
+                    }
+
+                    switch (result.Score.Role)
+                    {
+                        case BlockRole.Meta:
+                            metaCount++;
+                            break;
+                        case BlockRole.Geometry:
+                            geometryCount++;
+                            break;
+                        case BlockRole.Frame:
+                            frameCount++;
+                            break;
+                        default:
+                            unknownCount++;
+                            break;
+                    }
+
+                    double width = 0;
+                    double height = 0;
+                    double area = 0;
+
+                    if (result.Bounds.HasValue)
+                    {
+                        width = Math.Abs(result.Bounds.Value.MaxPoint.X - result.Bounds.Value.MinPoint.X);
+                        height = Math.Abs(result.Bounds.Value.MaxPoint.Y - result.Bounds.Value.MinPoint.Y);
+                        area = width * height;
+                    }
+
+                    var b = result.Bounds;
+                    string boundsText = b.HasValue
+                        ? $"Min=({b.Value.MinPoint.X:F2},{b.Value.MinPoint.Y:F2}) Max=({b.Value.MaxPoint.X:F2},{b.Value.MaxPoint.Y:F2}) | W={width:F2}, H={height:F2}, Area={area:F2}"
+                        : "Bounds=Unavailable";
+
+                    ed.WriteMessage(
+                        $"\n--------------------------------------------------" +
+                        $"\n[Block] Handle={result.Handle} Name={result.Name}" +
+                        $"\n{boundsText}" +
+                        $"\nSize: W={width:F2}, H={height:F2}, Area={area:F2}" +
+                        $"\nStats: Text={result.Stats.TotalTextCount} (DB={result.Stats.DbTextCount}, MT={result.Stats.MTextCount}, ATT={result.Stats.AttributeCount})" +
+                        $"\n       Geo={result.Stats.TotalGeometryCount} (L={result.Stats.LineCount}, A={result.Stats.ArcCount}, C={result.Stats.CircleCount}, P={result.Stats.PolylineCount})" +
+                        $"\n       Nested={result.Stats.NestedBlockCount}" +
+                        $"\n       LongH={result.Stats.LongHorizontalLineCount}, LongV={result.Stats.LongVerticalLineCount}" +
+                        $"\nScores: Meta={result.Score.MetaScore:F1}, Geometry={result.Score.GeometryScore:F1}, Frame={result.Score.FrameScore:F1}" +
+                        $"\nRole: {result.Score.Role}" +
+                        $"\nReason: {result.Score.Reason}"
+                    );
+                }
+
+                tr.Commit();
+            }
+
+            ed.WriteMessage(
+                $"\n==================================================" +
+                $"\n[FluxCAD] 분류 완료" +
+                $"\nTotal BlockReferences = {totalBlocks}" +
+                $"\nMETA     = {metaCount}" +
+                $"\nGEOMETRY = {geometryCount}" +
+                $"\nFRAME    = {frameCount}" +
+                $"\nUNKNOWN  = {unknownCount}" +
+                $"\n=================================================="
+            );
+        }
+
+
+        [CommandMethod("FLUX_DEBUG_BLOCK_CONTENT")]
+        public void DebugBlockContent()
+        {
+            var doc = Application.DocumentManager.MdiActiveDocument;
+            var db = doc.Database;
+            var ed = doc.Editor;
+
+            var pr = ed.GetString("\n분석할 BlockReference Handle 입력: ");
+            if (pr.Status != PromptStatus.OK)
+                return;
+
+            string handleText = pr.StringResult.Trim();
+
+            using (var tr = db.TransactionManager.StartTransaction())
+            {
+                var bt = (BlockTable)tr.GetObject(db.BlockTableId, OpenMode.ForRead);
+                var ms = (BlockTableRecord)tr.GetObject(bt[BlockTableRecord.ModelSpace], OpenMode.ForRead);
+
+                BlockReference target = null;
+
+                foreach (ObjectId id in ms)
+                {
+                    if (!(tr.GetObject(id, OpenMode.ForRead) is BlockReference br))
+                        continue;
+
+                    if (string.Equals(br.Handle.ToString(), handleText, StringComparison.OrdinalIgnoreCase))
+                    {
+                        target = br;
+                        break;
+                    }
+                }
+
+                if (target == null)
+                {
+                    ed.WriteMessage($"\n[FluxCAD] Handle={handleText} 인 BlockReference를 찾지 못했습니다.");
+                    return;
+                }
+
+                ed.WriteMessage($"\n[FluxCAD] Target Handle={target.Handle}");
+
+                DumpBlockRecursive(target, tr, ed, 0);
+
+                tr.Commit();
+            }
+        }
+
+        private void DumpBlockRecursive(BlockReference br, Transaction tr, Editor ed, int depth)
+        {
+            string indent = new string(' ', depth * 2);
+
+            BlockTableRecord btr = (BlockTableRecord)tr.GetObject(br.BlockTableRecord, OpenMode.ForRead);
+
+            ed.WriteMessage($"\n{indent}[BLOCK] RefHandle={br.Handle}, Name={btr.Name}");
+
+            foreach (ObjectId entId in btr)
+            {
+                var ent = tr.GetObject(entId, OpenMode.ForRead) as Entity;
+                if (ent == null)
+                    continue;
+
+                string typeName = ent.GetType().Name;
+
+                if (ent is DBText dbt)
+                {
+                    ed.WriteMessage($"\n{indent}  [DBText] \"{dbt.TextString}\"");
+                }
+                else if (ent is MText mt)
+                {
+                    ed.WriteMessage($"\n{indent}  [MText.Text] \"{mt.Text}\"");
+                    ed.WriteMessage($"\n{indent}  [MText.Contents] \"{mt.Contents}\"");
+                }
+                else if (ent is BlockReference childBr)
+                {
+                    ed.WriteMessage($"\n{indent}  [NestedBlockReference] Handle={childBr.Handle}");
+                    DumpBlockRecursive(childBr, tr, ed, depth + 1);
+                }
+                else
+                {
+                    ed.WriteMessage($"\n{indent}  [{typeName}]");
+                }
+            }
+        }
+
         [CommandMethod("FLUX_DETECT_SHEET_CANDIDATES")]
         public void DetectSheetCandidates()
         {
@@ -28,7 +510,7 @@ namespace FluxCAD.BricsCAD.Plugin26
 
             using (var tr = db.TransactionManager.StartTransaction())
             {
-                var blockInfos = CollectBlockCandidates(db, tr);
+                var blockInfos = CollectBlockCandidates(db, tr, ed);
 
                 if (blockInfos.Count == 0)
                 {
@@ -44,15 +526,18 @@ namespace FluxCAD.BricsCAD.Plugin26
                         info.KeywordScore * 3 +
                         info.TextDensityScore * 2 +
                         info.MetaRegionScore * 2 +
-                        info.RepeatedTextScore * 3 +
-                        info.RepeatedLayoutScore * 2 +
-                        info.SizeScore;
+                        info.RepeatedTextScore * 2 +
+                        info.RepeatedLayoutScore * 3 +
+                        info.GeometryScore * 3 +
+                        info.SizeScore * 2;
 
                     info.Grade = ClassifyGrade(info);
                 }
 
+                // 디버깅은 큰 후보부터 보는 것이 낫습니다.
                 var ordered = blockInfos
                     .OrderByDescending(x => x.Grade)
+                    .ThenByDescending(x => x.Area)
                     .ThenByDescending(x => x.FinalScore)
                     .ToList();
 
@@ -66,20 +551,25 @@ namespace FluxCAD.BricsCAD.Plugin26
 
                 foreach (var info in ordered)
                 {
+                    string sample = string.Join(" | ", info.TextsRaw.Take(5));
                     ed.WriteMessage(
                         $"\n[{info.Grade}] Handle={info.Handle} " +
-                        $"Score={info.FinalScore} " +
-                        $"Keywords={info.KeywordScore} RepeatedText={info.RepeatedTextScore} " +
-                        $"RepeatedLayout={info.RepeatedLayoutScore} Meta={info.MetaRegionScore} " +
-                        $"Texts={info.TextCount} BBox=({info.Bounds.MinPoint.X:F2},{info.Bounds.MinPoint.Y:F2})~({info.Bounds.MaxPoint.X:F2},{info.Bounds.MaxPoint.Y:F2})"
+                        $"Score={info.FinalScore} Area={info.Area:F0} " +
+                        $"W={info.Width:F1} H={info.Height:F1} " +
+                        $"Lines={info.LineCount} Arcs={info.ArcCount} Texts={info.TextCount} " +
+                        $"Kw={info.KeywordScore} RepText={info.RepeatedTextScore} RepLayout={info.RepeatedLayoutScore} " +
+                        $"Meta={info.MetaRegionScore} Geo={info.GeometryScore} Size={info.SizeScore}"
                     );
+
+                    if (!string.IsNullOrWhiteSpace(sample))
+                        ed.WriteMessage($"\n    SampleText: {sample}");
                 }
 
                 tr.Commit();
             }
         }
 
-        private List<BlockCandidateInfo> CollectBlockCandidates(Database db, Transaction tr)
+        private List<BlockCandidateInfo> CollectBlockCandidates(Database db, Transaction tr, Editor ed)
         {
             var result = new List<BlockCandidateInfo>();
 
@@ -95,11 +585,23 @@ namespace FluxCAD.BricsCAD.Plugin26
                 if (!TryGetEntityExtents(br, out var bounds))
                     continue;
 
+                double width = bounds.MaxPoint.X - bounds.MinPoint.X;
+                double height = bounds.MaxPoint.Y - bounds.MinPoint.Y;
+                double area = width * height;
+
+                // 너무 작은 block는 초기에 제외
+                // 값은 도면에 맞게 조금씩 조정하세요.
+                if (width < 80 || height < 40 || area < 15000)
+                    continue;
+
                 var info = new BlockCandidateInfo
                 {
                     Id = br.ObjectId,
                     Handle = br.Handle.ToString(),
-                    Bounds = bounds
+                    Bounds = bounds,
+                    Width = width,
+                    Height = height,
+                    Area = area
                 };
 
                 ExtractBlockMetaFeatures(br, tr, info);
@@ -117,10 +619,8 @@ namespace FluxCAD.BricsCAD.Plugin26
 
             double minX = info.Bounds.MinPoint.X;
             double minY = info.Bounds.MinPoint.Y;
-            double maxX = info.Bounds.MaxPoint.X;
-            double maxY = info.Bounds.MaxPoint.Y;
-            double width = Math.Max(1e-6, maxX - minX);
-            double height = Math.Max(1e-6, maxY - minY);
+            double width = Math.Max(1e-6, info.Width);
+            double height = Math.Max(1e-6, info.Height);
 
             foreach (ObjectId entId in btr)
             {
@@ -128,35 +628,112 @@ namespace FluxCAD.BricsCAD.Plugin26
                 if (ent == null)
                     continue;
 
-                if (ent is DBText dbText)
+                switch (ent)
                 {
-                    string text = NormalizeText(dbText.TextString);
-                    if (!string.IsNullOrWhiteSpace(text))
-                    {
-                        info.Texts.Add(text);
-                        info.TextCount++;
+                    case Line _:
+                        info.LineCount++;
+                        break;
 
-                        var p = dbText.Position.TransformBy(br.BlockTransform);
-                        double rx = (p.X - minX) / width;
-                        double ry = (p.Y - minY) / height;
-                        info.TextPositions.Add(new RelativePoint(rx, ry));
-                    }
-                }
-                else if (ent is MText mtext)
-                {
-                    string text = NormalizeText(mtext.Text);
-                    if (!string.IsNullOrWhiteSpace(text))
-                    {
-                        info.Texts.Add(text);
-                        info.TextCount++;
+                    case Arc _:
+                        info.ArcCount++;
+                        break;
 
-                        var p = mtext.Location.TransformBy(br.BlockTransform);
-                        double rx = (p.X - minX) / width;
-                        double ry = (p.Y - minY) / height;
-                        info.TextPositions.Add(new RelativePoint(rx, ry));
-                    }
+                    case DBText dbText:
+                        {
+                            info.DBTextCount++;
+
+                            string raw = GetDisplayText(dbText);
+                            string norm = NormalizeForCompare(raw);
+
+                            if (!string.IsNullOrWhiteSpace(raw))
+                                info.TextsRaw.Add(raw);
+
+                            if (!string.IsNullOrWhiteSpace(norm))
+                            {
+                                info.Texts.Add(norm);
+                                info.TextCount++;
+
+                                var p = dbText.Position.TransformBy(br.BlockTransform);
+                                AddRelativeTextPoint(info, p, minX, minY, width, height);
+                            }
+                            break;
+                        }
+
+                    case MText mText:
+                        {
+                            info.MTextCount++;
+
+                            string raw = GetDisplayText(mText);
+                            string norm = NormalizeForCompare(raw);
+
+                            if (!string.IsNullOrWhiteSpace(raw))
+                                info.TextsRaw.Add(raw);
+
+                            if (!string.IsNullOrWhiteSpace(norm))
+                            {
+                                info.Texts.Add(norm);
+                                info.TextCount++;
+
+                                var p = mText.Location.TransformBy(br.BlockTransform);
+                                AddRelativeTextPoint(info, p, minX, minY, width, height);
+                            }
+                            break;
+                        }
                 }
             }
+        }
+
+        private void AddRelativeTextPoint(
+            BlockCandidateInfo info,
+            Point3d p,
+            double minX,
+            double minY,
+            double width,
+            double height)
+        {
+            double rx = (p.X - minX) / width;
+            double ry = (p.Y - minY) / height;
+            info.TextPositions.Add(new RelativePoint(rx, ry));
+        }
+
+        private string GetDisplayText(DBText dbText)
+        {
+            return dbText?.TextString?.Trim() ?? string.Empty;
+        }
+
+        private string GetDisplayText(MText mText)
+        {
+            if (mText == null)
+                return string.Empty;
+
+            // BricsCAD 화면 표시와 최대한 가까운 plain text를 목표로 한다.
+            // MText.Text 가 포맷이 덜 섞이는 경우가 많아 우선 사용.
+            string s = mText.Text ?? string.Empty;
+
+            if (string.IsNullOrWhiteSpace(s))
+                s = mText.Contents ?? string.Empty;
+
+            // 줄바꿈 코드 정리
+            s = s.Replace("\\P", " ");
+            s = s.Replace("\r", " ").Replace("\n", " ");
+
+            return s.Trim();
+        }
+
+        private string NormalizeForCompare(string text)
+        {
+            if (string.IsNullOrWhiteSpace(text))
+                return string.Empty;
+
+            string s = text.Trim();
+
+            // 너무 과하게 훼손하지 않는 약한 정규화
+            s = s.Replace("\r", " ").Replace("\n", " ");
+            s = s.Replace("%%", "%"); // % 중복 완화
+            s = Regex.Replace(s, @"\s+", " ");
+            s = s.ToUpperInvariant();
+
+            return s.Trim();
         }
 
         private void ComputeAbsoluteScores(BlockCandidateInfo info)
@@ -175,28 +752,33 @@ namespace FluxCAD.BricsCAD.Plugin26
                     info.KeywordScore++;
             }
 
-            if (info.TextCount >= 5) info.TextDensityScore = 1;
-            if (info.TextCount >= 10) info.TextDensityScore = 2;
-            if (info.TextCount >= 20) info.TextDensityScore = 3;
+            if (info.TextCount >= 3) info.TextDensityScore = 1;
+            if (info.TextCount >= 8) info.TextDensityScore = 2;
+            if (info.TextCount >= 15) info.TextDensityScore = 3;
 
-            // 우하단 메타 영역 간단 체크
-            int bottomRightCount = info.TextPositions.Count(p => p.X >= 0.65 && p.Y <= 0.35);
-            if (bottomRightCount >= 3) info.MetaRegionScore = 1;
-            if (bottomRightCount >= 6) info.MetaRegionScore = 2;
-            if (bottomRightCount >= 10) info.MetaRegionScore = 3;
+            int bottomBand = info.TextPositions.Count(p => p.Y <= 0.25);
+            int rightBand = info.TextPositions.Count(p => p.X >= 0.70);
+            int bottomRight = info.TextPositions.Count(p => p.X >= 0.65 && p.Y <= 0.35);
 
-            double width = info.Bounds.MaxPoint.X - info.Bounds.MinPoint.X;
-            double height = info.Bounds.MaxPoint.Y - info.Bounds.MinPoint.Y;
-            double area = width * height;
-            double ratio = width / Math.Max(1e-6, height);
+            if (bottomRight >= 2) info.MetaRegionScore = 1;
+            if (bottomRight >= 5) info.MetaRegionScore = 2;
+            if (bottomRight >= 8) info.MetaRegionScore = 3;
 
-            if (area > 1000) info.SizeScore++;
-            if (ratio >= 1.1 && ratio <= 3.5) info.SizeScore++;
+            // geometry 점수: line + arc + text가 함께 있어야 문서 양식 가능성 높음
+            if (info.LineCount >= 10) info.GeometryScore++;
+            if (info.TextCount >= 3) info.GeometryScore++;
+            if (info.ArcCount >= 1) info.GeometryScore++;
+
+            if (info.Area > 50000) info.SizeScore++;
+            if (info.Area > 200000) info.SizeScore++;
+
+            double ratio = info.Width / Math.Max(1e-6, info.Height);
+            if (ratio >= 1.0 && ratio <= 5.0) info.SizeScore++;
         }
 
         private void BuildRepeatedPatternScores(List<BlockCandidateInfo> blocks)
         {
-            // 1) 반복 텍스트 점수
+            // 반복 텍스트는 "완전 동일 문자열"만 보지 않기 위해 짧고 의미 없는 건 제외
             var textFrequency = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
 
             foreach (var block in blocks)
@@ -204,6 +786,9 @@ namespace FluxCAD.BricsCAD.Plugin26
                 foreach (var text in block.Texts.Distinct(StringComparer.OrdinalIgnoreCase))
                 {
                     if (string.IsNullOrWhiteSpace(text))
+                        continue;
+
+                    if (text.Length < 2)
                         continue;
 
                     if (!textFrequency.ContainsKey(text))
@@ -217,40 +802,37 @@ namespace FluxCAD.BricsCAD.Plugin26
             {
                 foreach (var text in block.Texts.Distinct(StringComparer.OrdinalIgnoreCase))
                 {
-                    if (textFrequency.TryGetValue(text, out int freq) && freq >= 2)
-                    {
-                        block.RepeatedTextScore++;
-                    }
-                }
-            }
+                    if (text.Length < 2)
+                        continue;
 
-            // 2) 반복 레이아웃 점수
-            // 매우 단순화된 버전: 우하단/하단에 텍스트가 비슷하게 몰려 있는지
-            foreach (var block in blocks)
-            {
+                    if (textFrequency.TryGetValue(text, out int freq) && freq >= 2)
+                        block.RepeatedTextScore++;
+                }
+
+                // 반복 레이아웃: 우하단/하단 밴드 집중 구조
                 int bottomBand = block.TextPositions.Count(p => p.Y <= 0.25);
                 int rightBand = block.TextPositions.Count(p => p.X >= 0.70);
                 int bottomRight = block.TextPositions.Count(p => p.X >= 0.65 && p.Y <= 0.35);
 
-                if (bottomBand >= 4) block.RepeatedLayoutScore++;
-                if (rightBand >= 3) block.RepeatedLayoutScore++;
-                if (bottomRight >= 3) block.RepeatedLayoutScore++;
+                if (bottomBand >= 3) block.RepeatedLayoutScore++;
+                if (rightBand >= 2) block.RepeatedLayoutScore++;
+                if (bottomRight >= 2) block.RepeatedLayoutScore++;
             }
         }
 
         private CandidateGrade ClassifyGrade(BlockCandidateInfo info)
         {
             // 강한 후보
-            if (info.KeywordScore >= 2 &&
-                info.RepeatedTextScore >= 2 &&
-                info.MetaRegionScore >= 1)
+            if (info.SizeScore >= 2 &&
+                info.GeometryScore >= 2 &&
+                (info.MetaRegionScore >= 1 || info.RepeatedLayoutScore >= 2))
                 return CandidateGrade.A;
 
-            if (info.FinalScore >= 12)
+            if (info.FinalScore >= 14)
                 return CandidateGrade.A;
 
             // 의심 후보
-            if (info.FinalScore >= 6)
+            if (info.FinalScore >= 8)
                 return CandidateGrade.B;
 
             return CandidateGrade.None;
@@ -268,20 +850,6 @@ namespace FluxCAD.BricsCAD.Plugin26
             {
                 return false;
             }
-        }
-
-        private string NormalizeText(string text)
-        {
-            if (string.IsNullOrWhiteSpace(text))
-                return string.Empty;
-
-            string s = text.Trim().ToUpperInvariant();
-            s = s.Replace("\\P", " ");
-            s = s.Replace("\r", " ").Replace("\n", " ");
-            while (s.Contains("  "))
-                s = s.Replace("  ", " ");
-
-            return s;
         }
 
         [CommandMethod("FLUX_DEBUG_SHEETS")]
@@ -3850,7 +4418,7 @@ namespace FluxCAD.BricsCAD.Plugin26
 
                 foreach (DBDictionaryEntry entry in groupDict)
                 {
-                    var group = tr.GetObject(entry.Value, OpenMode.ForRead) as Group;
+                    var group = tr.GetObject(entry.Value, OpenMode.ForRead) as Teigha.DatabaseServices.Group;
 
                     if (group == null)
                         continue;
