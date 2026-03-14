@@ -8,7 +8,7 @@ using Teigha.Geometry;
 
 namespace FluxCAD.BricsCAD.Plugin26
 {
-    public class SpatialGroup
+    public class SpatialGroup2
     {
         public List<ObjectId> Entities { get; } = new();
 

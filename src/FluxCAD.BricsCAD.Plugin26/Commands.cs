@@ -6,8 +6,10 @@ using Newtonsoft.Json.Linq;
 using System;
 using System.Drawing;
 using System.Drawing.Imaging;
+using System.Globalization;
 using System.IO;
 using System.Text.RegularExpressions;
+using System.Windows.Media.Animation;
 using Teigha.DatabaseServices;
 using Teigha.Geometry; // Point3d, Vector3d 등이 정의된 곳
 using Teigha.GraphicsSystem;
@@ -16,9 +18,3764 @@ using Teigha.Runtime;
 
 namespace FluxCAD.BricsCAD.Plugin26
 {
+    internal sealed class FluxCell
+    {
+        public int Row { get; set; }
+        public int Col { get; set; }
+        public Extents3d Bounds { get; set; }
+        public int EntityCount { get; set; }
+        public int LineCount { get; set; }
+        public int TextCount { get; set; }
+        public int BlockCount { get; set; }
+    }
+
+    internal sealed class GridAxisInfo
+    {
+        public double Coord { get; set; }
+        public List<GridInterval1D> Raw { get; } = new List<GridInterval1D>();
+        public List<GridInterval1D> Merged { get; set; } = new List<GridInterval1D>();
+
+        public double TotalSpan => Merged.Sum(x => x.B - x.A);
+        public double MaxSpan => Merged.Count == 0 ? 0 : Merged.Max(x => x.B - x.A);
+        public int SegmentCount => Merged.Count;
+    }
+
+    internal struct GridInterval1D
+    {
+        public double A;
+        public double B;
+
+        public GridInterval1D(double a, double b)
+        {
+            A = Math.Min(a, b);
+            B = Math.Max(a, b);
+        }
+    }
+
+    internal sealed class RegionCandidate
+    {
+        public int Id { get; set; }
+        public string SourceType { get; set; } = "";
+        public Extents3d Bounds { get; set; }
+        public Handle SourceHandle { get; set; }
+        public int ParentId { get; set; } = -1;
+    }
+
+    internal struct Interval1D
+    {
+        public double A;
+        public double B;
+
+        public Interval1D(double a, double b)
+        {
+            A = Math.Min(a, b);
+            B = Math.Max(a, b);
+        }
+    }
+
+    internal sealed class CoordIntervals
+    {
+        public double Coord { get; set; }
+        public List<Interval1D> Raw { get; } = new List<Interval1D>();
+        public List<Interval1D> Merged { get; set; } = new List<Interval1D>();
+    }
+
+    public sealed class CellSceneDebugStats
+    {
+        public int Candidates;
+        public int RejectNullWrapper;
+        public int RejectNullGeometry;
+        public int RejectBlockRef;
+        public int RejectNoWorldExtents;
+        public int RejectNoRepPoint;
+        public int RejectRepOutside;
+        public int RejectExtOutside;
+        public int Accepted;
+    }
     public class Commands
     {
         List<Entity> _flattened = new List<Entity>();
+        private const string CopySetRegAppName = "FLUXCAD";
+        private const string FluxCadRegAppName = "FLUXCAD";
+        private List<double>? _lastRecoveredGridXs;
+        private List<double>? _lastRecoveredGridYs;
+
+        [CommandMethod("FLUX_DEBUG_CELL_SCENE")]
+        public void DebugCellScene()
+        {
+            var doc = Application.DocumentManager.MdiActiveDocument;
+            var db = doc.Database;
+            var ed = doc.Editor;
+
+            try
+            {
+                using (var tr = db.TransactionManager.StartTransaction())
+                {
+                    var cells = DetectGridCells(tr, db, ed);
+
+                    int targetRow = 1;
+
+                    var targetCells = cells
+                        .Where(c => c.Row == targetRow)
+                        .OrderBy(c => c.Col)
+                        .ToList();
+
+                    ed.WriteMessage($"\n[FluxCAD] Target row = {targetRow}, cells = {targetCells.Count}");
+
+                    foreach (var cell in targetCells)
+                    {
+                        // 인자 순서 수정
+                        var scene = BuildCellScene(tr, db, ed, cell, normalizeToLocal: true);
+
+                        int lineCount = scene.Entities.Count(x => x.EntityType == nameof(Line));
+                        int arcCount = scene.Entities.Count(x => x.EntityType == nameof(Arc));
+                        int textCount = scene.Entities.Count(x =>
+                            x.EntityType == nameof(DBText) || x.EntityType == nameof(MText));
+                        int blockCount = scene.Entities.Count(x => x.EntityType == nameof(BlockReference));
+
+                        ed.WriteMessage(
+                            $"\n[Scene r{cell.Row} c{cell.Col}] " +
+                            $"Entities={scene.Entities.Count}, Lines={lineCount}, Arcs={arcCount}, Texts={textCount}, Blocks={blockCount}");
+
+                        var rects = FindRectangleCandidates(scene);
+
+                        ed.WriteMessage($"\n  RectCandidates={rects.Count}");
+
+                        foreach (var rc in rects.Take(3))
+                            ed.WriteMessage($"\n  -> {rc}");
+
+                        var best = rects.FirstOrDefault();
+                        if (best != null)
+                        {
+                            ed.WriteMessage(
+                                $"\n  PrimarySheetCandidate: " +
+                                $"Min=({best.Bounds.MinPoint.X:F2},{best.Bounds.MinPoint.Y:F2}) " +
+                                $"Max=({best.Bounds.MaxPoint.X:F2},{best.Bounds.MaxPoint.Y:F2}) " +
+                                $"Score={best.Score:F2}");
+                        }
+                        else
+                        {
+                            ed.WriteMessage("\n  PrimarySheetCandidate: NONE");
+                        }
+
+                        ed.WriteMessage("\n  Rectangle detection skipped for debug.");
+                    }
+
+                    tr.Commit();
+                }
+            }
+            catch (System.Exception ex)
+            {
+                ed.WriteMessage($"\n[FluxCAD][ERROR] FLUX_DEBUG_CELL_SCENE failed: {ex.Message}");
+            }
+        }
+
+        private CellScene BuildCellScene(
+    Transaction tr,
+    Database db,
+    Editor ed,
+    DetectedCell cell,
+    bool normalizeToLocal = true)
+        {
+            var scene = new CellScene
+            {
+                Cell = cell,
+                LocalBounds = new Extents3d(
+                    new Point3d(0, 0, 0),
+                    new Point3d(
+                        cell.Bounds.MaxPoint.X - cell.Bounds.MinPoint.X,
+                        cell.Bounds.MaxPoint.Y - cell.Bounds.MinPoint.Y,
+                        0))
+            };
+
+            var rawEntities = new List<FlattenedCellEntity>();
+
+            var bt = (BlockTable)tr.GetObject(db.BlockTableId, OpenMode.ForRead);
+            var ms = (BlockTableRecord)tr.GetObject(bt[BlockTableRecord.ModelSpace], OpenMode.ForRead);
+
+            foreach (ObjectId id in ms)
+            {
+                if (!id.IsValid || id.IsErased)
+                    continue;
+
+                var ent = tr.GetObject(id, OpenMode.ForRead, false) as Entity;
+                if (ent == null)
+                    continue;
+
+                // 현재 복구된 grid / 복사본만 보려면 유지
+                if (!HasFluxCadTag(ent))
+                    continue;
+
+                CollectVisibleEntitiesRecursive(
+                    tr,
+                    ent,
+                    Matrix3d.Identity,
+                    ent.GetType().Name,
+                    cell.Bounds,
+                    rawEntities,
+                    new HashSet<ObjectId>(),
+                    0);
+            }
+
+            scene.Entities = FilterCellEntitiesStrict(cell, rawEntities, ed, tol: 1.0);
+
+            if (normalizeToLocal)
+                NormalizeSceneToCellLocal(scene);
+
+            ed.WriteMessage(
+                $"\n[FluxCAD] BuildCellScene r{cell.Row} c{cell.Col} => Raw={rawEntities.Count}, Accepted={scene.Entities.Count}");
+
+            return scene;
+        }
+
+       
+
+        
+
+        private List<FlattenedCellEntity> FilterCellEntitiesStrict(
+    DetectedCell cell,
+    IEnumerable<FlattenedCellEntity> entities,
+    Editor ed = null,
+    double tol = 1.0)
+        {
+            var result = new List<FlattenedCellEntity>();
+            var stats = new CellSceneDebugStats();
+
+            var innerCell = Deflate(cell.Bounds, tol);
+            var outerCell = Inflate(cell.Bounds, tol);
+
+            foreach (var item in entities)
+            {
+                stats.Candidates++;
+
+                if (item == null)
+                {
+                    stats.RejectNullWrapper++;
+                    continue;
+                }
+
+                if (item.Geometry == null)
+                {
+                    stats.RejectNullGeometry++;
+                    continue;
+                }
+
+                // BlockReference 자체는 ownership 에서 제외
+                if (item.Geometry is BlockReference || item.EntityType == nameof(BlockReference))
+                {
+                    stats.RejectBlockRef++;
+                    continue;
+                }
+
+                if (!TryGetFlattenedWorldExtents(item, out var worldExt))
+                {
+                    stats.RejectNoWorldExtents++;
+                    continue;
+                }
+
+                if (!TryGetRepresentativePoint(item, out var rep))
+                {
+                    stats.RejectNoRepPoint++;
+                    continue;
+                }
+
+                if (!Contains(innerCell, rep))
+                {
+                    stats.RejectRepOutside++;
+                    continue;
+                }
+
+                if (!Contains(outerCell, worldExt))
+                {
+                    stats.RejectExtOutside++;
+                    continue;
+                }
+
+                result.Add(item);
+                stats.Accepted++;
+            }
+
+            if (ed != null)
+            {
+                ed.WriteMessage(
+                    $"\n[FluxCAD] StrictFilter r{cell.Row} c{cell.Col}" +
+                    $" candidates={stats.Candidates}" +
+                    $" reject_null_wrapper={stats.RejectNullWrapper}" +
+                    $" reject_null_geom={stats.RejectNullGeometry}" +
+                    $" reject_blockref={stats.RejectBlockRef}" +
+                    $" reject_no_worldext={stats.RejectNoWorldExtents}" +
+                    $" reject_no_rep={stats.RejectNoRepPoint}" +
+                    $" reject_rep_out={stats.RejectRepOutside}" +
+                    $" reject_ext_out={stats.RejectExtOutside}" +
+                    $" accepted={stats.Accepted}");
+            }
+
+            return result;
+        }
+
+        private bool TryGetFlattenedWorldExtents(FlattenedCellEntity item, out Extents3d ext)
+        {
+            ext = default;
+
+            if (item == null)
+                return false;
+
+            try
+            {
+                ext = item.WorldExtents;
+
+                if (double.IsNaN(ext.MinPoint.X) || double.IsNaN(ext.MinPoint.Y) ||
+                    double.IsNaN(ext.MaxPoint.X) || double.IsNaN(ext.MaxPoint.Y))
+                {
+                    return false;
+                }
+
+                return true;
+            }
+            catch
+            {
+                // fallback
+                try
+                {
+                    if (item.Geometry != null)
+                    {
+                        ext = item.Geometry.GeometricExtents;
+
+                        if (double.IsNaN(ext.MinPoint.X) || double.IsNaN(ext.MinPoint.Y) ||
+                            double.IsNaN(ext.MaxPoint.X) || double.IsNaN(ext.MaxPoint.Y))
+                        {
+                            return false;
+                        }
+
+                        return true;
+                    }
+                }
+                catch
+                {
+                }
+
+                return false;
+            }
+        }
+
+
+        private List<CellRegion> GetRow1Cells(Transaction tr, Database db, Editor ed)
+        {
+            var cells = DetectGridCells(tr, db, ed);
+
+            var row1Cells = cells
+                .Where(c => c.Row == 1)
+                .OrderBy(c => c.Col)
+                .Select(c => new CellRegion
+                {
+                    RowIndex = c.Row,
+                    ColIndex = c.Col,
+                    Extents = c.Bounds
+                })
+                .ToList();
+
+            ed.WriteMessage($"\n[FluxCAD] Row1 cells = {row1Cells.Count}");
+
+            foreach (var cell in row1Cells)
+            {
+                double w = cell.Extents.MaxPoint.X - cell.Extents.MinPoint.X;
+                double h = cell.Extents.MaxPoint.Y - cell.Extents.MinPoint.Y;
+
+                ed.WriteMessage(
+                    $"\n[Row1 c{cell.ColIndex}] " +
+                    $"W={w:F2}, H={h:F2}, " +
+                    $"Min=({cell.Extents.MinPoint.X:F2},{cell.Extents.MinPoint.Y:F2}) " +
+                    $"Max=({cell.Extents.MaxPoint.X:F2},{cell.Extents.MaxPoint.Y:F2})");
+            }
+
+            return row1Cells;
+        }
+
+
+        private bool TryGetRepresentativePoint(FlattenedCellEntity item, out Point3d pt)
+        {
+            pt = Point3d.Origin;
+
+            if (item == null || item.Geometry == null)
+                return false;
+
+            var ent = item.Geometry;
+
+            try
+            {
+                switch (ent)
+                {
+                    case DBText dbText:
+                        pt = dbText.Position;
+                        return true;
+
+                    case MText mText:
+                        pt = mText.Location;
+                        return true;
+
+                    case Circle circle:
+                        pt = circle.Center;
+                        return true;
+
+                    case Arc arc:
+                        {
+                            double midParam = (arc.StartParam + arc.EndParam) * 0.5;
+                            pt = arc.GetPointAtParameter(midParam);
+                            return true;
+                        }
+
+                    case Line line:
+                        pt = new Point3d(
+                            (line.StartPoint.X + line.EndPoint.X) * 0.5,
+                            (line.StartPoint.Y + line.EndPoint.Y) * 0.5,
+                            (line.StartPoint.Z + line.EndPoint.Z) * 0.5);
+                        return true;
+
+                    case Curve curve:
+                        {
+                            double midParam = (curve.StartParam + curve.EndParam) * 0.5;
+                            pt = curve.GetPointAtParameter(midParam);
+                            return true;
+                        }
+
+                    default:
+                        {
+                            if (TryGetFlattenedWorldExtents(item, out var ex))
+                            {
+                                pt = GetCenter(ex);
+                                return true;
+                            }
+                            return false;
+                        }
+                }
+            }
+            catch
+            {
+                try
+                {
+                    if (TryGetFlattenedWorldExtents(item, out var ex))
+                    {
+                        pt = GetCenter(ex);
+                        return true;
+                    }
+                }
+                catch
+                {
+                }
+
+                return false;
+            }
+        }
+
+
+        /// <summary>
+        /// entity representative point 계산
+        /// </summary>
+        private bool TryGetRepresentativePoint_old(Entity ent, out Point3d pt)
+        {
+            pt = Point3d.Origin;
+
+            try
+            {
+                switch (ent)
+                {
+                    case DBText dbText:
+                        pt = dbText.Position;
+                        return true;
+
+                    case MText mText:
+                        pt = mText.Location;
+                        return true;
+
+                    case Circle circle:
+                        pt = circle.Center;
+                        return true;
+
+                    case Arc arc:
+                        {
+                            double midParam = (arc.StartParam + arc.EndParam) * 0.5;
+                            pt = arc.GetPointAtParameter(midParam);
+                            return true;
+                        }
+
+                    case Line line:
+                        pt = new Point3d(
+                            (line.StartPoint.X + line.EndPoint.X) * 0.5,
+                            (line.StartPoint.Y + line.EndPoint.Y) * 0.5,
+                            (line.StartPoint.Z + line.EndPoint.Z) * 0.5);
+                        return true;
+
+                    case Polyline pl:
+                        {
+                            if (pl.NumberOfVertices > 0)
+                            {
+                                // 폴리라인은 extents center 가 더 안전한 경우가 많음
+                                if (TryGetEntityExtents(pl, out var ex))
+                                {
+                                    pt = GetCenter(ex);
+                                    return true;
+                                }
+                            }
+                            break;
+                        }
+
+                    case Curve curve:
+                        {
+                            double midParam = (curve.StartParam + curve.EndParam) * 0.5;
+                            pt = curve.GetPointAtParameter(midParam);
+                            return true;
+                        }
+
+                    default:
+                        {
+                            if (TryGetEntityExtents(ent, out var ex))
+                            {
+                                pt = GetCenter(ex);
+                                return true;
+                            }
+                            return false;
+                        }
+                }
+            }
+            catch
+            {
+                // fallback: extents center
+                try
+                {
+                    if (TryGetEntityExtents(ent, out var ex))
+                    {
+                        pt = GetCenter(ex);
+                        return true;
+                    }
+                }
+                catch
+                {
+                }
+
+                return false;
+            }
+
+            return false;
+        }
+
+        /// <summary>
+        /// GeometricExtents 는 예외가 자주 날 수 있으므로 안전 래핑
+        /// </summary>
+        private bool TryGetEntityExtents(Entity ent, out Extents3d ext)
+        {
+            ext = default;
+
+            try
+            {
+                ext = ent.GeometricExtents;
+
+                // 비정상 extents 방어
+                if (double.IsNaN(ext.MinPoint.X) || double.IsNaN(ext.MinPoint.Y) ||
+                    double.IsNaN(ext.MaxPoint.X) || double.IsNaN(ext.MaxPoint.Y))
+                    return false;
+
+                return true;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        private Point3d GetCenter(Extents3d ex)
+        {
+            return new Point3d(
+                (ex.MinPoint.X + ex.MaxPoint.X) * 0.5,
+                (ex.MinPoint.Y + ex.MaxPoint.Y) * 0.5,
+                (ex.MinPoint.Z + ex.MaxPoint.Z) * 0.5);
+        }
+
+        private Extents3d Inflate(Extents3d e, double d)
+        {
+            return new Extents3d(
+                new Point3d(e.MinPoint.X - d, e.MinPoint.Y - d, e.MinPoint.Z),
+                new Point3d(e.MaxPoint.X + d, e.MaxPoint.Y + d, e.MaxPoint.Z));
+        }
+
+        private Extents3d Deflate(Extents3d e, double d)
+        {
+            double minX = e.MinPoint.X + d;
+            double minY = e.MinPoint.Y + d;
+            double maxX = e.MaxPoint.X - d;
+            double maxY = e.MaxPoint.Y - d;
+
+            // 너무 작은 cell 방어
+            if (minX > maxX)
+            {
+                double cx = (e.MinPoint.X + e.MaxPoint.X) * 0.5;
+                minX = cx;
+                maxX = cx;
+            }
+
+            if (minY > maxY)
+            {
+                double cy = (e.MinPoint.Y + e.MaxPoint.Y) * 0.5;
+                minY = cy;
+                maxY = cy;
+            }
+
+            return new Extents3d(
+                new Point3d(minX, minY, e.MinPoint.Z),
+                new Point3d(maxX, maxY, e.MaxPoint.Z));
+        }
+
+        private bool Contains(Extents3d e, Point3d p)
+        {
+            return p.X >= e.MinPoint.X && p.X <= e.MaxPoint.X
+                && p.Y >= e.MinPoint.Y && p.Y <= e.MaxPoint.Y;
+        }
+
+        private bool Contains(Extents3d outer, Extents3d inner)
+        {
+            return inner.MinPoint.X >= outer.MinPoint.X
+                && inner.MaxPoint.X <= outer.MaxPoint.X
+                && inner.MinPoint.Y >= outer.MinPoint.Y
+                && inner.MaxPoint.Y <= outer.MaxPoint.Y;
+        }
+
+
+
+        private Extents3d BuildLocalBounds(Extents3d worldCellExt)
+        {
+            var w = worldCellExt.MaxPoint.X - worldCellExt.MinPoint.X;
+            var h = worldCellExt.MaxPoint.Y - worldCellExt.MinPoint.Y;
+
+            return new Extents3d(
+                new Point3d(0, 0, 0),
+                new Point3d(w, h, 0));
+        }
+
+
+        private void CollectVisibleEntitiesRecursive(
+    Transaction tr,
+    Entity ent,
+    Matrix3d currentTransform,
+    string sourcePath,
+    Extents3d cellBounds,
+    List<FlattenedCellEntity> output,
+    HashSet<ObjectId> activeBlockStack,
+    int depth = 0)
+        {
+            const int MaxDepth = 32;
+
+            if (ent == null)
+                return;
+
+            if (depth > MaxDepth)
+                return;
+
+            if (ent is BlockReference br)
+            {
+                if (!br.BlockTableRecord.IsValid || br.BlockTableRecord.IsErased)
+                    return;
+
+                ObjectId btrId = br.BlockTableRecord;
+
+                // 순환 block 참조 차단
+                if (activeBlockStack.Contains(btrId))
+                {
+                    //ed?.WriteMessage($"\n[FluxCAD] Block recursion cut: {sourcePath} / BTR={btrId}");
+                    return;
+                }
+
+                if (TryGetTransformedExtents(ent, currentTransform, out var brExt) &&
+                    Intersects(cellBounds, brExt))
+                {
+                    output.Add(new FlattenedCellEntity
+                    {
+                        SourceId = ent.ObjectId,
+                        SourcePath = sourcePath,
+                        EntityType = nameof(BlockReference),
+                        WorldExtents = brExt,
+                        LocalExtents = brExt,
+                        Geometry = null
+                    });
+                }
+
+                activeBlockStack.Add(btrId);
+
+                try
+                {
+                    var btr = (BlockTableRecord)tr.GetObject(btrId, OpenMode.ForRead);
+
+                    var nextTransform = currentTransform * br.BlockTransform;
+
+                    foreach (ObjectId childId in btr)
+                    {
+                        if (!childId.IsValid || childId.IsErased)
+                            continue;
+
+                        var child = tr.GetObject(childId, OpenMode.ForRead, false) as Entity;
+                        if (child == null)
+                            continue;
+
+                        CollectVisibleEntitiesRecursive(
+                            tr,
+                            child,
+                            nextTransform,
+                            $"{sourcePath}->{child.GetType().Name}",
+                            cellBounds,
+                            output,
+                            activeBlockStack,
+                            depth + 1);
+                    }
+                }
+                finally
+                {
+                    activeBlockStack.Remove(btrId);
+                }
+
+                return;
+            }
+
+            if (!TryGetTransformedExtents(ent, currentTransform, out var worldExt))
+                return;
+
+            if (!Intersects(cellBounds, worldExt))
+                return;
+
+            var clone = CloneAndTransform(ent, currentTransform);
+            if (clone == null)
+                return;
+
+            output.Add(new FlattenedCellEntity
+            {
+                SourceId = ent.ObjectId,
+                SourcePath = sourcePath,
+                EntityType = ent.GetType().Name,
+                WorldExtents = worldExt,
+                LocalExtents = worldExt,
+                Geometry = clone
+            });
+        }
+
+        private Entity CloneAndTransform(Entity ent, Matrix3d transform)
+        {
+            try
+            {
+                var clone = ent.Clone() as Entity;
+                if (clone == null)
+                    return null;
+
+                clone.TransformBy(transform);
+                return clone;
+            }
+            catch
+            {
+                return null;
+            }
+        }
+
+        private bool TryGetTransformedExtents(Entity ent, Matrix3d transform, out Extents3d ext)
+        {
+            ext = default;
+
+            try
+            {
+                var clone = ent.Clone() as Entity;
+                if (clone == null)
+                    return false;
+
+                clone.TransformBy(transform);
+                ext = clone.GeometricExtents;
+                return true;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        private bool Intersects(Extents3d a, Extents3d b, double eps = 1e-6)
+        {
+            return !(a.MaxPoint.X < b.MinPoint.X - eps ||
+                     a.MinPoint.X > b.MaxPoint.X + eps ||
+                     a.MaxPoint.Y < b.MinPoint.Y - eps ||
+                     a.MinPoint.Y > b.MaxPoint.Y + eps);
+        }
+
+        private void NormalizeSceneToCellLocal(CellScene scene)
+        {
+            double dx = -scene.Cell.Bounds.MinPoint.X;
+            double dy = -scene.Cell.Bounds.MinPoint.Y;
+
+            var localMat = Matrix3d.Displacement(new Vector3d(dx, dy, 0));
+
+            foreach (var item in scene.Entities)
+            {
+                if (item.Geometry != null)
+                {
+                    try
+                    {
+                        item.Geometry.TransformBy(localMat);
+                        item.LocalExtents = item.Geometry.GeometricExtents;
+                    }
+                    catch
+                    {
+                        item.LocalExtents = TranslateExtents(item.WorldExtents, dx, dy);
+                    }
+                }
+                else
+                {
+                    item.LocalExtents = TranslateExtents(item.WorldExtents, dx, dy);
+                }
+            }
+        }
+
+        private Extents3d TranslateExtents(Extents3d src, double dx, double dy)
+        {
+            return new Extents3d(
+                new Point3d(src.MinPoint.X + dx, src.MinPoint.Y + dy, src.MinPoint.Z),
+                new Point3d(src.MaxPoint.X + dx, src.MaxPoint.Y + dy, src.MaxPoint.Z));
+        }
+
+        private List<RectCandidate> FindRectangleCandidates(CellScene scene)
+        {
+            var result = new List<RectCandidate>();
+
+            const double angleTolDeg = 1.5;
+            const double slopeTol = 0.02618; // tan(1.5deg) 근사
+            const double posTol = 8.0;
+            const double minLineLength = 80.0;
+
+            double cellWidth = scene.LocalBounds.MaxPoint.X - scene.LocalBounds.MinPoint.X;
+            double cellHeight = scene.LocalBounds.MaxPoint.Y - scene.LocalBounds.MinPoint.Y;
+            double cellArea = Math.Max(1.0, cellWidth * cellHeight);
+
+            double minRectW = Math.Max(120.0, cellWidth * 0.18);
+            double minRectH = Math.Max(120.0, cellHeight * 0.18);
+
+            var horizontal = new List<Line>();
+            var vertical = new List<Line>();
+
+            foreach (var item in scene.Entities)
+            {
+                if (item.Geometry is not Line ln)
+                    continue;
+
+                double dx = ln.EndPoint.X - ln.StartPoint.X;
+                double dy = ln.EndPoint.Y - ln.StartPoint.Y;
+                double len = Math.Sqrt(dx * dx + dy * dy);
+
+                if (len < minLineLength)
+                    continue;
+
+                bool nearHorizontal =
+                    Math.Abs(dx) > 1e-6 &&
+                    Math.Abs(dy / dx) <= slopeTol;
+
+                bool nearVertical =
+                    Math.Abs(dy) > 1e-6 &&
+                    Math.Abs(dx / dy) <= slopeTol;
+
+                if (nearHorizontal)
+                    horizontal.Add(ln);
+                else if (nearVertical)
+                    vertical.Add(ln);
+            }
+
+            // 1차: Line 4개 조합으로 frame 후보 만들기
+            foreach (var top in horizontal)
+                foreach (var bottom in horizontal)
+                {
+                    double yTop = GetHorizontalRepY(top);
+                    double yBottom = GetHorizontalRepY(bottom);
+
+                    if (yTop <= yBottom + posTol)
+                        continue;
+
+                    foreach (var left in vertical)
+                        foreach (var right in vertical)
+                        {
+                            double xLeft = GetVerticalRepX(left);
+                            double xRight = GetVerticalRepX(right);
+
+                            if (xRight <= xLeft + posTol)
+                                continue;
+
+                            double w = xRight - xLeft;
+                            double h = yTop - yBottom;
+
+                            if (w < minRectW || h < minRectH)
+                                continue;
+
+                            if (!CoversHorizontal(top, xLeft, xRight, posTol))
+                                continue;
+
+                            if (!CoversHorizontal(bottom, xLeft, xRight, posTol))
+                                continue;
+
+                            if (!CoversVertical(left, yBottom, yTop, posTol))
+                                continue;
+
+                            if (!CoversVertical(right, yBottom, yTop, posTol))
+                                continue;
+
+                            var rect = new Extents3d(
+                                new Point3d(xLeft, yBottom, 0),
+                                new Point3d(xRight, yTop, 0));
+
+                            // 셀 전체와 거의 같은 경우는 grid 경계일 가능성도 있으므로
+                            // 점수에서 구분하되 일단 후보에는 포함
+                            var candidate = ScoreRectangleCandidate(scene, rect, 4);
+                            result.Add(candidate);
+                        }
+                }
+
+            // 2차: 닫힌 Polyline 사각형도 후보로 추가
+            foreach (var polyCandidate in FindPolylineRectangleCandidates(scene))
+                result.Add(polyCandidate);
+
+            result = MergeSimilarRectangles(result);
+
+            return result
+                .OrderByDescending(x => x.Score)
+                .ToList();
+        }
+
+        private double GetHorizontalRepY(Line ln)
+        {
+            return (ln.StartPoint.Y + ln.EndPoint.Y) * 0.5;
+        }
+
+        private double GetVerticalRepX(Line ln)
+        {
+            return (ln.StartPoint.X + ln.EndPoint.X) * 0.5;
+        }
+
+        private bool CoversHorizontal(Line ln, double x1, double x2, double tol)
+        {
+            double minX = Math.Min(ln.StartPoint.X, ln.EndPoint.X);
+            double maxX = Math.Max(ln.StartPoint.X, ln.EndPoint.X);
+
+            return minX <= x1 + tol && maxX >= x2 - tol;
+        }
+
+        private bool CoversVertical(Line ln, double y1, double y2, double tol)
+        {
+            double minY = Math.Min(ln.StartPoint.Y, ln.EndPoint.Y);
+            double maxY = Math.Max(ln.StartPoint.Y, ln.EndPoint.Y);
+
+            return minY <= y1 + tol && maxY >= y2 - tol;
+        }
+
+        private RectCandidate ScoreRectangleCandidate(CellScene scene, Extents3d rect, int supportLineCount)
+        {
+            double cellW = scene.LocalBounds.MaxPoint.X - scene.LocalBounds.MinPoint.X;
+            double cellH = scene.LocalBounds.MaxPoint.Y - scene.LocalBounds.MinPoint.Y;
+            double cellArea = Math.Max(1.0, cellW * cellH);
+
+            double rectW = rect.MaxPoint.X - rect.MinPoint.X;
+            double rectH = rect.MaxPoint.Y - rect.MinPoint.Y;
+            double rectArea = Math.Max(1.0, rectW * rectH);
+
+            double areaRatio = rectArea / cellArea;
+
+            int insideEntities = 0;
+            int textInside = 0;
+
+            foreach (var e in scene.Entities)
+            {
+                var ex = e.LocalExtents;
+
+                if (IsMostlyInside(ex, rect, 3.0))
+                {
+                    insideEntities++;
+
+                    if (e.EntityType == nameof(DBText) || e.EntityType == nameof(MText))
+                        textInside++;
+                }
+            }
+
+            double score = 0.0;
+
+            // 1. 면적 비율
+            // 너무 작은 건 약하고, 적당히 큰 후보를 선호
+            score += areaRatio * 120.0;
+
+            // 2. support lines
+            score += supportLineCount * 12.0;
+
+            // 3. 내부 엔티티 수
+            score += Math.Min(insideEntities, 120) * 0.45;
+
+            // 4. 텍스트는 title block 가능성을 높여 줌
+            score += Math.Min(textInside, 40) * 1.8;
+
+            // 5. 너무 셀 전체를 꽉 채우면 약간 감점
+            if (areaRatio > 0.97)
+                score -= 12.0;
+
+            // 6. 너무 작은 후보 감점
+            if (areaRatio < 0.08)
+                score -= 25.0;
+
+            return new RectCandidate
+            {
+                Bounds = rect,
+                Score = score,
+                SupportLineCount = supportLineCount,
+                InsideEntityCount = insideEntities,
+                TextInsideCount = textInside,
+                AreaRatio = areaRatio
+            };
+        }
+
+        private bool IsMostlyInside(Extents3d inner, Extents3d outer, double tol = 1.0)
+        {
+            return inner.MinPoint.X >= outer.MinPoint.X - tol &&
+                   inner.MaxPoint.X <= outer.MaxPoint.X + tol &&
+                   inner.MinPoint.Y >= outer.MinPoint.Y - tol &&
+                   inner.MaxPoint.Y <= outer.MaxPoint.Y + tol;
+        }
+
+
+
+        private List<RectCandidate> FindPolylineRectangleCandidates(CellScene scene)
+        {
+            var result = new List<RectCandidate>();
+
+            double cellW = scene.LocalBounds.MaxPoint.X - scene.LocalBounds.MinPoint.X;
+            double cellH = scene.LocalBounds.MaxPoint.Y - scene.LocalBounds.MinPoint.Y;
+
+            double minRectW = Math.Max(120.0, cellW * 0.18);
+            double minRectH = Math.Max(120.0, cellH * 0.18);
+
+            foreach (var item in scene.Entities)
+            {
+                if (item.Geometry is not Polyline pl)
+                    continue;
+
+                if (!pl.Closed)
+                    continue;
+
+                try
+                {
+                    var ex = pl.GeometricExtents;
+
+                    double w = ex.MaxPoint.X - ex.MinPoint.X;
+                    double h = ex.MaxPoint.Y - ex.MinPoint.Y;
+
+                    if (w < minRectW || h < minRectH)
+                        continue;
+
+                    // 아주 정교하게 사각형 여부를 판정하지는 않고,
+                    // 우선 extents 후보로 넣고 점수로 정렬
+                    var candidate = ScoreRectangleCandidate(scene, ex, 1);
+                    result.Add(candidate);
+                }
+                catch
+                {
+                    // skip
+                }
+            }
+
+            return result;
+        }
+
+        private List<RectCandidate> MergeSimilarRectangles(List<RectCandidate> src, double tol = 8.0)
+        {
+            var result = new List<RectCandidate>();
+
+            foreach (var rc in src.OrderByDescending(x => x.Score))
+            {
+                bool isDuplicate = result.Any(x => SimilarRect(x.Bounds, rc.Bounds, tol));
+                if (!isDuplicate)
+                    result.Add(rc);
+            }
+
+            return result;
+        }
+
+        private bool SimilarRect(Extents3d a, Extents3d b, double tol)
+        {
+            return Math.Abs(a.MinPoint.X - b.MinPoint.X) <= tol &&
+                   Math.Abs(a.MinPoint.Y - b.MinPoint.Y) <= tol &&
+                   Math.Abs(a.MaxPoint.X - b.MaxPoint.X) <= tol &&
+                   Math.Abs(a.MaxPoint.Y - b.MaxPoint.Y) <= tol;
+        }
+
+        [CommandMethod("FLUX_DEBUG_CELL_ASSIGN_RP")]
+        public void DebugCellAssignRp()
+        {
+            var doc = Application.DocumentManager.MdiActiveDocument;
+            var db = doc.Database;
+            var ed = doc.Editor;
+
+            try
+            {
+                using (var tr = db.TransactionManager.StartTransaction())
+                {
+                    var bt = (BlockTable)tr.GetObject(db.BlockTableId, OpenMode.ForRead);
+                    var ms = (BlockTableRecord)tr.GetObject(bt[BlockTableRecord.ModelSpace], OpenMode.ForRead);
+
+                    // 이미 복원한 격자 경계값 연결
+                    var gridXs = GetRecoveredGridXs();
+                    var gridYs = GetRecoveredGridYs();
+
+                    var grid = new GridTopology(gridXs, gridYs);
+
+                    var buckets = new CellBucket[grid.RowCount, grid.ColCount];
+                    for (int r = 0; r < grid.RowCount; r++)
+                    {
+                        for (int c = 0; c < grid.ColCount; c++)
+                        {
+                            buckets[r, c] = new CellBucket(r, c);
+                        }
+                    }
+
+                    double tol = 1.0;
+
+                    foreach (ObjectId id in ms)
+                    {
+                        if (!id.IsValid || id.IsErased)
+                            continue;
+
+                        var ent = tr.GetObject(id, OpenMode.ForRead) as Entity;
+                        if (ent == null)
+                            continue;
+
+                        if (CellContentFilter.ShouldSkipForCellContent(ent, grid, tol))
+                            continue;
+
+                        if (!RepresentativePointHelper.TryGetRepresentativePoint(ent, out var rp, out var kind))
+                            continue;
+
+                        if (!grid.TryFindCell(rp, out int row, out int col, tol))
+                            continue;
+
+                        buckets[row, col].Items.Add(new AssignedEntity
+                        {
+                            Id = ent.ObjectId,
+                            Handle = ent.Handle,
+                            TypeName = ent.GetType().Name,
+                            RepresentativePoint = rp,
+                            Kind = kind
+                        });
+                    }
+
+                    ed.WriteMessage($"\n[FluxCAD] RP assignment result");
+                    ed.WriteMessage($"\nGrid: {grid.RowCount} rows x {grid.ColCount} cols");
+
+                    for (int r = 0; r < grid.RowCount; r++)
+                    {
+                        ed.WriteMessage($"\n=== Row {r} ===");
+                        for (int c = 0; c < grid.ColCount; c++)
+                        {
+                            var b = buckets[r, c];
+                            ed.WriteMessage(
+                                $"\nCell({r},{c}) Total={b.TotalCount}, Text={b.TextCount}, Block={b.BlockCount}, Curve={b.CurveCount}, Other={b.OtherCount}, Score={b.Score:0.0}");
+                        }
+                    }
+
+                    tr.Commit();
+                }
+            }
+            catch (System.Exception ex)
+            {
+                ed.WriteMessage($"\n[FluxCAD][ERROR] {ex.Message}");
+                ed.WriteMessage($"\n{ex.StackTrace}");
+            }
+        }
+
+        
+
+        // 임시 stub
+        private List<double> GetRecoveredGridXs()
+        {
+            if (_lastRecoveredGridXs == null || _lastRecoveredGridXs.Count < 2)
+                throw new InvalidOperationException("먼저 격자 복원 명령을 실행해서 X 경계값을 준비해야 합니다.");
+
+            return _lastRecoveredGridXs;
+        }
+
+        // 임시 stub
+        private List<double> GetRecoveredGridYs()
+        {
+            if (_lastRecoveredGridYs == null || _lastRecoveredGridYs.Count < 2)
+                throw new InvalidOperationException("먼저 격자 복원 명령을 실행해서 Y 경계값을 준비해야 합니다.");
+
+            return _lastRecoveredGridYs;
+        }
+
+
+        [CommandMethod("FLUX_DEBUG_GRID_CELLS")]
+        public void DebugGridCells()
+        {
+            var doc = Application.DocumentManager.MdiActiveDocument;
+            var db = doc.Database;
+            var ed = doc.Editor;
+
+            try
+            {
+                using (var tr = db.TransactionManager.StartTransaction())
+                {
+                    var cells = DetectGridCells(tr, db, ed);
+
+                    ed.WriteMessage($"\n[FluxCAD] DebugGridCells returned {cells.Count} cells.");
+
+                    tr.Commit();
+                }
+            }
+            catch (System.Exception ex)
+            {
+                ed.WriteMessage($"\n[FluxCAD][ERROR] FLUX_DEBUG_GRID_CELLS failed: {ex.Message}");
+            }
+        }
+
+
+        private List<DetectedCell> DetectGridCells(Transaction tr, Database db, Editor ed)
+        {
+            const double coordTol = 10.0;
+            const double orthoTol = 1.0;
+            const double minGridLineLen = 100.0;
+            const double angleTolDeg = 1.5;
+            const double majorAxisRatio = 0.80;
+            const double cellInset = 5.0;
+
+            var cells = new List<DetectedCell>();
+
+            try
+            {
+                var bt = (BlockTable)tr.GetObject(db.BlockTableId, OpenMode.ForRead);
+                var ms = (BlockTableRecord)tr.GetObject(bt[BlockTableRecord.ModelSpace], OpenMode.ForRead);
+
+                var copied = new List<Entity>();
+                var hAxes = new List<GridAxisInfo>();
+                var vAxes = new List<GridAxisInfo>();
+
+                double slopeTol = Math.Tan(angleTolDeg * Math.PI / 180.0);
+
+                foreach (ObjectId id in ms)
+                {
+                    if (!id.IsValid || id.IsErased)
+                        continue;
+
+                    var ent = tr.GetObject(id, OpenMode.ForRead, false) as Entity;
+                    if (ent == null)
+                        continue;
+
+                    if (!HasFluxCadTag(ent))
+                        continue;
+
+                    copied.Add(ent);
+
+                    if (ent is not Line ln)
+                        continue;
+
+                    var p1 = ln.StartPoint;
+                    var p2 = ln.EndPoint;
+
+                    double dx = p2.X - p1.X;
+                    double dy = p2.Y - p1.Y;
+                    double len = Math.Sqrt(dx * dx + dy * dy);
+
+                    if (len < minGridLineLen)
+                        continue;
+
+                    bool nearHorizontal =
+                        Math.Abs(dx) > 1e-6 &&
+                        Math.Abs(dy / dx) <= slopeTol &&
+                        Math.Abs(dx) > orthoTol;
+
+                    bool nearVertical =
+                        Math.Abs(dy) > 1e-6 &&
+                        Math.Abs(dx / dy) <= slopeTol &&
+                        Math.Abs(dy) > orthoTol;
+
+                    if (nearHorizontal)
+                    {
+                        double yRep = (p1.Y + p2.Y) * 0.5;
+                        AddGridInterval(
+                            hAxes,
+                            yRep,
+                            Math.Min(p1.X, p2.X),
+                            Math.Max(p1.X, p2.X),
+                            coordTol);
+                    }
+                    else if (nearVertical)
+                    {
+                        double xRep = (p1.X + p2.X) * 0.5;
+                        AddGridInterval(
+                            vAxes,
+                            xRep,
+                            Math.Min(p1.Y, p2.Y),
+                            Math.Max(p1.Y, p2.Y),
+                            coordTol);
+                    }
+                }
+
+                foreach (var g in hAxes)
+                    g.Merged = MergeGridIntervals(g.Raw, coordTol);
+
+                foreach (var g in vAxes)
+                    g.Merged = MergeGridIntervals(g.Raw, coordTol);
+
+                double maxHSpan = hAxes.Count == 0 ? 0 : hAxes.Max(x => x.TotalSpan);
+                double maxVSpan = vAxes.Count == 0 ? 0 : vAxes.Max(x => x.TotalSpan);
+
+                var majorH = hAxes
+                    .Where(x => x.TotalSpan >= maxHSpan * majorAxisRatio)
+                    .OrderBy(x => x.Coord)
+                    .ToList();
+
+                var majorV = vAxes
+                    .Where(x => x.TotalSpan >= maxVSpan * majorAxisRatio)
+                    .OrderBy(x => x.Coord)
+                    .ToList();
+
+                ed.WriteMessage($"\n[FluxCAD] Major Horizontal Axes = {majorH.Count}");
+                ed.WriteMessage($"\n[FluxCAD] Major Vertical Axes   = {majorV.Count}");
+
+                if (majorH.Count < 2 || majorV.Count < 2)
+                {
+                    ed.WriteMessage("\n[FluxCAD] Not enough major axes to build cells.");
+                    return cells;
+                }
+
+                _lastRecoveredGridXs = majorV
+                    .Select(x => x.Coord)
+                    .OrderBy(x => x)
+                    .ToList();
+
+                _lastRecoveredGridYs = majorH
+                    .Select(y => y.Coord)
+                    .OrderBy(y => y)
+                    .ToList();
+
+                ed.WriteMessage($"\n[FluxCAD] Cached grid boundaries: X={_lastRecoveredGridXs.Count}, Y={_lastRecoveredGridYs.Count}");
+                ed.WriteMessage($"\n[FluxCAD] Cached grid size: rows={_lastRecoveredGridYs.Count - 1}, cols={_lastRecoveredGridXs.Count - 1}");
+
+                int rowCount = majorH.Count - 1;
+                int colCount = majorV.Count - 1;
+
+                for (int r = 0; r < rowCount; r++)
+                {
+                    for (int c = 0; c < colCount; c++)
+                    {
+                        double x1 = majorV[c].Coord;
+                        double x2 = majorV[c + 1].Coord;
+                        double y1 = majorH[r].Coord;
+                        double y2 = majorH[r + 1].Coord;
+
+                        var cellBounds = new Extents3d(
+                            new Point3d(Math.Min(x1, x2) + cellInset, Math.Min(y1, y2) + cellInset, 0),
+                            new Point3d(Math.Max(x1, x2) - cellInset, Math.Max(y1, y2) - cellInset, 0));
+
+                        int visualRow = (rowCount - 1) - r;
+
+                        var cell = new DetectedCell
+                        {
+                            Row = visualRow,
+                            Col = c,
+                            Bounds = cellBounds
+                        };
+
+
+                        foreach (var ent in copied)
+                        {
+                            if (!TryGetSafeExtents(ent, out var ex))
+                                continue;
+
+                            if (!Intersects(cellBounds, ex))
+                                continue;
+
+                            cell.EntityCount++;
+
+                            if (ent is Line)
+                                cell.LineCount++;
+                            else if (ent is DBText || ent is MText)
+                                cell.TextCount++;
+                            else if (ent is BlockReference)
+                                cell.BlockCount++;
+                        }
+
+                        cells.Add(cell);
+                    }
+                }
+
+                ed.WriteMessage($"\n[FluxCAD] Cell Count = {cells.Count}");
+
+                foreach (var cell in cells.OrderBy(x => x.Row).ThenBy(x => x.Col))
+                {
+                    double w = cell.Bounds.MaxPoint.X - cell.Bounds.MinPoint.X;
+                    double h = cell.Bounds.MaxPoint.Y - cell.Bounds.MinPoint.Y;
+
+                    ed.WriteMessage(
+                        $"\n[Cell r{cell.Row} c{cell.Col}] " +
+                        $"W={w:F2}, H={h:F2}, " +
+                        $"Entities={cell.EntityCount}, Lines={cell.LineCount}, Texts={cell.TextCount}, Blocks={cell.BlockCount}, " +
+                        $"Min=({cell.Bounds.MinPoint.X:F2},{cell.Bounds.MinPoint.Y:F2}) " +
+                        $"Max=({cell.Bounds.MaxPoint.X:F2},{cell.Bounds.MaxPoint.Y:F2})");
+                }
+
+                return cells;
+            }
+            catch (System.Exception ex)
+            {
+                ed.WriteMessage($"\n[FluxCAD][ERROR] DetectGridCells failed: {ex.Message}");
+                return cells;
+            }
+        }
+
+        private static bool Intersects(Extents3d a, Extents3d b)
+        {
+            return !(a.MaxPoint.X < b.MinPoint.X ||
+                     a.MinPoint.X > b.MaxPoint.X ||
+                     a.MaxPoint.Y < b.MinPoint.Y ||
+                     a.MinPoint.Y > b.MaxPoint.Y);
+        }
+
+        [CommandMethod("FLUX_DEBUG_GRID_AXES")]
+        public void FluxDebugGridAxes()
+        {
+            var doc = Application.DocumentManager.MdiActiveDocument;
+            var db = doc.Database;
+            var ed = doc.Editor;
+
+            // 추측 1개: 현재 문서용 기본 파라미터
+            //const double coordTol = 5.0;
+            //const double orthoTol = 1.0;
+            //const double minGridLineLen = 100.0;
+
+            const double coordTol = 10.0;   // 기존 5.0 -> 10.0 권장
+            const double orthoTol = 1.0;
+            const double minGridLineLen = 100.0;
+
+            try
+            {
+                using (var tr = db.TransactionManager.StartTransaction())
+                {
+                    var bt = (BlockTable)tr.GetObject(db.BlockTableId, OpenMode.ForRead);
+                    var ms = (BlockTableRecord)tr.GetObject(bt[BlockTableRecord.ModelSpace], OpenMode.ForRead);
+
+                    int copiedEntityCount = 0;
+                    int copiedLineCount = 0;
+                    int horizontalLineCount = 0;
+                    int verticalLineCount = 0;
+
+                    var hAxes = new List<GridAxisInfo>(); // Y축 그룹
+                    var vAxes = new List<GridAxisInfo>(); // X축 그룹
+
+                    foreach (ObjectId id in ms)
+                    {
+                        if (!id.IsValid || id.IsErased)
+                            continue;
+
+                        var ent = tr.GetObject(id, OpenMode.ForRead, false) as Entity;
+                        if (ent == null)
+                            continue;
+
+                        if (!HasFluxCadTag(ent))
+                            continue;
+
+                        copiedEntityCount++;
+
+                        if (ent is not Line ln)
+                            continue;
+
+                        copiedLineCount++;
+
+                        var p1 = ln.StartPoint;
+                        var p2 = ln.EndPoint;
+
+                        double dx = p2.X - p1.X;
+                        double dy = p2.Y - p1.Y;
+                        double len = Math.Sqrt(dx * dx + dy * dy);
+
+                        if (len < minGridLineLen)
+                            continue;
+
+                        //                         if (Math.Abs(dy) <= orthoTol && Math.Abs(dx) > orthoTol)
+                        //                         {
+                        //                             horizontalLineCount++;
+                        //                             AddGridInterval(
+                        //                                 hAxes,
+                        //                                 p1.Y,
+                        //                                 Math.Min(p1.X, p2.X),
+                        //                                 Math.Max(p1.X, p2.X),
+                        //                                 coordTol);
+                        //                         }
+                        //                         else if (Math.Abs(dx) <= orthoTol && Math.Abs(dy) > orthoTol)
+                        //                         {
+                        //                             verticalLineCount++;
+                        //                             AddGridInterval(
+                        //                                 vAxes,
+                        //                                 p1.X,
+                        //                                 Math.Min(p1.Y, p2.Y),
+                        //                                 Math.Max(p1.Y, p2.Y),
+                        //                                 coordTol);
+                        //                         }
+
+                        // 수정본
+                        double angleTolDeg = 1.5;
+                        double slopeTol = Math.Tan(angleTolDeg * Math.PI / 180.0);
+
+                        bool nearHorizontal =
+                            Math.Abs(dx) > 1e-6 &&
+                            Math.Abs(dy / dx) <= slopeTol &&
+                            Math.Abs(dx) > orthoTol;
+
+                        bool nearVertical =
+                            Math.Abs(dy) > 1e-6 &&
+                            Math.Abs(dx / dy) <= slopeTol &&
+                            Math.Abs(dy) > orthoTol;
+
+                        if (nearHorizontal)
+                        {
+                            double yRep = (p1.Y + p2.Y) * 0.5;
+
+                            horizontalLineCount++;
+                            AddGridInterval(
+                                hAxes,
+                                yRep,
+                                Math.Min(p1.X, p2.X),
+                                Math.Max(p1.X, p2.X),
+                                coordTol);
+                        }
+                        else if (nearVertical)
+                        {
+                            double xRep = (p1.X + p2.X) * 0.5;
+
+                            verticalLineCount++;
+                            AddGridInterval(
+                                vAxes,
+                                xRep,
+                                Math.Min(p1.Y, p2.Y),
+                                Math.Max(p1.Y, p2.Y),
+                                coordTol);
+                        }
+                    }
+
+                    foreach (var g in hAxes)
+                        g.Merged = MergeGridIntervals(g.Raw, coordTol);
+
+                    foreach (var g in vAxes)
+                        g.Merged = MergeGridIntervals(g.Raw, coordTol);
+
+                    var hSortedByCoord = hAxes.OrderBy(x => x.Coord).ToList();
+                    var vSortedByCoord = vAxes.OrderBy(x => x.Coord).ToList();
+
+                    var hStrong = hAxes
+                        .OrderByDescending(x => x.TotalSpan)
+                        .ThenByDescending(x => x.MaxSpan)
+                        .ThenBy(x => x.Coord)
+                        .Take(40)
+                        .ToList();
+
+                    var vStrong = vAxes
+                        .OrderByDescending(x => x.TotalSpan)
+                        .ThenByDescending(x => x.MaxSpan)
+                        .ThenBy(x => x.Coord)
+                        .Take(40)
+                        .ToList();
+
+                    ed.WriteMessage($"\n[FluxCAD] Copied Entities      = {copiedEntityCount}");
+                    ed.WriteMessage($"\n[FluxCAD] Copied Lines         = {copiedLineCount}");
+                    ed.WriteMessage($"\n[FluxCAD] Horizontal Lines     = {horizontalLineCount}");
+                    ed.WriteMessage($"\n[FluxCAD] Vertical Lines       = {verticalLineCount}");
+                    ed.WriteMessage($"\n[FluxCAD] Horizontal Axes(Y)   = {hAxes.Count}");
+                    ed.WriteMessage($"\n[FluxCAD] Vertical Axes(X)     = {vAxes.Count}");
+
+
+                    double maxHSpan = hAxes.Count == 0 ? 0 : hAxes.Max(x => x.TotalSpan);
+                    double maxVSpan = vAxes.Count == 0 ? 0 : vAxes.Max(x => x.TotalSpan);
+
+                    double majorAxisRatio = 0.80;
+
+                    var majorH = hAxes
+                        .Where(x => x.TotalSpan >= maxHSpan * majorAxisRatio)
+                        .OrderBy(x => x.Coord)
+                        .ToList();
+
+                    var majorV = vAxes
+                        .Where(x => x.TotalSpan >= maxVSpan * majorAxisRatio)
+                        .OrderBy(x => x.Coord)
+                        .ToList();
+
+                    ed.WriteMessage($"\n[FluxCAD] Copied Entities      = {copiedEntityCount}");
+                    ed.WriteMessage($"\n[FluxCAD] Copied Lines         = {copiedLineCount}");
+                    ed.WriteMessage($"\n[FluxCAD] Horizontal Lines     = {horizontalLineCount}");
+                    ed.WriteMessage($"\n[FluxCAD] Vertical Lines       = {verticalLineCount}");
+                    ed.WriteMessage($"\n[FluxCAD] Horizontal Axes(Y)   = {hAxes.Count}");
+                    ed.WriteMessage($"\n[FluxCAD] Vertical Axes(X)     = {vAxes.Count}");
+
+                    ed.WriteMessage($"\n[FluxCAD] Major Horizontal Axes = {majorH.Count}");
+                    for (int i = 0; i < majorH.Count; i++)
+                    {
+                        var a = majorH[i];
+                        ed.WriteMessage(
+                            $"\n  [MH {i + 1}] Y={a.Coord:F2}, Segments={a.SegmentCount}, TotalSpan={a.TotalSpan:F2}, MaxSpan={a.MaxSpan:F2}");
+                    }
+
+                    ed.WriteMessage($"\n[FluxCAD] Major Vertical Axes = {majorV.Count}");
+                    for (int i = 0; i < majorV.Count; i++)
+                    {
+                        var a = majorV[i];
+                        ed.WriteMessage(
+                            $"\n  [MV {i + 1}] X={a.Coord:F2}, Segments={a.SegmentCount}, TotalSpan={a.TotalSpan:F2}, MaxSpan={a.MaxSpan:F2}");
+                    }
+
+                    
+                    tr.Commit();
+                }
+            }
+            catch (System.Exception ex)
+            {
+                ed.WriteMessage($"\n[FluxCAD][ERROR] FLUX_DEBUG_GRID_AXES failed: {ex.Message}");
+            }
+        }
+
+        private static void AddGridInterval(
+            List<GridAxisInfo> groups,
+            double coord,
+            double a,
+            double b,
+            double coordTol)
+        {
+            foreach (var g in groups)
+            {
+                if (Math.Abs(g.Coord - coord) <= coordTol)
+                {
+                    g.Raw.Add(new GridInterval1D(a, b));
+                    return;
+                }
+            }
+
+            var ng = new GridAxisInfo { Coord = coord };
+            ng.Raw.Add(new GridInterval1D(a, b));
+            groups.Add(ng);
+        }
+
+        private static List<GridInterval1D> MergeGridIntervals(List<GridInterval1D> raw, double tol)
+        {
+            if (raw == null || raw.Count == 0)
+                return new List<GridInterval1D>();
+
+            var sorted = raw.OrderBy(x => x.A).ThenBy(x => x.B).ToList();
+            var merged = new List<GridInterval1D>();
+
+            double curA = sorted[0].A;
+            double curB = sorted[0].B;
+
+            for (int i = 1; i < sorted.Count; i++)
+            {
+                var it = sorted[i];
+
+                if (it.A <= curB + tol)
+                {
+                    curB = Math.Max(curB, it.B);
+                }
+                else
+                {
+                    merged.Add(new GridInterval1D(curA, curB));
+                    curA = it.A;
+                    curB = it.B;
+                }
+            }
+
+            merged.Add(new GridInterval1D(curA, curB));
+            return merged;
+        }
+    
+
+        [CommandMethod("FLUX_DEBUG_REGION_TREE")]
+        public void FluxDebugRegionTree()
+        {
+            var doc = Application.DocumentManager.MdiActiveDocument;
+            var db = doc.Database;
+            var ed = doc.Editor;
+
+            // 추측 1개: 현재 문서용 기본 허용오차
+            const double coordTol = 5.0;
+            const double orthoTol = 1.0;
+            const double containmentTol = 2.0;
+            const double minGridLineLen = 100.0;
+            const double minRegionWidth = 50.0;
+            const double minRegionHeight = 50.0;
+
+            try
+            {
+                using (var tr = db.TransactionManager.StartTransaction())
+                {
+                    var bt = (BlockTable)tr.GetObject(db.BlockTableId, OpenMode.ForRead);
+                    var ms = (BlockTableRecord)tr.GetObject(bt[BlockTableRecord.ModelSpace], OpenMode.ForRead);
+
+                    var copied = new List<Entity>();
+
+                    foreach (ObjectId id in ms)
+                    {
+                        if (!id.IsValid || id.IsErased)
+                            continue;
+
+                        var ent = tr.GetObject(id, OpenMode.ForRead, false) as Entity;
+                        if (ent == null)
+                            continue;
+
+                        if (!HasFluxCadTag(ent))
+                            continue;
+
+                        copied.Add(ent);
+                    }
+
+                    ed.WriteMessage($"\n[FluxCAD] Copied Entities = {copied.Count}");
+
+                    var candidates = new List<RegionCandidate>();
+                    int nextId = 1;
+
+                    // 1) BlockReference extents
+                    /*
+                    foreach (var ent in copied)
+                    {
+                        if (ent is BlockReference br && TryGetSafeExtents(br, out var ex))
+                        {
+                            if (IsBigEnough(ex, minRegionWidth, minRegionHeight))
+                            {
+                                candidates.Add(new RegionCandidate
+                                {
+                                    Id = nextId++,
+                                    SourceType = "BlockRef",
+                                    Bounds = ex,
+                                    SourceHandle = br.Handle
+                                });
+                            }
+                        }
+                    }
+                    */
+
+                    // 2) Axis-aligned closed rectangle polylines
+                    foreach (var ent in copied)
+                    {
+                        if (ent is Polyline pl &&
+                            IsAxisAlignedRectanglePolyline(pl, orthoTol) &&
+                            TryGetSafeExtents(pl, out var ex))
+                        {
+                            if (IsBigEnough(ex, minRegionWidth, minRegionHeight))
+                            {
+                                candidates.Add(new RegionCandidate
+                                {
+                                    Id = nextId++,
+                                    SourceType = "ClosedRectPline",
+                                    Bounds = ex,
+                                    SourceHandle = pl.Handle
+                                });
+                            }
+                        }
+                    }
+
+                    // 3) Long orthogonal line rectangles
+                    var lineRects = BuildRectanglesFromLines(
+                        copied,
+                        coordTol,
+                        orthoTol,
+                        minGridLineLen,
+                        minRegionWidth,
+                        minRegionHeight);
+
+                    foreach (var ex in lineRects)
+                    {
+                        candidates.Add(new RegionCandidate
+                        {
+                            Id = nextId++,
+                            SourceType = "LineRect",
+                            Bounds = ex,
+                            SourceHandle = default
+                        });
+                    }
+
+                    ed.WriteMessage($"\n[FluxCAD] Raw Candidate Count = {candidates.Count}");
+
+                    candidates = DeduplicateCandidates(candidates, coordTol);
+
+                    ed.WriteMessage($"\n[FluxCAD] Deduped Candidate Count = {candidates.Count}");
+
+                    BuildContainmentTree(candidates, containmentTol);
+
+                    PrintRegionSummary(ed, candidates);
+
+                    tr.Commit();
+                }
+            }
+            catch (System.Exception ex)
+            {
+                ed.WriteMessage($"\n[FluxCAD][ERROR] FLUX_DEBUG_REGION_TREE failed: {ex.Message}");
+            }
+        }
+
+        private static bool HasFluxCadTag(Entity ent)
+        {
+            if (ent == null)
+                return false;
+
+            var rb = ent.XData;
+            if (rb == null)
+                return false;
+
+            foreach (TypedValue tv in rb)
+            {
+                if (tv.TypeCode == (int)DxfCode.ExtendedDataRegAppName)
+                {
+                    var app = tv.Value as string;
+                    if (string.Equals(app, FluxCadRegAppName, StringComparison.OrdinalIgnoreCase))
+                        return true;
+                }
+            }
+
+            return false;
+        }
+
+        private static bool TryGetSafeExtents(Entity ent, out Extents3d ex)
+        {
+            ex = default;
+            try
+            {
+                ex = ent.GeometricExtents;
+                return true;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        private static bool IsBigEnough(Extents3d ex, double minW, double minH)
+        {
+            double w = ex.MaxPoint.X - ex.MinPoint.X;
+            double h = ex.MaxPoint.Y - ex.MinPoint.Y;
+            return w >= minW && h >= minH;
+        }
+
+        private static bool IsAxisAlignedRectanglePolyline(Polyline pl, double orthoTol)
+        {
+            if (pl == null || !pl.Closed)
+                return false;
+
+            if (pl.NumberOfVertices != 4)
+                return false;
+
+            for (int i = 0; i < 4; i++)
+            {
+                var p1 = pl.GetPoint3dAt(i);
+                var p2 = pl.GetPoint3dAt((i + 1) % 4);
+
+                double dx = Math.Abs(p2.X - p1.X);
+                double dy = Math.Abs(p2.Y - p1.Y);
+
+                bool horizontal = dy <= orthoTol && dx > orthoTol;
+                bool vertical = dx <= orthoTol && dy > orthoTol;
+
+                if (!horizontal && !vertical)
+                    return false;
+            }
+
+            return true;
+        }
+
+        private static List<Extents3d> BuildRectanglesFromLines(
+            List<Entity> copied,
+            double coordTol,
+            double orthoTol,
+            double minGridLineLen,
+            double minRegionWidth,
+            double minRegionHeight)
+        {
+            var hGroups = new List<CoordIntervals>();
+            var vGroups = new List<CoordIntervals>();
+
+            foreach (var ent in copied)
+            {
+                if (ent is not Line ln)
+                    continue;
+
+                var p1 = ln.StartPoint;
+                var p2 = ln.EndPoint;
+
+                double dx = p2.X - p1.X;
+                double dy = p2.Y - p1.Y;
+                double len = Math.Sqrt(dx * dx + dy * dy);
+
+                if (len < minGridLineLen)
+                    continue;
+
+                if (Math.Abs(dy) <= orthoTol && Math.Abs(dx) > orthoTol)
+                {
+                    AddInterval(hGroups, p1.Y, Math.Min(p1.X, p2.X), Math.Max(p1.X, p2.X), coordTol);
+                }
+                else if (Math.Abs(dx) <= orthoTol && Math.Abs(dy) > orthoTol)
+                {
+                    AddInterval(vGroups, p1.X, Math.Min(p1.Y, p2.Y), Math.Max(p1.Y, p2.Y), coordTol);
+                }
+            }
+
+            foreach (var g in hGroups)
+                g.Merged = MergeIntervals(g.Raw, coordTol);
+
+            foreach (var g in vGroups)
+                g.Merged = MergeIntervals(g.Raw, coordTol);
+
+            hGroups = hGroups.OrderBy(g => g.Coord).ToList();
+            vGroups = vGroups.OrderBy(g => g.Coord).ToList();
+
+            var rects = new List<Extents3d>();
+
+            for (int ix1 = 0; ix1 < vGroups.Count; ix1++)
+            {
+                for (int ix2 = ix1 + 1; ix2 < vGroups.Count; ix2++)
+                {
+                    double x1 = vGroups[ix1].Coord;
+                    double x2 = vGroups[ix2].Coord;
+                    double width = x2 - x1;
+
+                    if (width < minRegionWidth)
+                        continue;
+
+                    for (int iy1 = 0; iy1 < hGroups.Count; iy1++)
+                    {
+                        for (int iy2 = iy1 + 1; iy2 < hGroups.Count; iy2++)
+                        {
+                            double y1 = hGroups[iy1].Coord;
+                            double y2 = hGroups[iy2].Coord;
+                            double height = y2 - y1;
+
+                            if (height < minRegionHeight)
+                                continue;
+
+                            bool topOk = HasCover(hGroups[iy2], x1, x2, coordTol);
+                            bool bottomOk = HasCover(hGroups[iy1], x1, x2, coordTol);
+                            bool leftOk = HasCover(vGroups[ix1], y1, y2, coordTol);
+                            bool rightOk = HasCover(vGroups[ix2], y1, y2, coordTol);
+
+                            if (topOk && bottomOk && leftOk && rightOk)
+                            {
+                                rects.Add(new Extents3d(
+                                    new Point3d(x1, y1, 0),
+                                    new Point3d(x2, y2, 0)));
+                            }
+                        }
+                    }
+                }
+            }
+
+            return DeduplicateExtents(rects, coordTol);
+        }
+
+        private static void AddInterval(
+            List<CoordIntervals> groups,
+            double coord,
+            double a,
+            double b,
+            double coordTol)
+        {
+            foreach (var g in groups)
+            {
+                if (Math.Abs(g.Coord - coord) <= coordTol)
+                {
+                    g.Raw.Add(new Interval1D(a, b));
+                    return;
+                }
+            }
+
+            var ng = new CoordIntervals { Coord = coord };
+            ng.Raw.Add(new Interval1D(a, b));
+            groups.Add(ng);
+        }
+
+        private static List<Interval1D> MergeIntervals(List<Interval1D> raw, double tol)
+        {
+            if (raw.Count == 0)
+                return new List<Interval1D>();
+
+            var sorted = raw.OrderBy(x => x.A).ThenBy(x => x.B).ToList();
+            var merged = new List<Interval1D>();
+
+            double curA = sorted[0].A;
+            double curB = sorted[0].B;
+
+            for (int i = 1; i < sorted.Count; i++)
+            {
+                var it = sorted[i];
+                if (it.A <= curB + tol)
+                {
+                    curB = Math.Max(curB, it.B);
+                }
+                else
+                {
+                    merged.Add(new Interval1D(curA, curB));
+                    curA = it.A;
+                    curB = it.B;
+                }
+            }
+
+            merged.Add(new Interval1D(curA, curB));
+            return merged;
+        }
+
+        private static bool HasCover(CoordIntervals g, double a, double b, double tol)
+        {
+            double min = Math.Min(a, b);
+            double max = Math.Max(a, b);
+
+            foreach (var it in g.Merged)
+            {
+                if (it.A <= min + tol && it.B >= max - tol)
+                    return true;
+            }
+
+            return false;
+        }
+
+        private static List<Extents3d> DeduplicateExtents(List<Extents3d> src, double tol)
+        {
+            var result = new List<Extents3d>();
+
+            foreach (var ex in src)
+            {
+                bool exists = result.Any(r => NearlySameBounds(r, ex, tol));
+                if (!exists)
+                    result.Add(ex);
+            }
+
+            return result;
+        }
+
+        private static List<RegionCandidate> DeduplicateCandidates(List<RegionCandidate> src, double tol)
+        {
+            var result = new List<RegionCandidate>();
+
+            foreach (var c in src.OrderByDescending(x => Area(x.Bounds)))
+            {
+                bool exists = result.Any(r => NearlySameBounds(r.Bounds, c.Bounds, tol));
+                if (!exists)
+                    result.Add(c);
+            }
+
+            return result;
+        }
+
+        private static bool NearlySameBounds(Extents3d a, Extents3d b, double tol)
+        {
+            return Math.Abs(a.MinPoint.X - b.MinPoint.X) <= tol &&
+                   Math.Abs(a.MinPoint.Y - b.MinPoint.Y) <= tol &&
+                   Math.Abs(a.MaxPoint.X - b.MaxPoint.X) <= tol &&
+                   Math.Abs(a.MaxPoint.Y - b.MaxPoint.Y) <= tol;
+        }
+
+        private static void BuildContainmentTree(List<RegionCandidate> candidates, double tol)
+        {
+            var ordered = candidates.OrderBy(x => Area(x.Bounds)).ToList();
+
+            for (int i = 0; i < ordered.Count; i++)
+            {
+                var child = ordered[i];
+                RegionCandidate bestParent = null;
+                double bestArea = double.MaxValue;
+
+                for (int j = i + 1; j < ordered.Count; j++)
+                {
+                    var parent = ordered[j];
+
+                    if (!Contains(parent.Bounds, child.Bounds, tol))
+                        continue;
+
+                    double area = Area(parent.Bounds);
+                    if (area < bestArea)
+                    {
+                        bestArea = area;
+                        bestParent = parent;
+                    }
+                }
+
+                child.ParentId = bestParent?.Id ?? -1;
+            }
+        }
+
+        private static bool Contains(Extents3d outer, Extents3d inner, double tol)
+        {
+            return outer.MinPoint.X <= inner.MinPoint.X + tol &&
+                   outer.MinPoint.Y <= inner.MinPoint.Y + tol &&
+                   outer.MaxPoint.X >= inner.MaxPoint.X - tol &&
+                   outer.MaxPoint.Y >= inner.MaxPoint.Y - tol;
+        }
+
+        private static double Area(Extents3d ex)
+        {
+            double w = ex.MaxPoint.X - ex.MinPoint.X;
+            double h = ex.MaxPoint.Y - ex.MinPoint.Y;
+            return Math.Max(0, w) * Math.Max(0, h);
+        }
+
+        private static void PrintRegionSummary(Editor ed, List<RegionCandidate> candidates)
+        {
+            var byType = candidates
+                .GroupBy(x => x.SourceType)
+                .OrderByDescending(g => g.Count())
+                .ToList();
+
+            ed.WriteMessage($"\n[FluxCAD] Region Candidate Types = {byType.Count}");
+
+            foreach (var g in byType)
+            {
+                ed.WriteMessage($"\n  - {g.Key}: {g.Count()}");
+            }
+
+            var childCountMap = candidates
+                .Where(x => x.ParentId > 0)
+                .GroupBy(x => x.ParentId)
+                .ToDictionary(g => g.Key, g => g.Count());
+
+            var roots = candidates
+                .Where(x => x.ParentId < 0)
+                .OrderByDescending(x => Area(x.Bounds))
+                .ToList();
+
+            ed.WriteMessage($"\n[FluxCAD] Root Count = {roots.Count}");
+
+            for (int i = 0; i < Math.Min(roots.Count, 20); i++)
+            {
+                var r = roots[i];
+                double w = r.Bounds.MaxPoint.X - r.Bounds.MinPoint.X;
+                double h = r.Bounds.MaxPoint.Y - r.Bounds.MinPoint.Y;
+                int childCount = childCountMap.TryGetValue(r.Id, out var cc) ? cc : 0;
+
+                ed.WriteMessage(
+                    $"\n  [Root {i + 1}] Id={r.Id}, Src={r.SourceType}, Children={childCount}, " +
+                    $"W={w:F2}, H={h:F2}, Area={Area(r.Bounds):F2}, " +
+                    $"Min=({r.Bounds.MinPoint.X:F2},{r.Bounds.MinPoint.Y:F2}) " +
+                    $"Max=({r.Bounds.MaxPoint.X:F2},{r.Bounds.MaxPoint.Y:F2})");
+            }
+
+            var biggestRoot = roots.FirstOrDefault();
+            if (biggestRoot != null)
+            {
+                var firstChildren = candidates
+                    .Where(x => x.ParentId == biggestRoot.Id)
+                    .OrderByDescending(x => Area(x.Bounds))
+                    .ToList();
+
+                ed.WriteMessage($"\n[FluxCAD] Largest Root Direct Children = {firstChildren.Count}");
+
+                for (int i = 0; i < Math.Min(firstChildren.Count, 30); i++)
+                {
+                    var c = firstChildren[i];
+                    double w = c.Bounds.MaxPoint.X - c.Bounds.MinPoint.X;
+                    double h = c.Bounds.MaxPoint.Y - c.Bounds.MinPoint.Y;
+
+                    ed.WriteMessage(
+                        $"\n    [Child {i + 1}] Id={c.Id}, Src={c.SourceType}, " +
+                        $"W={w:F2}, H={h:F2}, Area={Area(c.Bounds):F2}, " +
+                        $"Min=({c.Bounds.MinPoint.X:F2},{c.Bounds.MinPoint.Y:F2}) " +
+                        $"Max=({c.Bounds.MaxPoint.X:F2},{c.Bounds.MaxPoint.Y:F2})");
+                }
+            }
+        }
+
+        [CommandMethod("FLUX_LIST_XDATA_APPS")]
+        public void FluxListXDataApps()
+        {
+            var doc = Application.DocumentManager.MdiActiveDocument;
+            var db = doc.Database;
+            var ed = doc.Editor;
+
+            try
+            {
+                using (var tr = db.TransactionManager.StartTransaction())
+                {
+                    var bt = (BlockTable)tr.GetObject(db.BlockTableId, OpenMode.ForRead);
+                    var ms = (BlockTableRecord)tr.GetObject(bt[BlockTableRecord.ModelSpace], OpenMode.ForRead);
+
+                    int entityCount = 0;
+                    int entityWithAnyXData = 0;
+
+                    var appCounts = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+
+                    foreach (ObjectId id in ms)
+                    {
+                        if (!id.IsValid || id.IsErased) continue;
+
+                        var ent = tr.GetObject(id, OpenMode.ForRead, false) as Entity;
+                        if (ent == null) continue;
+
+                        entityCount++;
+
+                        var rb = ent.XData;
+                        if (rb == null) continue;
+
+                        bool hasAny = false;
+
+                        foreach (TypedValue tv in rb)
+                        {
+                            if (tv.TypeCode == (int)DxfCode.ExtendedDataRegAppName)
+                            {
+                                hasAny = true;
+                                string app = tv.Value?.ToString() ?? "<NULL>";
+
+                                if (!appCounts.ContainsKey(app))
+                                    appCounts[app] = 0;
+
+                                appCounts[app]++;
+                            }
+                        }
+
+                        if (hasAny)
+                            entityWithAnyXData++;
+                    }
+
+                    ed.WriteMessage($"\n[FLUX] ModelSpace Entity Count : {entityCount}");
+                    ed.WriteMessage($"\n[FLUX] Entities With XData     : {entityWithAnyXData}");
+                    ed.WriteMessage($"\n[FLUX] Distinct RegApp Count   : {appCounts.Count}");
+
+                    if (appCounts.Count == 0)
+                    {
+                        ed.WriteMessage("\n[FLUX] No XData RegApp found in ModelSpace.");
+                    }
+                    else
+                    {
+                        foreach (var kv in appCounts.OrderByDescending(x => x.Value).ThenBy(x => x.Key))
+                        {
+                            ed.WriteMessage($"\n    - RegApp = {kv.Key}, Occurrences = {kv.Value}");
+                        }
+                    }
+
+                    tr.Commit();
+                }
+            }
+            catch (System.Exception ex)
+            {
+                ed.WriteMessage($"\n[FLUX][ERROR] FLUX_LIST_XDATA_APPS failed: {ex.Message}");
+            }
+        }
+
+        private static bool HasFluxCadTag_old(Entity ent)
+        {
+            if (ent == null)
+                return false;
+
+            var rb = ent.XData;
+            if (rb == null)
+                return false;
+
+            foreach (TypedValue tv in rb)
+            {
+                if (tv.TypeCode == (int)DxfCode.ExtendedDataRegAppName)
+                {
+                    var app = tv.Value as string;
+                    if (string.Equals(app, FluxCadRegAppName, StringComparison.OrdinalIgnoreCase))
+                        return true;
+                }
+            }
+
+            return false;
+        }
+
+        private static bool HasFluxCadCopyTag(Entity ent)
+        {
+            if (ent == null)
+                return false;
+
+            var rb = ent.XData;
+            if (rb == null)
+                return false;
+
+            foreach (TypedValue tv in rb)
+            {
+                if (tv.TypeCode == (int)DxfCode.ExtendedDataRegAppName)
+                {
+                    var app = tv.Value as string;
+                    if (string.Equals(app, CopySetRegAppName, StringComparison.OrdinalIgnoreCase))
+                        return true;
+                }
+            }
+
+            return false;
+        }
+
+        [CommandMethod("FLUX_DUMP_PICKED_META")]
+        public void FluxDumpPickedMeta()
+        {
+            var doc = Application.DocumentManager.MdiActiveDocument;
+            var db = doc.Database;
+            var ed = doc.Editor;
+
+            try
+            {
+                var peo = new PromptEntityOptions("\n메타를 확인할 엔티티를 선택하세요: ");
+                var per = ed.GetEntity(peo);
+                if (per.Status != PromptStatus.OK)
+                    return;
+
+                using (var tr = db.TransactionManager.StartTransaction())
+                {
+                    var ent = tr.GetObject(per.ObjectId, OpenMode.ForRead) as Entity;
+                    if (ent == null)
+                    {
+                        ed.WriteMessage("\n[FLUX] Selected object is not an Entity.");
+                        return;
+                    }
+
+                    ed.WriteMessage($"\n[FLUX] Handle : {ent.Handle}");
+                    ed.WriteMessage($"\n[FLUX] Type   : {ent.GetType().Name}");
+                    ed.WriteMessage($"\n[FLUX] Layer  : {ent.Layer}");
+
+                    // XData dump
+                    var rb = ent.XData;
+                    if (rb == null)
+                    {
+                        ed.WriteMessage("\n[FLUX] XData  : <null>");
+                    }
+                    else
+                    {
+                        ed.WriteMessage("\n[FLUX] XData:");
+                        foreach (TypedValue tv in rb)
+                        {
+                            ed.WriteMessage($"\n    TypeCode={tv.TypeCode}, Value={tv.Value}");
+                        }
+                    }
+
+                    // ExtensionDictionary dump
+                    if (ent.ExtensionDictionary.IsNull || !ent.ExtensionDictionary.IsValid)
+                    {
+                        ed.WriteMessage("\n[FLUX] ExtensionDictionary : <none>");
+                    }
+                    else
+                    {
+                        var dict = tr.GetObject(ent.ExtensionDictionary, OpenMode.ForRead) as DBDictionary;
+                        if (dict == null)
+                        {
+                            ed.WriteMessage("\n[FLUX] ExtensionDictionary : <invalid>");
+                        }
+                        else
+                        {
+                            ed.WriteMessage("\n[FLUX] ExtensionDictionary Entries:");
+                            foreach (DBDictionaryEntry entry in dict)
+                            {
+                                var obj = tr.GetObject(entry.Value, OpenMode.ForRead, false);
+                                ed.WriteMessage($"\n    Key={entry.Key}, ObjectType={obj?.GetType().Name}");
+                            }
+                        }
+                    }
+
+                    tr.Commit();
+                }
+            }
+            catch (System.Exception ex)
+            {
+                ed.WriteMessage($"\n[FLUX][ERROR] FLUX_DUMP_PICKED_META failed: {ex.Message}");
+            }
+        }
+
+        // 추측: 현재 COPYSET XData RegApp 이름
+        //private const string CopySetRegAppName = "FLUX_COPYSET";
+
+        [CommandMethod("FLUX_LIST_COPYSET")]
+        public void FluxListCopySet()
+        {
+            var doc = Application.DocumentManager.MdiActiveDocument;
+            var db = doc.Database;
+            var ed = doc.Editor;
+
+            try
+            {
+                using (var tr = db.TransactionManager.StartTransaction())
+                {
+                    var bt = (BlockTable)tr.GetObject(db.BlockTableId, OpenMode.ForRead);
+                    var ms = (BlockTableRecord)tr.GetObject(bt[BlockTableRecord.ModelSpace], OpenMode.ForRead);
+
+                    int totalEntities = 0;
+                    int copySetTaggedEntities = 0;
+
+                    var copySetCounts = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+
+                    foreach (ObjectId id in ms)
+                    {
+                        if (!id.IsValid || id.IsErased) continue;
+
+                        var ent = tr.GetObject(id, OpenMode.ForRead, false) as Entity;
+                        if (ent == null) continue;
+
+                        totalEntities++;
+
+                        if (TryGetCopySetId(ent, out string copySetId))
+                        {
+                            copySetTaggedEntities++;
+
+                            if (string.IsNullOrWhiteSpace(copySetId))
+                                copySetId = "<EMPTY>";
+
+                            if (!copySetCounts.ContainsKey(copySetId))
+                                copySetCounts[copySetId] = 0;
+
+                            copySetCounts[copySetId]++;
+                        }
+                    }
+
+                    ed.WriteMessage($"\n[FLUX] ModelSpace Entity Count      : {totalEntities}");
+                    ed.WriteMessage($"\n[FLUX] COPYSET Tagged Entity Count  : {copySetTaggedEntities}");
+                    ed.WriteMessage($"\n[FLUX] COPYSET Group Count          : {copySetCounts.Count}");
+
+                    if (copySetCounts.Count == 0)
+                    {
+                        ed.WriteMessage($"\n[FLUX] No entities with COPYSET XData were found.");
+                    }
+                    else
+                    {
+                        string latestId = PickLatestCopySetId(copySetCounts.Keys);
+
+                        ed.WriteMessage($"\n[FLUX] Latest COPYSET ID            : {latestId}");
+
+                        foreach (var kv in copySetCounts
+                                     .OrderBy(k => TryParseLong(k.Key))
+                                     .ThenBy(k => k.Key, StringComparer.OrdinalIgnoreCase))
+                        {
+                            ed.WriteMessage($"\n    - COPYSET ID = {kv.Key}, Entity Count = {kv.Value}");
+                        }
+                    }
+
+                    tr.Commit();
+                }
+            }
+            catch (System.Exception ex)
+            {
+                ed.WriteMessage($"\n[FLUX][ERROR] FLUX_LIST_COPYSET failed: {ex.Message}");
+            }
+        }
+
+        private static bool TryGetCopySetId(Entity ent, out string copySetId)
+        {
+            copySetId = null;
+
+            ResultBuffer rb = ent.XData;
+            if (rb == null)
+                return false;
+
+            bool inTargetRegApp = false;
+
+            foreach (TypedValue tv in rb)
+            {
+                if (tv.TypeCode == (int)DxfCode.ExtendedDataRegAppName)
+                {
+                    string regApp = tv.Value as string;
+                    inTargetRegApp = string.Equals(regApp, CopySetRegAppName, StringComparison.OrdinalIgnoreCase);
+                    continue;
+                }
+
+                if (!inTargetRegApp)
+                    continue;
+
+                // 추측: 첫 문자열/정수 값을 CopySet ID 로 사용
+                if (tv.TypeCode == (int)DxfCode.ExtendedDataAsciiString ||
+                    tv.TypeCode == (int)DxfCode.ExtendedDataInteger16 ||
+                    tv.TypeCode == (int)DxfCode.ExtendedDataInteger32)
+                {
+                    copySetId = Convert.ToString(tv.Value, CultureInfo.InvariantCulture);
+                    return !string.IsNullOrWhiteSpace(copySetId);
+                }
+            }
+
+            return false;
+        }
+
+        private static string PickLatestCopySetId(IEnumerable<string> ids)
+        {
+            var list = ids.Where(x => !string.IsNullOrWhiteSpace(x)).ToList();
+            if (list.Count == 0)
+                return null;
+
+            var numeric = list
+                .Select(x => new { Raw = x, Num = TryParseLong(x) })
+                .Where(x => x.Num.HasValue)
+                .OrderByDescending(x => x.Num.Value)
+                .FirstOrDefault();
+
+            if (numeric != null)
+                return numeric.Raw;
+
+            // 숫자가 아니면 마지막 문자열 기준 fallback
+            return list.OrderBy(x => x, StringComparer.OrdinalIgnoreCase).Last();
+        }
+
+        private static long? TryParseLong(string s)
+        {
+            if (long.TryParse(s, NumberStyles.Integer, CultureInfo.InvariantCulture, out long v))
+                return v;
+            return null;
+        }
+        [CommandMethod("FLUX_BUILD_COPYSET_GROUPS")]
+        public void FluxBuildCopySetGroups()
+        {
+            var doc = Application.DocumentManager.MdiActiveDocument;
+            var db = doc.Database;
+            var ed = doc.Editor;
+
+            try
+            {
+                using var tr = db.TransactionManager.StartTransaction();
+
+                var bt = (BlockTable)tr.GetObject(db.BlockTableId, OpenMode.ForRead);
+                var ms = (BlockTableRecord)tr.GetObject(bt[BlockTableRecord.ModelSpace], OpenMode.ForWrite);
+
+                var copiedEntities = new List<Entity>();
+
+                foreach (ObjectId id in ms)
+                {
+                    if (!id.IsValid || id.IsErased)
+                        continue;
+
+                    var ent = tr.GetObject(id, OpenMode.ForRead, false) as Entity;
+                    if (ent == null)
+                        continue;
+
+                    if (!HasFluxCadTag(ent))
+                        continue;
+
+                    copiedEntities.Add(ent);
+                }
+
+                ed.WriteMessage($"\n[FluxCAD] Copy-tagged entities = {copiedEntities.Count}");
+
+                var items = CopySetGroupingService.CollectTopLevelCopySetEntities(tr, ms);
+
+                if (items.Count == 0)
+                {
+                    ed.WriteMessage("\n[FluxCAD] COPYSET 엔티티를 찾지 못했습니다.");
+                    tr.Commit();
+                    return;
+                }
+
+                string latestCopySetId = items
+                    .Select(x => x.CopySetId)
+                    .Where(x => !string.IsNullOrWhiteSpace(x))
+                    .Distinct(StringComparer.OrdinalIgnoreCase)
+                    .OrderByDescending(x => x, StringComparer.OrdinalIgnoreCase)
+                    .First();
+
+                var targetItems = items
+                    .Where(x => string.Equals(x.CopySetId, latestCopySetId, StringComparison.OrdinalIgnoreCase))
+                    .ToList();
+
+                if (targetItems.Count == 0)
+                {
+                    ed.WriteMessage($"\n[FluxCAD] 최신 COPYSET={latestCopySetId} 의 엔티티가 없습니다.");
+                    tr.Commit();
+                    return;
+                }
+
+                double eps = CopySetGroupingService.ComputeGroupingEpsilon(targetItems);
+                var groups = CopySetGroupingService.BuildGroups(targetItems, eps);
+
+                CopySetGroupingService.EnsureLayer(db, tr, "FLUX_GROUP_DEBUG");
+                CopySetGroupingService.ClearDebugLayer(ms, tr, "FLUX_GROUP_DEBUG");
+                CopySetGroupingService.DrawGroupDebugOverlay(ms, tr, groups, "FLUX_GROUP_DEBUG");
+
+                ed.WriteMessage($"\n[FluxCAD] Latest CopySet = {latestCopySetId}");
+                ed.WriteMessage($"\n[FluxCAD] TopLevel Count = {targetItems.Count}");
+                ed.WriteMessage($"\n[FluxCAD] EPS = {eps:0.###}");
+                ed.WriteMessage($"\n[FluxCAD] Group Count = {groups.Count}");
+
+                foreach (var g in groups.OrderByDescending(x => x.Area))
+                {
+                    ed.WriteMessage(
+                        $"\n  [Group {g.GroupId}] Items={g.Items.Count}, " +
+                        $"W={g.Width:0.##}, H={g.Height:0.##}, Area={g.Area:0.##}, " +
+                        $"Min=({g.Bounds.MinPoint.X:0.##},{g.Bounds.MinPoint.Y:0.##}) " +
+                        $"Max=({g.Bounds.MaxPoint.X:0.##},{g.Bounds.MaxPoint.Y:0.##})");
+                }
+
+                tr.Commit();
+            }
+            catch (System.Exception ex)
+            {
+                ed.WriteMessage($"\n[FluxCAD][ERROR] {ex.Message}\n{ex.StackTrace}");
+            }
+        }
+
+
+        public void FluxBuildCopySetGroups_old2()
+        {
+            var doc = Application.DocumentManager.MdiActiveDocument;
+            var db = doc.Database;
+            var ed = doc.Editor;
+
+            try
+            {
+                using var tr = db.TransactionManager.StartTransaction();
+
+                var bt = (BlockTable)tr.GetObject(db.BlockTableId, OpenMode.ForRead);
+                var ms = (BlockTableRecord)tr.GetObject(bt[BlockTableRecord.ModelSpace], OpenMode.ForWrite);
+
+                var tagged = new List<Entity>();
+
+                foreach (ObjectId id in ms)
+                {
+                    if (!id.IsValid || id.IsErased)
+                        continue;
+
+                    var ent = tr.GetObject(id, OpenMode.ForRead, false) as Entity;
+                    if (ent == null)
+                        continue;
+
+                    if (!HasFluxCadCopyTag(ent))
+                        continue;
+
+                    tagged.Add(ent);
+                }
+
+                ed.WriteMessage($"\n[FluxCAD] Tagged copy entities = {tagged.Count}");
+
+                var items = CopySetGroupingService.CollectTopLevelCopySetEntities(tr, ms);
+
+                if (items.Count == 0)
+                {
+                    ed.WriteMessage("\n[FluxCAD] COPYSET 엔티티를 찾지 못했습니다.");
+                    tr.Commit();
+                    return;
+                }
+
+                string latestCopySetId = items
+                    .Select(x => x.CopySetId)
+                    .Where(x => !string.IsNullOrWhiteSpace(x))
+                    .Distinct(StringComparer.OrdinalIgnoreCase)
+                    .OrderByDescending(x => x, StringComparer.OrdinalIgnoreCase)
+                    .First();
+
+                var targetItems = items
+                    .Where(x => string.Equals(x.CopySetId, latestCopySetId, StringComparison.OrdinalIgnoreCase))
+                    .ToList();
+
+                if (targetItems.Count == 0)
+                {
+                    ed.WriteMessage($"\n[FluxCAD] 최신 COPYSET={latestCopySetId} 의 엔티티가 없습니다.");
+                    tr.Commit();
+                    return;
+                }
+
+                double eps = CopySetGroupingService.ComputeGroupingEpsilon(targetItems);
+                var groups = CopySetGroupingService.BuildGroups(targetItems, eps);
+
+                CopySetGroupingService.EnsureLayer(db, tr, "FLUX_GROUP_DEBUG");
+                CopySetGroupingService.ClearDebugLayer(ms, tr, "FLUX_GROUP_DEBUG");
+                CopySetGroupingService.DrawGroupDebugOverlay(ms, tr, groups, "FLUX_GROUP_DEBUG");
+
+                ed.WriteMessage($"\n[FluxCAD] Latest CopySet = {latestCopySetId}");
+                ed.WriteMessage($"\n[FluxCAD] TopLevel Count = {targetItems.Count}");
+                ed.WriteMessage($"\n[FluxCAD] EPS = {eps:0.###}");
+                ed.WriteMessage($"\n[FluxCAD] Group Count = {groups.Count}");
+
+                foreach (var g in groups.OrderByDescending(x => x.Area))
+                {
+                    ed.WriteMessage(
+                        $"\n  [Group {g.GroupId}] Items={g.Items.Count}, " +
+                        $"W={g.Width:0.##}, H={g.Height:0.##}, Area={g.Area:0.##}, " +
+                        $"Min=({g.Bounds.MinPoint.X:0.##},{g.Bounds.MinPoint.Y:0.##}) " +
+                        $"Max=({g.Bounds.MaxPoint.X:0.##},{g.Bounds.MaxPoint.Y:0.##})");
+                }
+
+                tr.Commit();
+            }
+            catch (System.Exception ex)
+            {
+                ed.WriteMessage($"\n[FluxCAD][ERROR] {ex.Message}\n{ex.StackTrace}");
+            }
+        }
+
+
+        public void FluxBuildCopySetGroups_old()
+        {
+            var doc = Application.DocumentManager.MdiActiveDocument;
+            var db = doc.Database;
+            var ed = doc.Editor;
+
+            try
+            {
+                using var tr = db.TransactionManager.StartTransaction();
+
+                var bt = (BlockTable)tr.GetObject(db.BlockTableId, OpenMode.ForRead);
+                var ms = (BlockTableRecord)tr.GetObject(bt[BlockTableRecord.ModelSpace], OpenMode.ForWrite);
+
+                var items = CopySetGroupingService.CollectTopLevelCopySetEntities(tr, ms);
+
+                if (items.Count == 0)
+                {
+                    ed.WriteMessage("\n[FluxCAD] COPYSET 엔티티를 찾지 못했습니다.");
+                    tr.Commit();
+                    return;
+                }
+
+                string latestCopySetId = items
+                    .Select(x => x.CopySetId)
+                    .Where(x => !string.IsNullOrWhiteSpace(x))
+                    .Distinct(StringComparer.OrdinalIgnoreCase)
+                    .OrderByDescending(x => x, StringComparer.OrdinalIgnoreCase)
+                    .First();
+
+                var targetItems = items
+                    .Where(x => string.Equals(x.CopySetId, latestCopySetId, StringComparison.OrdinalIgnoreCase))
+                    .ToList();
+
+                if (targetItems.Count == 0)
+                {
+                    ed.WriteMessage($"\n[FluxCAD] 최신 COPYSET={latestCopySetId} 의 엔티티가 없습니다.");
+                    tr.Commit();
+                    return;
+                }
+
+                double eps = CopySetGroupingService.ComputeGroupingEpsilon(targetItems);
+                var groups = CopySetGroupingService.BuildGroups(targetItems, eps);
+
+                CopySetGroupingService.EnsureLayer(db, tr, "FLUX_GROUP_DEBUG");
+                CopySetGroupingService.ClearDebugLayer(ms, tr, "FLUX_GROUP_DEBUG");
+                CopySetGroupingService.DrawGroupDebugOverlay(ms, tr, groups, "FLUX_GROUP_DEBUG");
+
+                ed.WriteMessage($"\n[FluxCAD] Latest CopySet = {latestCopySetId}");
+                ed.WriteMessage($"\n[FluxCAD] TopLevel Count = {targetItems.Count}");
+                ed.WriteMessage($"\n[FluxCAD] EPS = {eps:0.###}");
+                ed.WriteMessage($"\n[FluxCAD] Group Count = {groups.Count}");
+
+                foreach (var g in groups.OrderByDescending(x => x.Area))
+                {
+                    ed.WriteMessage(
+                        $"\n  [Group {g.GroupId}] Items={g.Items.Count}, " +
+                        $"W={g.Width:0.##}, H={g.Height:0.##}, Area={g.Area:0.##}, " +
+                        $"Min=({g.Bounds.MinPoint.X:0.##},{g.Bounds.MinPoint.Y:0.##}) " +
+                        $"Max=({g.Bounds.MaxPoint.X:0.##},{g.Bounds.MaxPoint.Y:0.##})");
+                }
+
+                tr.Commit();
+            }
+            catch (System.Exception ex)
+            {
+                ed.WriteMessage($"\n[FluxCAD][ERROR] {ex.Message}\n{ex.StackTrace}");
+            }
+        }
+
+        public sealed class CopySetTopLevelEntity
+        {
+            public ObjectId Id { get; set; }
+            public string Handle { get; set; } = "";
+            public string SourceHandle { get; set; } = "";
+            public string CopySetId { get; set; } = "";
+            public string TypeName { get; set; } = "";
+            public string Layer { get; set; } = "";
+            public Extents3d Bounds { get; set; }
+
+            public double Width => Bounds.MaxPoint.X - Bounds.MinPoint.X;
+            public double Height => Bounds.MaxPoint.Y - Bounds.MinPoint.Y;
+            public double Area => Math.Max(0, Width) * Math.Max(0, Height);
+
+            public Point3d Center =>
+                new Point3d(
+                    (Bounds.MinPoint.X + Bounds.MaxPoint.X) * 0.5,
+                    (Bounds.MinPoint.Y + Bounds.MaxPoint.Y) * 0.5,
+                    0);
+        }
+
+        public sealed class SpatialGroup
+        {
+            public int GroupId { get; set; }
+            public List<CopySetTopLevelEntity> Items { get; } = new();
+            public Extents3d Bounds { get; set; }
+
+            public List<ObjectId> Entities { get; } = new();
+
+            public double Width => Bounds.MaxPoint.X - Bounds.MinPoint.X;
+            public double Height => Bounds.MaxPoint.Y - Bounds.MinPoint.Y;
+            public double Area => Math.Max(0, Width) * Math.Max(0, Height);
+        }
+
+        public static class CopySetGroupingService
+        {
+            public static List<CopySetTopLevelEntity> CollectTopLevelCopySetEntities(Transaction tr, BlockTableRecord ms)
+            {
+                var list = new List<CopySetTopLevelEntity>();
+
+                foreach (ObjectId id in ms)
+                {
+                    if (id.IsNull || id.IsErased)
+                        continue;
+
+                    var ent = tr.GetObject(id, OpenMode.ForRead, false) as Entity;
+                    if (ent == null)
+                        continue;
+
+                    if (ent is Viewport)
+                        continue;
+
+                    if (!TryReadFluxTags(ent, out string copySetId, out string sourceHandle))
+                        continue;
+
+                    if (string.IsNullOrWhiteSpace(copySetId))
+                        continue;
+
+                    if (!TryGetBounds(ent, out Extents3d bounds))
+                        continue;
+
+                    list.Add(new CopySetTopLevelEntity
+                    {
+                        Id = id,
+                        Handle = ent.Handle.ToString(),
+                        SourceHandle = sourceHandle,
+                        CopySetId = copySetId,
+                        TypeName = ent.GetType().Name,
+                        Layer = ent.Layer,
+                        Bounds = bounds
+                    });
+                }
+
+                return list;
+            }
+
+            public static double ComputeGroupingEpsilon(List<CopySetTopLevelEntity> items)
+            {
+                // 추측이 들어간 부분: 도면마다 조정될 수 있음
+                // 기본 아이디어:
+                // - 너무 작으면 분할이 과해지고
+                // - 너무 크면 전부 한 그룹으로 붙음
+                // 따라서 객체 최대 치수의 중앙값 기반으로 소폭 inflate
+                var sizes = items
+                    .Select(x => Math.Max(x.Width, x.Height))
+                    .Where(x => x > 1e-6)
+                    .OrderBy(x => x)
+                    .ToList();
+
+                if (sizes.Count == 0)
+                    return 20.0;
+
+                double median = sizes[sizes.Count / 2];
+                double eps = median * 0.02;   // 2%
+                if (eps < 5.0) eps = 5.0;
+                if (eps > 200.0) eps = 200.0;
+
+                return eps;
+            }
+
+            public static List<SpatialGroup> BuildGroups(List<CopySetTopLevelEntity> items, double eps)
+            {
+                int n = items.Count;
+                var visited = new bool[n];
+                var groups = new List<SpatialGroup>();
+                int groupId = 1;
+
+                for (int i = 0; i < n; i++)
+                {
+                    if (visited[i])
+                        continue;
+
+                    var q = new Queue<int>();
+                    q.Enqueue(i);
+                    visited[i] = true;
+
+                    var component = new List<CopySetTopLevelEntity>();
+
+                    while (q.Count > 0)
+                    {
+                        int cur = q.Dequeue();
+                        component.Add(items[cur]);
+
+                        for (int j = 0; j < n; j++)
+                        {
+                            if (visited[j])
+                                continue;
+
+                            if (AreConnected(items[cur].Bounds, items[j].Bounds, eps))
+                            {
+                                visited[j] = true;
+                                q.Enqueue(j);
+                            }
+                        }
+                    }
+
+                    var gBounds = component[0].Bounds;
+                    for (int k = 1; k < component.Count; k++)
+                        gBounds = UnionExt(gBounds, component[k].Bounds);
+
+                    var group = new SpatialGroup
+                    {
+                        GroupId = groupId++,
+                        Bounds = gBounds
+                    };
+                    group.Items.AddRange(component);
+
+                    groups.Add(group);
+                }
+
+                return groups;
+            }
+
+            private static bool AreConnected(Extents3d a, Extents3d b, double eps)
+            {
+                var ea = Inflate(a, eps, eps);
+                var eb = Inflate(b, eps, eps);
+
+                return Intersects2D(ea, eb);
+            }
+
+            private static bool Intersects2D(Extents3d a, Extents3d b)
+            {
+                if (a.MaxPoint.X < b.MinPoint.X) return false;
+                if (b.MaxPoint.X < a.MinPoint.X) return false;
+                if (a.MaxPoint.Y < b.MinPoint.Y) return false;
+                if (b.MaxPoint.Y < a.MinPoint.Y) return false;
+                return true;
+            }
+
+            private static Extents3d Inflate(Extents3d e, double dx, double dy)
+            {
+                return new Extents3d(
+                    new Point3d(e.MinPoint.X - dx, e.MinPoint.Y - dy, e.MinPoint.Z),
+                    new Point3d(e.MaxPoint.X + dx, e.MaxPoint.Y + dy, e.MaxPoint.Z));
+            }
+
+            private static Extents3d UnionExt(Extents3d a, Extents3d b)
+            {
+                return new Extents3d(
+                    new Point3d(
+                        Math.Min(a.MinPoint.X, b.MinPoint.X),
+                        Math.Min(a.MinPoint.Y, b.MinPoint.Y),
+                        Math.Min(a.MinPoint.Z, b.MinPoint.Z)),
+                    new Point3d(
+                        Math.Max(a.MaxPoint.X, b.MaxPoint.X),
+                        Math.Max(a.MaxPoint.Y, b.MaxPoint.Y),
+                        Math.Max(a.MaxPoint.Z, b.MaxPoint.Z)));
+            }
+
+            public static void EnsureLayer(Database db, Transaction tr, string layerName)
+            {
+                var lt = (LayerTable)tr.GetObject(db.LayerTableId, OpenMode.ForRead);
+
+                if (lt.Has(layerName))
+                    return;
+
+                lt.UpgradeOpen();
+                var rec = new LayerTableRecord
+                {
+                    Name = layerName
+                };
+                lt.Add(rec);
+                tr.AddNewlyCreatedDBObject(rec, true);
+            }
+
+            public static void ClearDebugLayer(BlockTableRecord ms, Transaction tr, string layerName)
+            {
+                var eraseIds = new List<ObjectId>();
+
+                foreach (ObjectId id in ms)
+                {
+                    if (id.IsNull || id.IsErased)
+                        continue;
+
+                    var ent = tr.GetObject(id, OpenMode.ForRead, false) as Entity;
+                    if (ent == null)
+                        continue;
+
+                    if (string.Equals(ent.Layer, layerName, StringComparison.OrdinalIgnoreCase))
+                        eraseIds.Add(id);
+                }
+
+                foreach (var id in eraseIds)
+                {
+                    var ent = tr.GetObject(id, OpenMode.ForWrite, false) as Entity;
+                    ent?.Erase();
+                }
+            }
+
+            public static void DrawGroupDebugOverlay(
+                BlockTableRecord ms,
+                Transaction tr,
+                List<SpatialGroup> groups,
+                string layerName)
+            {
+                foreach (var g in groups)
+                {
+                    double minX = g.Bounds.MinPoint.X;
+                    double minY = g.Bounds.MinPoint.Y;
+                    double maxX = g.Bounds.MaxPoint.X;
+                    double maxY = g.Bounds.MaxPoint.Y;
+
+                    var pl = new Polyline();
+                    pl.SetDatabaseDefaults();
+                    pl.Layer = layerName;
+
+                    pl.AddVertexAt(0, new Point2d(minX, minY), 0, 0, 0);
+                    pl.AddVertexAt(1, new Point2d(maxX, minY), 0, 0, 0);
+                    pl.AddVertexAt(2, new Point2d(maxX, maxY), 0, 0, 0);
+                    pl.AddVertexAt(3, new Point2d(minX, maxY), 0, 0, 0);
+                    pl.Closed = true;
+
+                    ms.AppendEntity(pl);
+                    tr.AddNewlyCreatedDBObject(pl, true);
+
+                    double textHeight = Math.Max(20.0, Math.Min(g.Width, g.Height) * 0.05);
+
+                    var txt = new DBText
+                    {
+                        Layer = layerName,
+                        Position = new Point3d(minX, maxY + textHeight * 0.3, 0),
+                        Height = textHeight,
+                        TextString = $"G{g.GroupId} ({g.Items.Count})"
+                    };
+
+                    ms.AppendEntity(txt);
+                    tr.AddNewlyCreatedDBObject(txt, true);
+                }
+            }
+
+            private static bool TryReadFluxTags(Entity ent, out string copySetId, out string sourceHandle)
+            {
+                copySetId = "";
+                sourceHandle = "";
+
+                try
+                {
+                    using var rb = ent.XData;
+                    if (rb == null)
+                        return false;
+
+                    bool hasFluxApp = false;
+
+                    foreach (TypedValue tv in rb)
+                    {
+                        if (tv.TypeCode == (int)DxfCode.ExtendedDataRegAppName)
+                        {
+                            if (string.Equals(tv.Value?.ToString(), "FLUXCAD", StringComparison.OrdinalIgnoreCase))
+                                hasFluxApp = true;
+                        }
+                        else if (tv.TypeCode == (int)DxfCode.ExtendedDataAsciiString)
+                        {
+                            string s = tv.Value?.ToString() ?? "";
+
+                            if (s.StartsWith("COPYSET=", StringComparison.OrdinalIgnoreCase))
+                                copySetId = s.Substring("COPYSET=".Length);
+
+                            if (s.StartsWith("SRC=", StringComparison.OrdinalIgnoreCase))
+                                sourceHandle = s.Substring("SRC=".Length);
+                        }
+                    }
+
+                    return hasFluxApp && !string.IsNullOrWhiteSpace(copySetId);
+                }
+                catch
+                {
+                    return false;
+                }
+            }
+
+            private static bool TryGetBounds(Entity ent, out Extents3d bounds)
+            {
+                bounds = default;
+
+                try
+                {
+                    bounds = ent.GeometricExtents;
+                    return true;
+                }
+                catch
+                {
+                    return false;
+                }
+            }
+        }
+
+        [CommandMethod("FLUX_COPY_TO_SIDE")]
+        public void FluxCopyToSide()
+        {
+            var doc = Application.DocumentManager.MdiActiveDocument;
+            var db = doc.Database;
+            var ed = doc.Editor;
+
+            try
+            {
+                using var tr = db.TransactionManager.StartTransaction();
+
+                var bt = (BlockTable)tr.GetObject(db.BlockTableId, OpenMode.ForRead);
+                var ms = (BlockTableRecord)tr.GetObject(bt[BlockTableRecord.ModelSpace], OpenMode.ForWrite);
+
+                var sourceIds = new ObjectIdCollection();
+                Extents3d? totalExt = null;
+
+                var topLevelSourceIds = new HashSet<ObjectId>();
+                foreach (ObjectId id in ms)
+                {
+                    if (id.IsNull || id.IsErased)
+                        continue;
+
+                    var obj = tr.GetObject(id, OpenMode.ForRead, false) as Entity;
+                    if (obj == null)
+                        continue;
+
+                    if (obj is Viewport)
+                        continue;
+
+                    sourceIds.Add(id);
+                    topLevelSourceIds.Add(id);
+
+                    try
+                    {
+                        var ext = obj.GeometricExtents;
+                        totalExt = totalExt == null ? ext : UnionExt(totalExt.Value, ext);
+                    }
+                    catch
+                    {
+                    }
+                }
+
+                if (sourceIds.Count == 0)
+                {
+                    ed.WriteMessage("\n[FluxCAD] 복사할 엔티티가 없습니다.");
+                    tr.Commit();
+                    return;
+                }
+
+                if (totalExt == null)
+                {
+                    ed.WriteMessage("\n[FluxCAD] 전체 Extents 계산 실패.");
+                    tr.Commit();
+                    return;
+                }
+
+                double width = totalExt.Value.MaxPoint.X - totalExt.Value.MinPoint.X;
+                double margin = Math.Max(width * 0.2, 1000.0);
+
+                // 오른쪽 멀리 복사
+                var offset = new Vector3d(width + margin, 0, 0);
+
+                var mapping = new IdMapping();
+
+                // 같은 DB, 같은 ModelSpace 안으로 복제
+                db.DeepCloneObjects(sourceIds, ms.ObjectId, mapping, false);
+
+                int moved = 0;
+                int tagged = 0;
+                string copySetId = "COPYSET_" + DateTime.Now.ToString("yyyyMMdd_HHmmss");
+
+                EnsureRegApp(db, tr, "FLUXCAD");
+
+                foreach (IdPair pair in mapping)
+                {
+                    if (!pair.IsCloned || pair.Value.IsNull)
+                        continue;
+
+                    // 핵심: 최상위 원본 객체에 대응되는 clone만 이동
+                    if (!topLevelSourceIds.Contains(pair.Key))
+                        continue;
+
+                    var clonedObj = tr.GetObject(pair.Value, OpenMode.ForWrite, false) as Entity;
+                    if (clonedObj == null)
+                        continue;
+
+                    try
+                    {
+                        clonedObj.TransformBy(Matrix3d.Displacement(offset));
+                        moved++;
+
+                        SetFluxXData(clonedObj, copySetId, pair.Key.Handle.ToString());
+                        tagged++;
+                    }
+                    catch (System.Exception ex)
+                    {
+                        ed.WriteMessage($"\n[FluxCAD][MoveFail] {pair.Value.Handle} : {ex.Message}");
+                    }
+                }
+
+                tr.Commit();
+
+                ed.WriteMessage($"\n[FluxCAD] Copy complete.");
+                ed.WriteMessage($"\n[FluxCAD] CopySetId = {copySetId}");
+                ed.WriteMessage($"\n[FluxCAD] Cloned+Moved = {moved}");
+                ed.WriteMessage($"\n[FluxCAD] Tagged = {tagged}");
+                ed.WriteMessage($"\n[FluxCAD] Offset = ({offset.X}, {offset.Y}, {offset.Z})");
+            }
+            catch (System.Exception ex)
+            {
+                ed.WriteMessage($"\n[FluxCAD][ERROR] {ex.Message}\n{ex.StackTrace}");
+            }
+        }
+
+
+        public void FluxCopyToSide_old()
+        {
+            var doc = Application.DocumentManager.MdiActiveDocument;
+            var db = doc.Database;
+            var ed = doc.Editor;
+
+            try
+            {
+                using var tr = db.TransactionManager.StartTransaction();
+
+                var bt = (BlockTable)tr.GetObject(db.BlockTableId, OpenMode.ForRead);
+                var ms = (BlockTableRecord)tr.GetObject(bt[BlockTableRecord.ModelSpace], OpenMode.ForWrite);
+
+                var sourceIds = new ObjectIdCollection();
+                Extents3d? totalExt = null;
+
+                foreach (ObjectId id in ms)
+                {
+                    if (id.IsNull || id.IsErased)
+                        continue;
+
+                    var obj = tr.GetObject(id, OpenMode.ForRead, false) as Entity;
+                    if (obj == null)
+                        continue;
+
+                    if (obj is Viewport)
+                        continue;
+
+                    sourceIds.Add(id);
+
+                    try
+                    {
+                        var ext = obj.GeometricExtents;
+                        totalExt = totalExt == null ? ext : UnionExt(totalExt.Value, ext);
+                    }
+                    catch
+                    {
+                    }
+                }
+
+                if (sourceIds.Count == 0)
+                {
+                    ed.WriteMessage("\n[FluxCAD] 복사할 엔티티가 없습니다.");
+                    tr.Commit();
+                    return;
+                }
+
+                if (totalExt == null)
+                {
+                    ed.WriteMessage("\n[FluxCAD] 전체 Extents 계산 실패.");
+                    tr.Commit();
+                    return;
+                }
+
+                double width = totalExt.Value.MaxPoint.X - totalExt.Value.MinPoint.X;
+                double margin = Math.Max(width * 0.2, 1000.0);
+
+                // 오른쪽 멀리 복사
+                var offset = new Vector3d(width + margin, 0, 0);
+
+                var mapping = new IdMapping();
+
+                // 같은 DB, 같은 ModelSpace 안으로 복제
+                db.DeepCloneObjects(sourceIds, ms.ObjectId, mapping, false);
+
+                int moved = 0;
+                int tagged = 0;
+                string copySetId = "COPYSET_" + DateTime.Now.ToString("yyyyMMdd_HHmmss");
+
+                EnsureRegApp(db, tr, "FLUXCAD");
+
+                foreach (IdPair pair in mapping)
+                {
+                    if (!pair.IsCloned || pair.Value.IsNull)
+                        continue;
+
+                    var clonedObj = tr.GetObject(pair.Value, OpenMode.ForWrite, false) as Entity;
+                    if (clonedObj == null)
+                        continue;
+
+                    try
+                    {
+                        clonedObj.TransformBy(Matrix3d.Displacement(offset));
+                        moved++;
+
+                        SetFluxXData(clonedObj, copySetId, pair.Key.Handle.ToString());
+                        tagged++;
+                    }
+                    catch (System.Exception ex)
+                    {
+                        ed.WriteMessage($"\n[FluxCAD][MoveFail] {pair.Value.Handle} : {ex.Message}");
+                    }
+                }
+
+                tr.Commit();
+
+                ed.WriteMessage($"\n[FluxCAD] Copy complete.");
+                ed.WriteMessage($"\n[FluxCAD] CopySetId = {copySetId}");
+                ed.WriteMessage($"\n[FluxCAD] Cloned+Moved = {moved}");
+                ed.WriteMessage($"\n[FluxCAD] Tagged = {tagged}");
+                ed.WriteMessage($"\n[FluxCAD] Offset = ({offset.X}, {offset.Y}, {offset.Z})");
+            }
+            catch (System.Exception ex)
+            {
+                ed.WriteMessage($"\n[FluxCAD][ERROR] {ex.Message}\n{ex.StackTrace}");
+            }
+        }
+
+        private static Extents3d UnionExt(Extents3d a, Extents3d b)
+        {
+            var minX = Math.Min(a.MinPoint.X, b.MinPoint.X);
+            var minY = Math.Min(a.MinPoint.Y, b.MinPoint.Y);
+            var minZ = Math.Min(a.MinPoint.Z, b.MinPoint.Z);
+
+            var maxX = Math.Max(a.MaxPoint.X, b.MaxPoint.X);
+            var maxY = Math.Max(a.MaxPoint.Y, b.MaxPoint.Y);
+            var maxZ = Math.Max(a.MaxPoint.Z, b.MaxPoint.Z);
+
+            return new Extents3d(
+                new Point3d(minX, minY, minZ),
+                new Point3d(maxX, maxY, maxZ));
+        }
+
+        private static void EnsureRegApp(Database db, Transaction tr, string appName)
+        {
+            var rat = (RegAppTable)tr.GetObject(db.RegAppTableId, OpenMode.ForRead);
+            if (rat.Has(appName))
+                return;
+
+            rat.UpgradeOpen();
+            var rec = new RegAppTableRecord { Name = appName };
+            rat.Add(rec);
+            tr.AddNewlyCreatedDBObject(rec, true);
+        }
+
+        private static void SetFluxXData(Entity ent, string copySetId, string sourceHandle)
+        {
+            var rb = new ResultBuffer(
+                new TypedValue((int)DxfCode.ExtendedDataRegAppName, "FLUXCAD"),
+                new TypedValue((int)DxfCode.ExtendedDataAsciiString, $"COPYSET={copySetId}"),
+                new TypedValue((int)DxfCode.ExtendedDataAsciiString, $"SRC={sourceHandle}")
+            );
+
+            ent.XData = rb;
+        }
+
+        [CommandMethod("FLUX_EXPORT_SPATIAL_WORLD")]
+        public void ExportSpatialWorld()
+        {
+            var doc = Application.DocumentManager.MdiActiveDocument;
+            var db = doc.Database;
+            var ed = doc.Editor;
+
+            if (string.IsNullOrWhiteSpace(db.Filename))
+            {
+                ed.WriteMessage("\n[FluxCAD] 먼저 도면을 저장해 주세요.");
+                return;
+            }
+
+            try
+            {
+                SpatialScene scene;
+
+                using (var tr = db.TransactionManager.StartTransaction())
+                {
+                    var builder = new SpatialWorldBuilder();
+                    scene = builder.Build(db, tr);
+                    tr.Commit();
+                }
+
+                ed.WriteMessage($"\n[FluxCAD] Spatial build complete. Items={scene.Items.Count}, Skipped={scene.Skipped.Count}");
+
+                string srcPath = db.Filename;
+                string outDwg = Path.Combine(
+                    Path.GetDirectoryName(srcPath)!,
+                    Path.GetFileNameWithoutExtension(srcPath) + "_spatial_world.dwg");
+
+                string outJson = Path.Combine(
+                    Path.GetDirectoryName(srcPath)!,
+                    Path.GetFileNameWithoutExtension(srcPath) + "_spatial_world.json");
+
+                SpatialWorldExporter.Export(db, scene, outDwg, ed);
+                SpatialWorldExporter.ExportJson(scene, outJson);
+
+                ed.WriteMessage($"\n[FluxCAD] DWG  : {outDwg}");
+                ed.WriteMessage($"\n[FluxCAD] JSON : {outJson}");
+
+                if (scene.Skipped.Count > 0)
+                {
+                    ed.WriteMessage($"\n[FluxCAD] Skipped sample:");
+                    foreach (var s in scene.Skipped.Take(15))
+                        ed.WriteMessage($"\n  - {s}");
+                }
+            }
+            catch (System.Exception ex)
+            {
+                ed.WriteMessage($"\n[FluxCAD][ERROR] {ex.Message}\n{ex.StackTrace}");
+            }
+        }
+
+        public sealed class SpatialScene
+        {
+            public List<PlacedEntity> Items { get; } = new();
+            public List<string> Skipped { get; } = new();
+        }
+
+        public sealed class PlacedEntity
+        {
+            public SourceEntityInfo Source { get; set; } = new();
+            public Entity WorldEntity { get; set; } = null!;
+            public Extents3d? WorldBounds { get; set; }
+        }
+
+        public sealed class SourceEntityInfo
+        {
+            public string Handle { get; set; } = "";
+            public string TypeName { get; set; } = "";
+            public List<string> ParentBlockPath { get; set; } = new();
+            public string Layer { get; set; } = "";
+            public string Linetype { get; set; } = "";
+            public string? TextStyleName { get; set; }
+        }
+
+        public sealed class SpatialWorldBuilder
+        {
+            public SpatialScene Build(Database db, Transaction tr)
+            {
+                var scene = new SpatialScene();
+
+                var bt = (BlockTable)tr.GetObject(db.BlockTableId, OpenMode.ForRead);
+                var ms = (BlockTableRecord)tr.GetObject(bt[BlockTableRecord.ModelSpace], OpenMode.ForRead);
+
+                foreach (ObjectId id in ms)
+                {
+                    TraverseEntity(
+                        tr,
+                        id,
+                        Matrix3d.Identity,
+                        new List<string>(),
+                        scene);
+                }
+
+                return scene;
+            }
+
+            private void TraverseEntity(
+                Transaction tr,
+                ObjectId id,
+                Matrix3d accumulatedTransform,
+                List<string> parentBlockPath,
+                SpatialScene scene)
+            {
+                if (id.IsNull || id.IsErased)
+                    return;
+
+                var dbObj = tr.GetObject(id, OpenMode.ForRead, false);
+                if (dbObj is not Entity ent)
+                    return;
+
+                // Viewport 같은 분석 불필요 객체는 제외
+                if (ent is Viewport)
+                    return;
+
+                if (ent is BlockReference br)
+                {
+                    try
+                    {
+                        var nextPath = new List<string>(parentBlockPath) { br.Handle.ToString() };
+                        var nextTransform = accumulatedTransform * br.BlockTransform;
+
+                        var btr = (BlockTableRecord)tr.GetObject(br.BlockTableRecord, OpenMode.ForRead);
+                        foreach (ObjectId childId in btr)
+                        {
+                            TraverseEntity(tr, childId, nextTransform, nextPath, scene);
+                        }
+                    }
+                    catch (System.Exception ex)
+                    {
+                        scene.Skipped.Add($"BlockReference Handle={br.Handle} Reason={ex.Message}");
+                    }
+
+                    return;
+                }
+
+                try
+                {
+                    var cloned = (Entity)ent.Clone();
+                    cloned.TransformBy(accumulatedTransform);
+
+                    var info = new SourceEntityInfo
+                    {
+                        Handle = ent.Handle.ToString(),
+                        TypeName = ent.GetType().Name,
+                        ParentBlockPath = new List<string>(parentBlockPath),
+                        Layer = ent.Layer,
+                        Linetype = ent.Linetype,
+                        TextStyleName = GetTextStyleName(ent, tr)
+                    };
+
+                    Extents3d? bounds = null;
+                    try
+                    {
+                        bounds = cloned.GeometricExtents;
+                    }
+                    catch
+                    {
+                        // bounds 실패는 허용. 나중에 cell 검출에서 제외 가능
+                    }
+
+                    scene.Items.Add(new PlacedEntity
+                    {
+                        Source = info,
+                        WorldEntity = cloned,
+                        WorldBounds = bounds
+                    });
+                }
+                catch (System.Exception ex)
+                {
+                    scene.Skipped.Add($"Entity Handle={ent.Handle} Type={ent.GetType().Name} Reason={ex.Message}");
+                }
+            }
+
+            private string? GetTextStyleName(Entity ent, Transaction tr)
+            {
+                try
+                {
+                    if (ent is DBText dbText)
+                    {
+                        if (!dbText.TextStyleId.IsNull)
+                        {
+                            var ts = tr.GetObject(dbText.TextStyleId, OpenMode.ForRead) as TextStyleTableRecord;
+                            return ts?.Name;
+                        }
+                    }
+                    else if (ent is MText mText)
+                    {
+                        if (!mText.TextStyleId.IsNull)
+                        {
+                            var ts = tr.GetObject(mText.TextStyleId, OpenMode.ForRead) as TextStyleTableRecord;
+                            return ts?.Name;
+                        }
+                    }
+                }
+                catch
+                {
+                }
+
+                return null;
+            }
+        }
+
+        public static class SpatialWorldExporter
+        {
+            public static void Export(Database sourceDb, SpatialScene scene, string outDwgPath, Editor ed)
+            {
+                if (File.Exists(outDwgPath))
+                    File.Delete(outDwgPath);
+
+                using var targetDb = new Database(true, true);
+
+                // 먼저 필요한 레이어 / 선종류 / 문자스타일을 복제
+                CloneRequiredSymbolTables(sourceDb, targetDb, scene, ed);
+
+                using var tr = targetDb.TransactionManager.StartTransaction();
+
+                var bt = (BlockTable)tr.GetObject(targetDb.BlockTableId, OpenMode.ForRead);
+                var ms = (BlockTableRecord)tr.GetObject(bt[BlockTableRecord.ModelSpace], OpenMode.ForWrite);
+
+                int appended = 0;
+                int appendFailed = 0;
+
+                foreach (var item in scene.Items)
+                {
+                    try
+                    {
+                        var ent = item.WorldEntity;
+
+                        ApplyTargetStyleBindings(targetDb, tr, ent, item.Source);
+
+                        ms.AppendEntity(ent);
+                        tr.AddNewlyCreatedDBObject(ent, true);
+                        appended++;
+                    }
+                    catch (System.Exception ex)
+                    {
+                        appendFailed++;
+                        ed.WriteMessage($"\n[FluxCAD][AppendFail] {item.Source.Handle} {item.Source.TypeName} : {ex.Message}");
+                        try { item.WorldEntity.Dispose(); } catch { }
+                    }
+                }
+
+                tr.Commit();
+
+                targetDb.SaveAs(outDwgPath, DwgVersion.Current);
+
+                ed.WriteMessage($"\n[FluxCAD] Export appended={appended}, failed={appendFailed}");
+            }
+
+            public static void ExportJson(SpatialScene scene, string outJsonPath)
+            {
+                var dto = scene.Items.Select((x, i) => new
+                {
+                    index = i,
+                    sourceHandle = x.Source.Handle,
+                    sourceType = x.Source.TypeName,
+                    parentBlockPath = x.Source.ParentBlockPath,
+                    layer = x.Source.Layer,
+                    linetype = x.Source.Linetype,
+                    textStyle = x.Source.TextStyleName,
+                    bounds = x.WorldBounds == null ? null : new
+                    {
+                        minX = x.WorldBounds.Value.MinPoint.X,
+                        minY = x.WorldBounds.Value.MinPoint.Y,
+                        minZ = x.WorldBounds.Value.MinPoint.Z,
+                        maxX = x.WorldBounds.Value.MaxPoint.X,
+                        maxY = x.WorldBounds.Value.MaxPoint.Y,
+                        maxZ = x.WorldBounds.Value.MaxPoint.Z
+                    }
+                }).ToList();
+
+                var root = new
+                {
+                    itemCount = scene.Items.Count,
+                    skippedCount = scene.Skipped.Count,
+                    items = dto,
+                    skipped = scene.Skipped
+                };
+
+                File.WriteAllText(outJsonPath, JsonConvert.SerializeObject(root, Formatting.Indented));
+            }
+
+            private static void CloneRequiredSymbolTables(Database sourceDb, Database targetDb, SpatialScene scene, Editor ed)
+            {
+                var layerNames = scene.Items
+                    .Select(x => x.Source.Layer)
+                    .Where(x => !string.IsNullOrWhiteSpace(x))
+                    .Distinct(StringComparer.OrdinalIgnoreCase)
+                    .ToList();
+
+                var linetypeNames = scene.Items
+                    .Select(x => x.Source.Linetype)
+                    .Where(x => !string.IsNullOrWhiteSpace(x) && !x.Equals("ByLayer", StringComparison.OrdinalIgnoreCase) && !x.Equals("ByBlock", StringComparison.OrdinalIgnoreCase))
+                    .Distinct(StringComparer.OrdinalIgnoreCase)
+                    .ToList();
+
+                var textStyleNames = scene.Items
+                    .Select(x => x.Source.TextStyleName)
+                    .Where(x => !string.IsNullOrWhiteSpace(x))
+                    .Distinct(StringComparer.OrdinalIgnoreCase)
+                    .Cast<string>()
+                    .ToList();
+
+                using var tr = sourceDb.TransactionManager.StartTransaction();
+
+                CloneLayers(sourceDb, targetDb, tr, layerNames, ed);
+                CloneLinetypes(sourceDb, targetDb, tr, linetypeNames, ed);
+                CloneTextStyles(sourceDb, targetDb, tr, textStyleNames, ed);
+
+                tr.Commit();
+            }
+
+            private static void CloneLayers(Database sourceDb, Database targetDb, Transaction sourceTr, List<string> layerNames, Editor ed)
+            {
+                var srcTable = (LayerTable)sourceTr.GetObject(sourceDb.LayerTableId, OpenMode.ForRead);
+
+                using var targetTr = targetDb.TransactionManager.StartTransaction();
+                var tgtTable = (LayerTable)targetTr.GetObject(targetDb.LayerTableId, OpenMode.ForRead);
+
+                foreach (var name in layerNames)
+                {
+                    if (tgtTable.Has(name))
+                        continue;
+
+                    if (!srcTable.Has(name))
+                        continue;
+
+                    var srcRec = (LayerTableRecord)sourceTr.GetObject(srcTable[name], OpenMode.ForRead);
+
+                    var newRec = new LayerTableRecord
+                    {
+                        Name = srcRec.Name,
+                        Color = srcRec.Color,
+                        IsFrozen = srcRec.IsFrozen,
+                        IsLocked = srcRec.IsLocked,
+                        IsOff = srcRec.IsOff,
+                        IsPlottable = srcRec.IsPlottable,
+                        LineWeight = srcRec.LineWeight
+                    };
+
+                    tgtTable.UpgradeOpen();
+                    var newId = tgtTable.Add(newRec);
+                    targetTr.AddNewlyCreatedDBObject(newRec, true);
+                }
+
+                targetTr.Commit();
+            }
+
+            private static void CloneLinetypes(Database sourceDb, Database targetDb, Transaction sourceTr, List<string> names, Editor ed)
+            {
+                var srcTable = (LinetypeTable)sourceTr.GetObject(sourceDb.LinetypeTableId, OpenMode.ForRead);
+
+                using var targetTr = targetDb.TransactionManager.StartTransaction();
+                var tgtTable = (LinetypeTable)targetTr.GetObject(targetDb.LinetypeTableId, OpenMode.ForRead);
+
+                foreach (var name in names)
+                {
+                    if (tgtTable.Has(name))
+                        continue;
+
+                    if (!srcTable.Has(name))
+                        continue;
+
+                    try
+                    {
+                        var ids = new ObjectIdCollection { srcTable[name] };
+                        var map = new IdMapping();
+                        sourceDb.WblockCloneObjects(ids, targetDb.LinetypeTableId, map, DuplicateRecordCloning.Ignore, false);
+                    }
+                    catch (System.Exception ex)
+                    {
+                        ed.WriteMessage($"\n[FluxCAD][LinetypeCloneFail] {name} : {ex.Message}");
+                    }
+                }
+
+                targetTr.Commit();
+            }
+
+            private static void CloneTextStyles(Database sourceDb, Database targetDb, Transaction sourceTr, List<string> names, Editor ed)
+            {
+                var srcTable = (TextStyleTable)sourceTr.GetObject(sourceDb.TextStyleTableId, OpenMode.ForRead);
+
+                using var targetTr = targetDb.TransactionManager.StartTransaction();
+                var tgtTable = (TextStyleTable)targetTr.GetObject(targetDb.TextStyleTableId, OpenMode.ForRead);
+
+                foreach (var name in names)
+                {
+                    if (tgtTable.Has(name))
+                        continue;
+
+                    if (!srcTable.Has(name))
+                        continue;
+
+                    try
+                    {
+                        var ids = new ObjectIdCollection { srcTable[name] };
+                        var map = new IdMapping();
+                        sourceDb.WblockCloneObjects(ids, targetDb.TextStyleTableId, map, DuplicateRecordCloning.Ignore, false);
+                    }
+                    catch (System.Exception ex)
+                    {
+                        ed.WriteMessage($"\n[FluxCAD][TextStyleCloneFail] {name} : {ex.Message}");
+                    }
+                }
+
+                targetTr.Commit();
+            }
+
+            private static void ApplyTargetStyleBindings(Database targetDb, Transaction targetTr, Entity ent, SourceEntityInfo src)
+            {
+                if (!string.IsNullOrWhiteSpace(src.Layer))
+                    ent.Layer = src.Layer;
+
+                if (!string.IsNullOrWhiteSpace(src.Linetype))
+                    ent.Linetype = src.Linetype;
+
+                if (!string.IsNullOrWhiteSpace(src.TextStyleName))
+                {
+                    var tst = (TextStyleTable)targetTr.GetObject(targetDb.TextStyleTableId, OpenMode.ForRead);
+                    if (tst.Has(src.TextStyleName))
+                    {
+                        var styleId = tst[src.TextStyleName];
+
+                        if (ent is DBText dbText)
+                            dbText.TextStyleId = styleId;
+                        else if (ent is MText mText)
+                            mText.TextStyleId = styleId;
+                    }
+                }
+            }
+        }
+
 
         [CommandMethod("FLUX_EXPORT_GIANT_CANDIDATES")]
         public void ExportGiantCandidates()
@@ -838,7 +4595,7 @@ namespace FluxCAD.BricsCAD.Plugin26
             return CandidateGrade.None;
         }
 
-        private bool TryGetEntityExtents(Entity ent, out Extents3d ext)
+        private bool TryGetEntityExtents_old(Entity ent, out Extents3d ext)
         {
             ext = default;
             try
