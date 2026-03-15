@@ -10,6 +10,7 @@ using System.Globalization;
 using System.IO;
 using System.Reflection;
 using System.Text.RegularExpressions;
+using System.Windows.Controls;
 using System.Windows.Media.Animation;
 using Teigha.DatabaseServices;
 using Teigha.Geometry; // Point3d, Vector3d 등이 정의된 곳
@@ -19,6 +20,26 @@ using Teigha.Runtime;
 
 namespace FluxCAD.BricsCAD.Plugin26
 {
+    public sealed class CellLocalExportResult
+    {
+        public List<SpatialNode> ExportNodes { get; } = new();
+        public List<string> ExportHandles { get; } = new();
+
+        public List<SpatialNode> AcceptedBlocks { get; } = new();
+        public List<SpatialNode> AcceptedPrimitives { get; } = new();
+
+        public List<SpatialNode> RejectedPartitions { get; } = new();
+        public List<SpatialNode> RejectedTooLargeBlocks { get; } = new();
+        public List<SpatialNode> RejectedNonLocal { get; } = new();
+
+        public int TotalAcceptedCount => AcceptedBlocks.Count + AcceptedPrimitives.Count;
+
+        // 기존 호출부 호환용 alias
+        //public IReadOnlyList<string> ExportIds => ExportHandles;
+
+        public ObjectIdCollection ExportIds { get; } = new ObjectIdCollection();
+    }
+
     internal sealed class FluxCell
     {
         public int Row { get; set; }
@@ -104,6 +125,7 @@ namespace FluxCAD.BricsCAD.Plugin26
     internal sealed class RootUnitInfo
     {
         public ObjectId Id { get; set; }
+        public string HandleText { get; set; } = "";
         public string TypeName { get; set; } = "";
         public string? BlockName { get; set; }
         public Extents3d Bounds { get; set; }
@@ -112,6 +134,15 @@ namespace FluxCAD.BricsCAD.Plugin26
         public double Height { get; set; }
         public RootRole Role { get; set; }
         public string Reason { get; set; } = "";
+
+        public bool IsBlockReference =>
+            string.Equals(TypeName, "BlockReference", StringComparison.OrdinalIgnoreCase);
+
+        public bool IsLikelyBlock =>
+            IsBlockReference || !string.IsNullOrWhiteSpace(BlockName);
+
+        public bool IsPartition =>
+        Role == RootRole.Partition;
     }
 
     internal sealed class PrimitiveCluster
@@ -125,6 +156,304 @@ namespace FluxCAD.BricsCAD.Plugin26
                 0);
     }
 
+    public sealed class GridAnalysisResult
+    {
+        public GridCell[,] Cells { get; set; }
+
+        public int RowCount => Cells.GetLength(0);
+        public int ColCount => Cells.GetLength(1);
+    }
+
+
+    public sealed class CellLocalCollectResult
+    {
+        public List<string> Handles { get; } = new();
+
+        public int AcceptedBlocks { get; set; }
+        public int AcceptedPrimitives { get; set; }
+        public int RejectedPartitions { get; set; }
+        public int RejectedTooLargeBlocks { get; set; }
+        public int RejectedNonLocal { get; set; }
+
+        public int TotalAccepted => AcceptedBlocks + AcceptedPrimitives;
+    }
+
+    public static class CellLocalCollector
+    {
+        public static CellLocalCollectResult CollectHandles<T>(
+            IEnumerable<T> roots,
+            Extents3d cellExt,
+            Func<T, Extents3d> getBounds,
+            Func<T, string?> getHandle,
+            Func<T, bool> isPartition,
+            Func<T, bool> isBlockLike,
+            double blockMaxWidthRatio = 0.95,
+            double blockMaxHeightRatio = 0.95,
+            double blockMinOverlapRatio = 0.25,
+            double primitiveMinOverlapRatio = 0.60)
+        {
+            var result = new CellLocalCollectResult();
+            var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+            foreach (var root in roots)
+            {
+                var ext = getBounds(root);
+
+                if (!Intersects2D(cellExt, ext))
+                    continue;
+
+                if (isPartition(root))
+                {
+                    result.RejectedPartitions++;
+                    continue;
+                }
+
+                bool isBlock = isBlockLike(root);
+
+                if (isBlock)
+                {
+                    if (IsBlockTooLargeForLocalCell(ext, cellExt, blockMaxWidthRatio, blockMaxHeightRatio))
+                    {
+                        result.RejectedTooLargeBlocks++;
+                        continue;
+                    }
+
+                    if (!IsLocalToCell(ext, cellExt, blockMinOverlapRatio))
+                    {
+                        result.RejectedNonLocal++;
+                        continue;
+                    }
+
+                    var h = getHandle(root);
+                    if (!string.IsNullOrWhiteSpace(h) && seen.Add(h))
+                        result.Handles.Add(h);
+
+                    result.AcceptedBlocks++;
+                }
+                else
+                {
+                    if (!IsLocalToCell(ext, cellExt, primitiveMinOverlapRatio))
+                    {
+                        result.RejectedNonLocal++;
+                        continue;
+                    }
+
+                    var h = getHandle(root);
+                    if (!string.IsNullOrWhiteSpace(h) && seen.Add(h))
+                        result.Handles.Add(h);
+
+                    result.AcceptedPrimitives++;
+                }
+            }
+
+            return result;
+        }
+
+        private static bool IsBlockTooLargeForLocalCell(
+            Extents3d rootExt,
+            Extents3d cellExt,
+            double maxWidthRatio,
+            double maxHeightRatio)
+        {
+            double rootW = GetWidth(rootExt);
+            double rootH = GetHeight(rootExt);
+            double cellW = GetWidth(cellExt);
+            double cellH = GetHeight(cellExt);
+
+            return rootW > cellW * maxWidthRatio || rootH > cellH * maxHeightRatio;
+        }
+
+        private static bool IsLocalToCell(
+            Extents3d rootExt,
+            Extents3d cellExt,
+            double minOverlapRatio)
+        {
+            var center = GetCenter(rootExt);
+
+            if (!ContainsPoint2D(cellExt, center))
+                return false;
+
+            double overlap = GetOverlapRatio2D(rootExt, cellExt);
+            return overlap >= minOverlapRatio;
+        }
+
+        private static bool ContainsPoint2D(Extents3d ext, Point3d p)
+        {
+            return p.X >= ext.MinPoint.X && p.X <= ext.MaxPoint.X
+                && p.Y >= ext.MinPoint.Y && p.Y <= ext.MaxPoint.Y;
+        }
+
+        private static bool Intersects2D(Extents3d a, Extents3d b)
+        {
+            if (a.MaxPoint.X < b.MinPoint.X || b.MaxPoint.X < a.MinPoint.X)
+                return false;
+
+            if (a.MaxPoint.Y < b.MinPoint.Y || b.MaxPoint.Y < a.MinPoint.Y)
+                return false;
+
+            return true;
+        }
+
+        private static double GetOverlapRatio2D(Extents3d rootExt, Extents3d cellExt)
+        {
+            const double eps = 1e-6;
+
+            double ix = Math.Max(0.0,
+                Math.Min(rootExt.MaxPoint.X, cellExt.MaxPoint.X) -
+                Math.Max(rootExt.MinPoint.X, cellExt.MinPoint.X));
+
+            double iy = Math.Max(0.0,
+                Math.Min(rootExt.MaxPoint.Y, cellExt.MaxPoint.Y) -
+                Math.Max(rootExt.MinPoint.Y, cellExt.MinPoint.Y));
+
+            double interArea = Math.Max(ix, eps) * Math.Max(iy, eps);
+
+            double rootW = Math.Max(GetWidth(rootExt), eps);
+            double rootH = Math.Max(GetHeight(rootExt), eps);
+            double rootArea = rootW * rootH;
+
+            return interArea / rootArea;
+        }
+
+        private static double GetWidth(Extents3d ext)
+        {
+            return ext.MaxPoint.X - ext.MinPoint.X;
+        }
+
+        private static double GetHeight(Extents3d ext)
+        {
+            return ext.MaxPoint.Y - ext.MinPoint.Y;
+        }
+
+        private static Point3d GetCenter(Extents3d ext)
+        {
+            return new Point3d(
+                (ext.MinPoint.X + ext.MaxPoint.X) * 0.5,
+                (ext.MinPoint.Y + ext.MaxPoint.Y) * 0.5,
+                0.0);
+        }
+    }
+
+    internal static class CellDebugPrinter
+    {
+        public static void DumpGridLines(dynamic ed, IReadOnlyList<double> xs, IReadOnlyList<double> ys, int preview = 20)
+        {
+            ed.WriteMessage($"\n[GridLines] XCount={xs.Count} YCount={ys.Count}");
+            ed.WriteMessage($"\n[XLines] {Preview(xs, preview)}");
+            ed.WriteMessage($"\n[YLines] {Preview(ys, preview)}");
+        }
+
+        public static void DumpCellBounds(dynamic ed, int row, int col, Extents3d cell)
+        {
+            double w = cell.MaxPoint.X - cell.MinPoint.X;
+            double h = cell.MaxPoint.Y - cell.MinPoint.Y;
+
+            ed.WriteMessage(
+                $"\n[CellBounds r={row} c={col}] " +
+                $"Min=({cell.MinPoint.X:F2},{cell.MinPoint.Y:F2}) " +
+                $"Max=({cell.MaxPoint.X:F2},{cell.MaxPoint.Y:F2}) " +
+                $"W={w:F2} H={h:F2}");
+        }
+
+        public static void DumpAcceptedSummary(
+            dynamic ed,
+            int row,
+            int col,
+            IReadOnlyList<RootUnitInfo> roots,
+            IReadOnlyCollection<string> acceptedHandles,
+            int previewCount = 40)
+        {
+            var handleSet = new HashSet<string>(
+                acceptedHandles.Where(h => !string.IsNullOrWhiteSpace(h)),
+                StringComparer.OrdinalIgnoreCase);
+
+            var accepted = roots
+                .Where(r => !string.IsNullOrWhiteSpace(r.HandleText) && handleSet.Contains(r.HandleText))
+                .ToList();
+
+            int blockCount = accepted.Count(r => r.IsBlockReference);
+            int primitiveCount = accepted.Count - blockCount;
+
+            ed.WriteMessage(
+                $"\n[AcceptedSummary r={row} c={col}] " +
+                $"Count={accepted.Count} Blocks={blockCount} Primitives={primitiveCount}");
+
+            if (TryUnion(accepted.Select(r => r.Bounds), out var union))
+            {
+                double uw = union.MaxPoint.X - union.MinPoint.X;
+                double uh = union.MaxPoint.Y - union.MinPoint.Y;
+
+                ed.WriteMessage(
+                    $"\n[AcceptedUnion r={row} c={col}] " +
+                    $"Min=({union.MinPoint.X:F2},{union.MinPoint.Y:F2}) " +
+                    $"Max=({union.MaxPoint.X:F2},{union.MaxPoint.Y:F2}) " +
+                    $"W={uw:F2} H={uh:F2}");
+            }
+            else
+            {
+                ed.WriteMessage($"\n[AcceptedUnion r={row} c={col}] <empty>");
+            }
+
+            ed.WriteMessage($"\n--- Accepted Roots (top-left order, first {previewCount}) ---");
+
+            int i = 0;
+            foreach (var r in accepted
+                .OrderByDescending(x => x.Center.Y)
+                .ThenBy(x => x.Center.X)
+                .Take(previewCount))
+            {
+                ed.WriteMessage(
+                    $"\n[{i++}] " +
+                    $"Handle={r.HandleText} " +
+                    $"Type={r.TypeName} " +
+                    $"Role={r.Role} " +
+                    $"Min=({r.Bounds.MinPoint.X:F2},{r.Bounds.MinPoint.Y:F2}) " +
+                    $"Max=({r.Bounds.MaxPoint.X:F2},{r.Bounds.MaxPoint.Y:F2}) " +
+                    $"Center=({r.Center.X:F2},{r.Center.Y:F2}) " +
+                    $"W={r.Width:F2} H={r.Height:F2}");
+            }
+        }
+
+        private static bool TryUnion(IEnumerable<Extents3d> items, out Extents3d union)
+        {
+            union = default;
+            bool hasAny = false;
+
+            foreach (var e in items)
+            {
+                if (!hasAny)
+                {
+                    union = e;
+                    hasAny = true;
+                    continue;
+                }
+
+                union = new Extents3d(
+                    new Point3d(
+                        Math.Min(union.MinPoint.X, e.MinPoint.X),
+                        Math.Min(union.MinPoint.Y, e.MinPoint.Y),
+                        Math.Min(union.MinPoint.Z, e.MinPoint.Z)),
+                    new Point3d(
+                        Math.Max(union.MaxPoint.X, e.MaxPoint.X),
+                        Math.Max(union.MaxPoint.Y, e.MaxPoint.Y),
+                        Math.Max(union.MaxPoint.Z, e.MaxPoint.Z)));
+            }
+
+            return hasAny;
+        }
+
+        private static string Preview(IReadOnlyList<double> values, int max)
+        {
+            if (values == null || values.Count == 0)
+                return "<empty>";
+
+            if (values.Count <= max)
+                return string.Join(", ", values.Select(v => v.ToString("F2")));
+
+            var head = string.Join(", ", values.Take(max).Select(v => v.ToString("F2")));
+            return $"{head}, ... (total {values.Count})";
+        }
+    }
 
 
     public class Commands
@@ -132,8 +461,798 @@ namespace FluxCAD.BricsCAD.Plugin26
         List<Entity> _flattened = new List<Entity>();
         private const string CopySetRegAppName = "FLUXCAD";
         private const string FluxCadRegAppName = "FLUXCAD";
-        private List<double>? _lastRecoveredGridXs;
-        private List<double>? _lastRecoveredGridYs;
+        private static List<double>? _cachedGridXs;
+        private static List<double>? _cachedGridYs;
+
+        [CommandMethod("FLUX_DEBUG_CELL_BOUNDS")]
+        public static void FluxDebugCellBounds()
+        {
+            var doc = Application.DocumentManager.MdiActiveDocument;
+            var db = doc.Database;
+            var ed = doc.Editor;
+
+            // cache 확인
+            if (_cachedGridXs == null || _cachedGridYs == null ||
+                _cachedGridXs.Count < 2 || _cachedGridYs.Count < 2)
+            {
+                ed.WriteMessage("\n[FluxCAD] Cached grid가 없습니다. 먼저 FLUX_DEBUG_GRID_CELLS를 실행하세요.");
+                return;
+            }
+
+            int rows = _cachedGridYs.Count - 1;
+            int cols = _cachedGridXs.Count - 1;
+
+            var rowOpt = new PromptIntegerOptions($"\nrow 입력 (0 ~ {rows - 1})")
+            {
+                AllowNegative = false,
+                AllowZero = true,
+                AllowNone = false,
+                DefaultValue = 1
+            };
+            var rowRes = ed.GetInteger(rowOpt);
+            if (rowRes.Status != PromptStatus.OK) return;
+
+            var colOpt = new PromptIntegerOptions($"\ncol 입력 (0 ~ {cols - 1})")
+            {
+                AllowNegative = false,
+                AllowZero = true,
+                AllowNone = false,
+                DefaultValue = 1
+            };
+            var colRes = ed.GetInteger(colOpt);
+            if (colRes.Status != PromptStatus.OK) return;
+
+            int r = rowRes.Value;
+            int c = colRes.Value;
+
+            if (r < 0 || r >= rows || c < 0 || c >= cols)
+            {
+                ed.WriteMessage("\n[FluxCAD] row/col 범위가 잘못되었습니다.");
+                return;
+            }
+
+            // 현재 row는 위->아래 기준
+            double x1 = _cachedGridXs[c];
+            double x2 = _cachedGridXs[c + 1];
+
+            double yTop = _cachedGridYs[_cachedGridYs.Count - 1 - r];
+            double yBottom = _cachedGridYs[_cachedGridYs.Count - 2 - r];
+
+            var cellBounds = new Extents3d(
+                new Point3d(Math.Min(x1, x2), Math.Min(yBottom, yTop), 0),
+                new Point3d(Math.Max(x1, x2), Math.Max(yBottom, yTop), 0));
+
+            var gridBounds = new Extents3d(
+                new Point3d(_cachedGridXs.First(), _cachedGridYs.First(), 0),
+                new Point3d(_cachedGridXs.Last(), _cachedGridYs.Last(), 0));
+
+            using (var tr = db.TransactionManager.StartTransaction())
+            {
+                var roots = CollectRootUnitsInBounds(db, tr, gridBounds);
+
+                // ---------------------------------------
+                // 1. grid / index / bounds 로그
+                // ---------------------------------------
+                ed.WriteMessage($"\n[FluxCAD] DEBUG CELL BOUNDS r={r} c={c}");
+                ed.WriteMessage($"\n[GridCount] Rows={rows} Cols={cols}");
+                ed.WriteMessage($"\n[XLines] {PreviewDoubles(_cachedGridXs)}");
+                ed.WriteMessage($"\n[YLines] {PreviewDoubles(_cachedGridYs)}");
+
+                ed.WriteMessage(
+                    $"\n[CellIndexMap] x1={x1:F2} x2={x2:F2} yBottom={yBottom:F2} yTop={yTop:F2}");
+
+                ed.WriteMessage(
+                    $"\n[CellBounds] Min=({cellBounds.MinPoint.X:F2},{cellBounds.MinPoint.Y:F2}) " +
+                    $"Max=({cellBounds.MaxPoint.X:F2},{cellBounds.MaxPoint.Y:F2}) " +
+                    $"W={WidthOf(cellBounds):F2} H={HeightOf(cellBounds):F2}");
+
+                ed.WriteMessage(
+                    $"\n[AnalysisBounds] Min=({gridBounds.MinPoint.X:F2},{gridBounds.MinPoint.Y:F2}) " +
+                    $"Max=({gridBounds.MaxPoint.X:F2},{gridBounds.MaxPoint.Y:F2}) " +
+                    $"W={WidthOf(gridBounds):F2} H={HeightOf(gridBounds):F2}");
+
+                // ---------------------------------------
+                // 2. 기존 related / verdict 로그는 유지
+                // ---------------------------------------
+                var related = roots
+                    .Where(rn => Intersects(rn.Bounds, cellBounds) || ContainsPoint(cellBounds, rn.Center))
+                    .OrderBy(rn => rn.Role == RootRole.Partition ? 0 : 1)
+                    .ThenByDescending(rn => rn.Width * rn.Height)
+                    .ToList();
+
+                var primitiveCandidates = new List<RootUnitInfo>();
+
+                foreach (var rn in related)
+                {
+                    bool centerIn = ContainsPoint(cellBounds, rn.Center);
+                    double overlap = IntersectionAreaRatio(cellBounds, rn.Bounds);
+
+                    string verdict;
+                    string why;
+
+                    if (rn.Role == RootRole.Partition)
+                    {
+                        verdict = "REJECT";
+                        why = rn.Reason;
+                    }
+                    else if (rn.Role == RootRole.BlockContent)
+                    {
+                        if (IsTooLargeForCell(rn.Bounds, cellBounds))
+                        {
+                            verdict = "REJECT";
+                            why = "block too large for local cell";
+                        }
+                        else if (centerIn)
+                        {
+                            verdict = "ACCEPT";
+                            why = "block center in cell";
+                        }
+                        else if (overlap >= 0.20)
+                        {
+                            verdict = "ACCEPT";
+                            why = "block overlap >= 0.20";
+                        }
+                        else
+                        {
+                            verdict = "REJECT";
+                            why = "block not local enough";
+                        }
+                    }
+                    else
+                    {
+                        if (centerIn || overlap >= 0.20)
+                        {
+                            verdict = "CANDIDATE";
+                            why = centerIn ? "primitive center in cell" : "primitive overlap >= 0.20";
+                            primitiveCandidates.Add(rn);
+                        }
+                        else
+                        {
+                            verdict = "WEAK";
+                            why = "primitive not local enough";
+                        }
+                    }
+
+                    ed.WriteMessage(
+                        $"\n[CellRoot] Id={HandleText(rn.Id)} Type={rn.TypeName}" +
+                        $" Role={rn.Role} W={rn.Width:F2} H={rn.Height:F2}" +
+                        $" CenterIn={(centerIn ? "Y" : "N")} Overlap={overlap:F2}" +
+                        $" -> {verdict} ({why})");
+                }
+
+                // ---------------------------------------
+                // 3. primitive cluster 로그 유지
+                // ---------------------------------------
+                double cellW = WidthOf(cellBounds);
+                double cellH = HeightOf(cellBounds);
+                double clusterGap = Math.Max(1.0, Math.Min(cellW, cellH) * 0.015);
+
+                var clusters = BuildPrimitiveClusters(primitiveCandidates, clusterGap)
+                    .OrderByDescending(cu => cu.Members.Count)
+                    .ToList();
+
+                ed.WriteMessage($"\n\n[PrimitiveCluster] Gap={clusterGap:F2} Count={clusters.Count}");
+
+                int idx = 1;
+                foreach (var cl in clusters.Take(20))
+                {
+                    double overlap = IntersectionAreaRatio(cellBounds, cl.Bounds);
+                    bool centerIn = ContainsPoint(cellBounds, cl.Center);
+
+                    ed.WriteMessage(
+                        $"\n[Cluster {idx}] Members={cl.Members.Count}" +
+                        $" W={WidthOf(cl.Bounds):F2} H={HeightOf(cl.Bounds):F2}" +
+                        $" CenterIn={(centerIn ? "Y" : "N")} Overlap={overlap:F2}" +
+                        $" Center=({cl.Center.X:F2},{cl.Center.Y:F2})" +
+                        $" Min=({cl.Bounds.MinPoint.X:F2},{cl.Bounds.MinPoint.Y:F2})" +
+                        $" Max=({cl.Bounds.MaxPoint.X:F2},{cl.Bounds.MaxPoint.Y:F2})");
+
+                    idx++;
+                }
+
+                // ---------------------------------------
+                // 4. local handle 수집
+                //    핵심: HandleText 우선 사용
+                // ---------------------------------------
+                var local = CellLocalCollector.CollectHandles(
+                    roots,
+                    cellBounds,
+                    x => x.Bounds,
+                    x => GetRootHandle(x),
+                    x => x.IsPartition,
+                    x => x.IsBlockReference
+                );
+
+                WriteCellLocalCollectSummary(ed, r, c, local);
+
+                if (local.Handles.Count == 0)
+                {
+                    ed.WriteMessage("\n[AcceptedSummary] No local handles found.");
+                    tr.Commit();
+                    return;
+                }
+
+                // ---------------------------------------
+                // 5. accepted handle -> 실제 RootUnitInfo 매핑
+                // ---------------------------------------
+                var handleSet = new HashSet<string>(
+                    local.Handles.Where(h => !string.IsNullOrWhiteSpace(h)),
+                    StringComparer.OrdinalIgnoreCase);
+
+                var acceptedRoots = roots
+                    .Where(x => handleSet.Contains(GetRootHandle(x)))
+                    .OrderByDescending(x => x.Center.Y)
+                    .ThenBy(x => x.Center.X)
+                    .ToList();
+
+                int acceptedBlocks = acceptedRoots.Count(x => x.IsBlockReference);
+                int acceptedPrimitives = acceptedRoots.Count - acceptedBlocks;
+
+                ed.WriteMessage(
+                    $"\n[AcceptedSummary] Count={acceptedRoots.Count} " +
+                    $"Blocks={acceptedBlocks} Primitives={acceptedPrimitives}");
+
+                if (TryUnionBounds(acceptedRoots.Select(x => x.Bounds), out var acceptedUnion))
+                {
+                    ed.WriteMessage(
+                        $"\n[AcceptedUnion] Min=({acceptedUnion.MinPoint.X:F2},{acceptedUnion.MinPoint.Y:F2}) " +
+                        $"Max=({acceptedUnion.MaxPoint.X:F2},{acceptedUnion.MaxPoint.Y:F2}) " +
+                        $"W={WidthOf(acceptedUnion):F2} H={HeightOf(acceptedUnion):F2}");
+                }
+                else
+                {
+                    ed.WriteMessage("\n[AcceptedUnion] <empty>");
+                }
+
+                int showCount = Math.Min(acceptedRoots.Count, 30);
+                ed.WriteMessage($"\n--- Accepted Roots (top-left order, first {showCount}) ---");
+
+                for (int i = 0; i < showCount; i++)
+                {
+                    var a = acceptedRoots[i];
+
+                    ed.WriteMessage(
+                        $"\n[{i}] Handle={GetRootHandle(a)}" +
+                        $" Type={a.TypeName}" +
+                        $" Role={a.Role}" +
+                        $" Center=({a.Center.X:F2},{a.Center.Y:F2})" +
+                        $" Min=({a.Bounds.MinPoint.X:F2},{a.Bounds.MinPoint.Y:F2})" +
+                        $" Max=({a.Bounds.MaxPoint.X:F2},{a.Bounds.MaxPoint.Y:F2})" +
+                        $" W={a.Width:F2} H={a.Height:F2}");
+                }
+
+                tr.Commit();
+            }
+        }
+
+        private static string PreviewDoubles(IReadOnlyList<double> values, int max = 20)
+        {
+            if (values == null || values.Count == 0)
+                return "<empty>";
+
+            if (values.Count <= max)
+                return string.Join(", ", values.Select(x => x.ToString("F2")));
+
+            return string.Join(", ", values.Take(max).Select(x => x.ToString("F2")))
+                   + $" ... (total {values.Count})";
+        }
+
+        private static bool TryUnionBounds(IEnumerable<Extents3d> boundsList, out Extents3d union)
+        {
+            union = default;
+            bool hasAny = false;
+
+            foreach (var b in boundsList)
+            {
+                if (!hasAny)
+                {
+                    union = b;
+                    hasAny = true;
+                    continue;
+                }
+
+                union = new Extents3d(
+                    new Point3d(
+                        Math.Min(union.MinPoint.X, b.MinPoint.X),
+                        Math.Min(union.MinPoint.Y, b.MinPoint.Y),
+                        Math.Min(union.MinPoint.Z, b.MinPoint.Z)),
+                    new Point3d(
+                        Math.Max(union.MaxPoint.X, b.MaxPoint.X),
+                        Math.Max(union.MaxPoint.Y, b.MaxPoint.Y),
+                        Math.Max(union.MaxPoint.Z, b.MaxPoint.Z)));
+            }
+
+            return hasAny;
+        }
+
+        private static string GetRootHandle(RootUnitInfo r)
+        {
+            if (!string.IsNullOrWhiteSpace(r.HandleText))
+                return r.HandleText;
+
+            return r.Id.ToString();
+        }
+
+        [CommandMethod("FLUX_DEBUG_CELL_ROOT_RC_NEW")]
+        public static void FluxDebugCellRootRc()
+        {
+            var doc = Application.DocumentManager.MdiActiveDocument;
+            var db = doc.Database;
+            var ed = doc.Editor;
+
+            // 예시: 이미 FLUX_DEBUG_GRID_CELLS에서 채운 cache를 사용
+            if (_cachedGridXs == null || _cachedGridYs == null ||
+                _cachedGridXs.Count < 2 || _cachedGridYs.Count < 2)
+            {
+                ed.WriteMessage("\n[FluxCAD] Cached grid가 없습니다. 먼저 FLUX_DEBUG_GRID_CELLS를 실행하세요.");
+                return;
+            }
+
+            int rows = _cachedGridYs.Count - 1;
+            int cols = _cachedGridXs.Count - 1;
+
+            var rowOpt = new PromptIntegerOptions($"\nrow 입력 (0 ~ {rows - 1})")
+            {
+                AllowNegative = false,
+                AllowZero = true,
+                AllowNone = false,
+                DefaultValue = 1
+            };
+            var rowRes = ed.GetInteger(rowOpt);
+            if (rowRes.Status != PromptStatus.OK) return;
+
+            var colOpt = new PromptIntegerOptions($"\ncol 입력 (0 ~ {cols - 1})")
+            {
+                AllowNegative = false,
+                AllowZero = true,
+                AllowNone = false,
+                DefaultValue = 1
+            };
+            var colRes = ed.GetInteger(colOpt);
+            if (colRes.Status != PromptStatus.OK) return;
+
+            int r = rowRes.Value;
+            int c = colRes.Value;
+
+            if (r < 0 || r >= rows || c < 0 || c >= cols)
+            {
+                ed.WriteMessage("\n[FluxCAD] row/col 범위가 잘못되었습니다.");
+                return;
+            }
+
+            // 위에서 아래로 읽는 row 기준이면 Y는 뒤집어서 계산
+            double x1 = _cachedGridXs[c];
+            double x2 = _cachedGridXs[c + 1];
+
+            double yTop = _cachedGridYs[_cachedGridYs.Count - 1 - r];
+            double yBottom = _cachedGridYs[_cachedGridYs.Count - 2 - r];
+
+            var cellBounds = new Extents3d(
+                new Point3d(Math.Min(x1, x2), Math.Min(yBottom, yTop), 0),
+                new Point3d(Math.Max(x1, x2), Math.Max(yBottom, yTop), 0));
+
+            var gridBounds = new Extents3d(
+                new Point3d(_cachedGridXs.First(), _cachedGridYs.First(), 0),
+                new Point3d(_cachedGridXs.Last(), _cachedGridYs.Last(), 0));
+
+            using (var tr = db.TransactionManager.StartTransaction())
+            {
+                var roots = CollectRootUnitsInBounds(db, tr, gridBounds);
+
+                ed.WriteMessage($"\n[FluxCAD] Cell Root Candidates r{r} c{c}");
+                ed.WriteMessage($"\nCell Min=({cellBounds.MinPoint.X:F2},{cellBounds.MinPoint.Y:F2}) Max=({cellBounds.MaxPoint.X:F2},{cellBounds.MaxPoint.Y:F2})");
+                ed.WriteMessage($"\nAnalysisBounds Min=({gridBounds.MinPoint.X:F2},{gridBounds.MinPoint.Y:F2}) Max=({gridBounds.MaxPoint.X:F2},{gridBounds.MaxPoint.Y:F2})");
+
+                var related = roots
+                    .Where(rn => Intersects(rn.Bounds, cellBounds) || ContainsPoint(cellBounds, rn.Center))
+                    .OrderBy(rn => rn.Role == RootRole.Partition ? 0 : 1)
+                    .ThenByDescending(rn => rn.Width * rn.Height)
+                    .ToList();
+
+                var primitiveCandidates = new List<RootUnitInfo>();
+
+                foreach (var rn in related)
+                {
+                    bool centerIn = ContainsPoint(cellBounds, rn.Center);
+                    double overlap = IntersectionAreaRatio(cellBounds, rn.Bounds);
+
+                    string verdict;
+                    string why;
+
+                    if (rn.Role == RootRole.Partition)
+                    {
+                        verdict = "REJECT";
+                        why = rn.Reason;
+                    }
+                    else if (rn.Role == RootRole.BlockContent)
+                    {
+                        if (IsTooLargeForCell(rn.Bounds, cellBounds))
+                        {
+                            verdict = "REJECT";
+                            why = "block too large for local cell";
+                        }
+                        else if (centerIn)
+                        {
+                            verdict = "ACCEPT";
+                            why = "block center in cell";
+                        }
+                        else if (overlap >= 0.20)
+                        {
+                            verdict = "ACCEPT";
+                            why = "block overlap >= 0.20";
+                        }
+                        else
+                        {
+                            verdict = "REJECT";
+                            why = "block not local enough";
+                        }
+                    }
+                    else
+                    {
+                        if (centerIn || overlap >= 0.20)
+                        {
+                            verdict = "CANDIDATE";
+                            why = centerIn ? "primitive center in cell" : "primitive overlap >= 0.20";
+                            primitiveCandidates.Add(rn);
+                        }
+                        else
+                        {
+                            verdict = "WEAK";
+                            why = "primitive not local enough";
+                        }
+                    }
+
+                    ed.WriteMessage(
+                        $"\n[CellRoot] Id={HandleText(rn.Id)} Type={rn.TypeName}" +
+                        $" Role={rn.Role} W={rn.Width:F2} H={rn.Height:F2}" +
+                        $" CenterIn={(centerIn ? "Y" : "N")} Overlap={overlap:F2}" +
+                        $" -> {verdict} ({why})");
+                }
+
+                double cellW = WidthOf(cellBounds);
+                double cellH = HeightOf(cellBounds);
+                double clusterGap = Math.Max(1.0, Math.Min(cellW, cellH) * 0.015); // 추측값
+
+                var clusters = BuildPrimitiveClusters(primitiveCandidates, clusterGap)
+                    .OrderByDescending(cu => cu.Members.Count)
+                    .ToList();
+
+                ed.WriteMessage($"\n\n[PrimitiveCluster] Gap={clusterGap:F2} Count={clusters.Count}");
+
+                int idx = 1;
+                foreach (var cl in clusters.Take(20))
+                {
+                    double overlap = IntersectionAreaRatio(cellBounds, cl.Bounds);
+                    bool centerIn = ContainsPoint(cellBounds, cl.Center);
+
+                    ed.WriteMessage(
+                        $"\n[Cluster {idx}] Members={cl.Members.Count}" +
+                        $" W={WidthOf(cl.Bounds):F2} H={HeightOf(cl.Bounds):F2}" +
+                        $" CenterIn={(centerIn ? "Y" : "N")} Overlap={overlap:F2}" +
+                        $" Min=({cl.Bounds.MinPoint.X:F2},{cl.Bounds.MinPoint.Y:F2})" +
+                        $" Max=({cl.Bounds.MaxPoint.X:F2},{cl.Bounds.MaxPoint.Y:F2})");
+
+                    idx++;
+                }
+
+
+                //var cell = grid.Cells[row, col];
+                //var cellExt = GetGridCellBounds(cell);
+
+                // -----------------------------
+                // 2. 현재 RootUnitInfo 구조에 맞춘 람다 연결
+                // -----------------------------
+                var local = CellLocalCollector.CollectHandles(
+                    roots,
+                    cellBounds,
+                    r => r.Bounds,                 // RootUnitInfo의 bounds
+                    r => r.Id.ToString(),                 // RootUnitInfo의 handle 문자열
+                    r => r.IsPartition,            // partition 판정
+                    r => r.IsBlockReference             // block 여부
+                );
+
+                WriteCellLocalCollectSummary(ed, r, 1, local);
+
+                if (local.Handles.Count == 0)
+                {
+                    ed.WriteMessage("\nNo local handles found.");
+                    tr.Commit();
+                    return;
+                }
+
+                int showCount = Math.Min(local.Handles.Count, 20);
+                ed.WriteMessage($"\n--- Local Handles (first {showCount}) ---");
+
+                for (int i = 0; i < showCount; i++)
+                {
+                    ed.WriteMessage($"\n[{i}] {local.Handles[i]}");
+                }
+
+                tr.Commit();
+            }
+        }
+
+        private static void WriteCellLocalCollectSummary(Editor ed, int row, int col, CellLocalCollectResult r)
+        {
+            ed.WriteMessage(
+                $"\n[CellLocalExport r={row} c={col}] " +
+                $"Handles={r.Handles.Count} " +
+                $"Accepted={r.TotalAccepted} " +
+                $"Blocks={r.AcceptedBlocks} " +
+                $"Primitives={r.AcceptedPrimitives} " +
+                $"RejectedPartitions={r.RejectedPartitions} " +
+                $"RejectedTooLargeBlocks={r.RejectedTooLargeBlocks} " +
+                $"RejectedNonLocal={r.RejectedNonLocal}");
+        }
+
+        public static bool IsPartitionNode(SpatialNode node)
+        {
+            if (string.Equals(node.EntityType, "Line", StringComparison.OrdinalIgnoreCase))
+            {
+                double w = node.Bounds.MaxPoint.X - node.Bounds.MinPoint.X;
+                double h = node.Bounds.MaxPoint.Y - node.Bounds.MinPoint.Y;
+
+                // 예시: 셀 경계선/표선으로 보이는 긴 수평/수직선
+                if (w > 1000 || h > 1000)
+                    return true;
+            }
+
+            return false;
+        }
+        public static void ExportCellLocalContent(
+    Database sourceDb,
+    Transaction tr,
+    IEnumerable<SpatialNode> rootNodes,
+    Extents3d cellExt,
+    string filePath)
+        {
+            var local = CellLocalExportCollector.CollectCellLocalExportNodes(rootNodes, cellExt);
+
+            if (local.ExportIds.Count == 0)
+                return;
+
+            using (Database newDb = new Database(true, true))
+            {
+                using (Transaction trNew = newDb.TransactionManager.StartTransaction())
+                {
+                    ObjectId newMsId = SymbolUtilityServices.GetBlockModelSpaceId(newDb);
+
+                    IdMapping map = new IdMapping();
+
+                    sourceDb.WblockCloneObjects(
+                        local.ExportIds,
+                        newMsId,
+                        map,
+                        DuplicateRecordCloning.Ignore,
+                        false);
+
+                    trNew.Commit();
+                }
+
+                newDb.SaveAs(filePath, DwgVersion.Current);
+            }
+        }
+
+        [CommandMethod("FLUX_DEBUG_CELL_ROOT_RC")]
+        public static void FluxDebugCellRootRcNew()
+        {
+            var doc = Application.DocumentManager.MdiActiveDocument;
+            var db = doc.Database;
+            var ed = doc.Editor;
+
+            // 예시: 이미 FLUX_DEBUG_GRID_CELLS에서 채운 cache를 사용
+            if (_cachedGridXs == null || _cachedGridYs == null ||
+                _cachedGridXs.Count < 2 || _cachedGridYs.Count < 2)
+            {
+                ed.WriteMessage("\n[FluxCAD] Cached grid가 없습니다. 먼저 FLUX_DEBUG_GRID_CELLS를 실행하세요.");
+                return;
+            }
+
+            int rows = _cachedGridYs.Count - 1;
+            int cols = _cachedGridXs.Count - 1;
+
+            var rowOpt = new PromptIntegerOptions($"\nrow 입력 (0 ~ {rows - 1})")
+            {
+                AllowNegative = false,
+                AllowZero = true,
+                AllowNone = false,
+                DefaultValue = 1
+            };
+            var rowRes = ed.GetInteger(rowOpt);
+            if (rowRes.Status != PromptStatus.OK) return;
+
+            var colOpt = new PromptIntegerOptions($"\ncol 입력 (0 ~ {cols - 1})")
+            {
+                AllowNegative = false,
+                AllowZero = true,
+                AllowNone = false,
+                DefaultValue = 1
+            };
+            var colRes = ed.GetInteger(colOpt);
+            if (colRes.Status != PromptStatus.OK) return;
+
+            int r = rowRes.Value;
+            int c = colRes.Value;
+
+            if (r < 0 || r >= rows || c < 0 || c >= cols)
+            {
+                ed.WriteMessage("\n[FluxCAD] row/col 범위가 잘못되었습니다.");
+                return;
+            }
+
+            // 위에서 아래로 읽는 row 기준이면 Y는 뒤집어서 계산
+            double x1 = _cachedGridXs[c];
+            double x2 = _cachedGridXs[c + 1];
+
+            double yTop = _cachedGridYs[_cachedGridYs.Count - 1 - r];
+            double yBottom = _cachedGridYs[_cachedGridYs.Count - 2 - r];
+
+            var cellBounds = new Extents3d(
+                new Point3d(Math.Min(x1, x2), Math.Min(yBottom, yTop), 0),
+                new Point3d(Math.Max(x1, x2), Math.Max(yBottom, yTop), 0));
+
+            var gridBounds = new Extents3d(
+                new Point3d(_cachedGridXs.First(), _cachedGridYs.First(), 0),
+                new Point3d(_cachedGridXs.Last(), _cachedGridYs.Last(), 0));
+
+            using (var tr = db.TransactionManager.StartTransaction())
+            {
+                var roots = CollectRootUnitsInBounds(db, tr, gridBounds);
+
+                ed.WriteMessage($"\n[FluxCAD] Cell Root Candidates r{r} c{c}");
+                ed.WriteMessage($"\nCell Min=({cellBounds.MinPoint.X:F2},{cellBounds.MinPoint.Y:F2}) Max=({cellBounds.MaxPoint.X:F2},{cellBounds.MaxPoint.Y:F2})");
+                ed.WriteMessage($"\nAnalysisBounds Min=({gridBounds.MinPoint.X:F2},{gridBounds.MinPoint.Y:F2}) Max=({gridBounds.MaxPoint.X:F2},{gridBounds.MaxPoint.Y:F2})");
+
+                var related = roots
+                    .Where(rn => Intersects(rn.Bounds, cellBounds) || ContainsPoint(cellBounds, rn.Center))
+                    .OrderBy(rn => rn.Role == RootRole.Partition ? 0 : 1)
+                    .ThenByDescending(rn => rn.Width * rn.Height)
+                    .ToList();
+
+                var primitiveCandidates = new List<RootUnitInfo>();
+
+                foreach (var rn in related)
+                {
+                    bool centerIn = ContainsPoint(cellBounds, rn.Center);
+                    double overlap = IntersectionAreaRatio(cellBounds, rn.Bounds);
+
+                    string verdict;
+                    string why;
+
+                    if (rn.Role == RootRole.Partition)
+                    {
+                        verdict = "REJECT";
+                        why = rn.Reason;
+                    }
+                    else if (rn.Role == RootRole.BlockContent)
+                    {
+                        if (IsTooLargeForCell(rn.Bounds, cellBounds))
+                        {
+                            verdict = "REJECT";
+                            why = "block too large for local cell";
+                        }
+                        else if (centerIn)
+                        {
+                            verdict = "ACCEPT";
+                            why = "block center in cell";
+                        }
+                        else if (overlap >= 0.20)
+                        {
+                            verdict = "ACCEPT";
+                            why = "block overlap >= 0.20";
+                        }
+                        else
+                        {
+                            verdict = "REJECT";
+                            why = "block not local enough";
+                        }
+                    }
+                    else
+                    {
+                        if (centerIn || overlap >= 0.20)
+                        {
+                            verdict = "CANDIDATE";
+                            why = centerIn ? "primitive center in cell" : "primitive overlap >= 0.20";
+                            primitiveCandidates.Add(rn);
+                        }
+                        else
+                        {
+                            verdict = "WEAK";
+                            why = "primitive not local enough";
+                        }
+                    }
+
+                    ed.WriteMessage(
+                        $"\n[CellRoot] Id={HandleText(rn.Id)} Type={rn.TypeName}" +
+                        $" Role={rn.Role} W={rn.Width:F2} H={rn.Height:F2}" +
+                        $" CenterIn={(centerIn ? "Y" : "N")} Overlap={overlap:F2}" +
+                        $" -> {verdict} ({why})");
+                }
+
+                double cellW = WidthOf(cellBounds);
+                double cellH = HeightOf(cellBounds);
+                double clusterGap = Math.Max(1.0, Math.Min(cellW, cellH) * 0.015); // 추측값
+
+                var clusters = BuildPrimitiveClusters(primitiveCandidates, clusterGap)
+                    .OrderByDescending(cu => cu.Members.Count)
+                    .ToList();
+
+                ed.WriteMessage($"\n\n[PrimitiveCluster] Gap={clusterGap:F2} Count={clusters.Count}");
+
+                int idx = 1;
+                foreach (var cl in clusters.Take(20))
+                {
+                    double overlap = IntersectionAreaRatio(cellBounds, cl.Bounds);
+                    bool centerIn = ContainsPoint(cellBounds, cl.Center);
+
+                    ed.WriteMessage(
+                        $"\n[Cluster {idx}] Members={cl.Members.Count}" +
+                        $" W={WidthOf(cl.Bounds):F2} H={HeightOf(cl.Bounds):F2}" +
+                        $" CenterIn={(centerIn ? "Y" : "N")} Overlap={overlap:F2}" +
+                        $" Min=({cl.Bounds.MinPoint.X:F2},{cl.Bounds.MinPoint.Y:F2})" +
+                        $" Max=({cl.Bounds.MaxPoint.X:F2},{cl.Bounds.MaxPoint.Y:F2})");
+
+                    idx++;
+                }
+
+                tr.Commit();
+            }
+        }
+
+        public static CellLocalExportResult CollectCellLocalExportIdsByRowCol(
+    GridAnalysisResult grid,
+    IEnumerable<SpatialNode> rootNodes,
+    int row,
+    int col)
+        {
+            var cell = grid.Cells[row, col];
+            var cellExt = GetGridCellBounds(cell);
+            var result = CellLocalExportCollector.CollectCellLocalExportNodes(rootNodes, cellExt);
+            return result;
+        }
+
+        public static void WriteCellLocalExportSummary(Editor ed, int row, int col, CellLocalExportResult r)
+        {
+            ed.WriteMessage(
+                $"\n[CellLocalExport r={row} c={col}] " +
+                $"Accepted={r.TotalAcceptedCount} " +
+                $"Blocks={r.AcceptedBlocks.Count} " +
+                $"Primitives={r.AcceptedPrimitives.Count} " +
+                $"RejectedPartitions={r.RejectedPartitions.Count} " +
+                $"RejectedTooLargeBlocks={r.RejectedTooLargeBlocks.Count} " +
+                $"RejectedNonLocal={r.RejectedNonLocal.Count}");
+        }
+
+        private static Extents3d GetGridCellBounds(object cell)
+        {
+            if (cell == null)
+                throw new ArgumentNullException(nameof(cell));
+
+            var type = cell.GetType();
+
+            string[] candidateNames =
+            {
+        "WorldBounds",
+        "Bounds",
+        "CellBounds",
+        "Extents",
+        "Extents3d"
+    };
+
+            foreach (var name in candidateNames)
+            {
+                var prop = type.GetProperty(name, BindingFlags.Public | BindingFlags.Instance);
+                if (prop != null && prop.PropertyType == typeof(Extents3d))
+                {
+                    var value = prop.GetValue(cell);
+                    if (value != null)
+                        return (Extents3d)value;
+                }
+            }
+
+            throw new InvalidOperationException(
+                $"GridCell bounds property not found. Type={type.FullName}");
+        }
 
 
         [CommandMethod("FLUX_DEBUG_CELL_ROOT_CANDIDATES")]
@@ -176,10 +1295,27 @@ namespace FluxCAD.BricsCAD.Plugin26
                     }
                     else if (r.Role == RootRole.BlockContent)
                     {
-                        verdict = (centerIn || overlap >= 0.20) ? "ACCEPT" : "CANDIDATE";
-                        why = centerIn ? "block center in cell" :
-                              overlap >= 0.20 ? "block overlap >= 0.20" :
-                              "block intersects cell border";
+                        if (IsTooLargeForCell(r.Bounds, cellBounds))
+                        {
+                            verdict = "REJECT";
+                            why = "block too large for local cell";
+                        }
+                        else if (centerIn)
+                        {
+                            verdict = "ACCEPT";
+                            why = "block center in cell";
+                        }
+                        else if (overlap >= 0.20)
+                        {
+                            verdict = "ACCEPT";
+                            why = "block overlap >= 0.20";
+                        }
+                        else
+                        {
+                            verdict = "REJECT";
+                            why = "block not local enough";
+                        }
+                        
                     }
                     else
                     {
@@ -301,26 +1437,30 @@ namespace FluxCAD.BricsCAD.Plugin26
             var db = doc.Database;
             var ed = doc.Editor;
 
+            if (_cachedGridXs == null || _cachedGridYs == null ||
+                _cachedGridXs.Count < 2 || _cachedGridYs.Count < 2)
+            {
+                ed.WriteMessage("\n[FluxCAD] Cached grid가 없습니다. 먼저 FLUX_DEBUG_GRID_CELLS를 실행하세요.");
+                return;
+            }
+
+            var gridBounds = new Extents3d(
+                new Point3d(_cachedGridXs.First(), _cachedGridYs.First(), 0),
+                new Point3d(_cachedGridXs.Last(), _cachedGridYs.Last(), 0));
+
             using (var tr = db.TransactionManager.StartTransaction())
             {
-                var worldBounds = GetModelSpaceBounds(db, tr);
-                var roots = CollectRootUnits(db, tr, worldBounds);
+                var roots = CollectRootUnitsInBounds(db, tr, gridBounds);
 
-                ed.WriteMessage("\n[FluxCAD] Root Summary");
-                ed.WriteMessage($"\nWorldBounds Min=({worldBounds.MinPoint.X:F2},{worldBounds.MinPoint.Y:F2}) Max=({worldBounds.MaxPoint.X:F2},{worldBounds.MaxPoint.Y:F2})");
+                ed.WriteMessage("\n[FluxCAD] Root Summary (Grid/Copy Bounds Only)");
+                ed.WriteMessage($"\nBounds Min=({gridBounds.MinPoint.X:F2},{gridBounds.MinPoint.Y:F2}) Max=({gridBounds.MaxPoint.X:F2},{gridBounds.MaxPoint.Y:F2})");
 
                 ed.WriteMessage($"\nTotal={roots.Count}");
                 ed.WriteMessage($"\nPartition={roots.Count(x => x.Role == RootRole.Partition)}");
                 ed.WriteMessage($"\nBlockContent={roots.Count(x => x.Role == RootRole.BlockContent)}");
                 ed.WriteMessage($"\nPrimitiveContent={roots.Count(x => x.Role == RootRole.PrimitiveContent)}");
 
-                ed.WriteMessage("\n\n[Type Histogram]");
-                foreach (var g in roots.GroupBy(x => x.TypeName).OrderByDescending(g => g.Count()).Take(20))
-                {
-                    ed.WriteMessage($"\n{g.Key} = {g.Count()}");
-                }
-
-                double thinTol = ThinTol(worldBounds);
+                double thinTol = ThinTol(gridBounds);
 
                 ed.WriteMessage("\n\n[Long Horizontal Candidates]");
                 foreach (var r in roots
@@ -342,6 +1482,65 @@ namespace FluxCAD.BricsCAD.Plugin26
 
                 tr.Commit();
             }
+        }
+
+        private static List<RootUnitInfo> CollectRootUnitsInBounds(
+    Database db,
+    Transaction tr,
+    Extents3d analysisBounds)
+        {
+            var result = new List<RootUnitInfo>();
+
+            var ms = (BlockTableRecord)tr.GetObject(
+                SymbolUtilityServices.GetBlockModelSpaceId(db),
+                OpenMode.ForRead);
+
+            foreach (ObjectId id in ms)
+            {
+                if (!(tr.GetObject(id, OpenMode.ForRead) is Entity ent))
+                    continue;
+
+                if (!TryGetEntityExtents(ent, out var ext))
+                    continue;
+
+                // 분석 대상 영역 바깥은 제외
+                if (!Intersects(ext, analysisBounds) && !ContainsPoint(analysisBounds, CenterOf(ext)))
+                    continue;
+
+                string reason;
+                var role = ClassifyRootRole(ent, ext, analysisBounds, out reason);
+
+                string? blockName = null;
+                if (ent is BlockReference br)
+                    blockName = br.Name;
+
+                result.Add(new RootUnitInfo
+                {
+                    Id = id,
+                    HandleText = ent.Handle.ToString(),
+                    TypeName = ent.GetType().Name,
+                    BlockName = blockName,
+                    Bounds = ext,
+                    Center = CenterOf(ext),
+                    Width = WidthOf(ext),
+                    Height = HeightOf(ext),
+                    Role = role,
+                    Reason = reason
+                });
+            }
+
+            return result;
+        }
+
+        private static bool IsTooLargeForCell(Extents3d obj, Extents3d cell)
+        {
+            double ow = WidthOf(obj);
+            double oh = HeightOf(obj);
+            double cw = WidthOf(cell);
+            double ch = HeightOf(cell);
+
+            // 셀보다 너무 큰 block은 로컬 셀 내용일 가능성이 낮다
+            return ow > cw * 2.5 || oh > ch * 2.5;
         }
 
         private static bool TryGetEntityExtents(Entity ent, out Extents3d ext)
@@ -2678,19 +3877,19 @@ namespace FluxCAD.BricsCAD.Plugin26
         // 임시 stub
         private List<double> GetRecoveredGridXs()
         {
-            if (_lastRecoveredGridXs == null || _lastRecoveredGridXs.Count < 2)
+            if (_cachedGridXs == null || _cachedGridXs.Count < 2)
                 throw new InvalidOperationException("먼저 격자 복원 명령을 실행해서 X 경계값을 준비해야 합니다.");
 
-            return _lastRecoveredGridXs;
+            return _cachedGridXs;
         }
 
         // 임시 stub
         private List<double> GetRecoveredGridYs()
         {
-            if (_lastRecoveredGridYs == null || _lastRecoveredGridYs.Count < 2)
+            if (_cachedGridYs == null || _cachedGridYs.Count < 2)
                 throw new InvalidOperationException("먼저 격자 복원 명령을 실행해서 Y 경계값을 준비해야 합니다.");
 
-            return _lastRecoveredGridYs;
+            return _cachedGridYs;
         }
 
 
@@ -2828,18 +4027,18 @@ namespace FluxCAD.BricsCAD.Plugin26
                     return cells;
                 }
 
-                _lastRecoveredGridXs = majorV
+                _cachedGridXs = majorV
                     .Select(x => x.Coord)
                     .OrderBy(x => x)
                     .ToList();
 
-                _lastRecoveredGridYs = majorH
+                _cachedGridYs = majorH
                     .Select(y => y.Coord)
                     .OrderBy(y => y)
                     .ToList();
 
-                ed.WriteMessage($"\n[FluxCAD] Cached grid boundaries: X={_lastRecoveredGridXs.Count}, Y={_lastRecoveredGridYs.Count}");
-                ed.WriteMessage($"\n[FluxCAD] Cached grid size: rows={_lastRecoveredGridYs.Count - 1}, cols={_lastRecoveredGridXs.Count - 1}");
+                ed.WriteMessage($"\n[FluxCAD] Cached grid boundaries: X={_cachedGridXs.Count}, Y={_cachedGridYs.Count}");
+                ed.WriteMessage($"\n[FluxCAD] Cached grid size: rows={_cachedGridYs.Count - 1}, cols={_cachedGridXs.Count - 1}");
 
                 int rowCount = majorH.Count - 1;
                 int colCount = majorV.Count - 1;
