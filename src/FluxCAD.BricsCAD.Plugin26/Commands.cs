@@ -677,33 +677,14 @@ namespace FluxCAD.BricsCAD.Plugin26
 
                 ObjectId btrId = br.BlockTableRecord;
 
-                // 순환 block 참조 차단
                 if (activeBlockStack.Contains(btrId))
-                {
-                    //ed?.WriteMessage($"\n[FluxCAD] Block recursion cut: {sourcePath} / BTR={btrId}");
                     return;
-                }
-
-                if (TryGetTransformedExtents(ent, currentTransform, out var brExt) &&
-                    Intersects(cellBounds, brExt))
-                {
-                    output.Add(new FlattenedCellEntity
-                    {
-                        SourceId = ent.ObjectId,
-                        SourcePath = sourcePath,
-                        EntityType = nameof(BlockReference),
-                        WorldExtents = brExt,
-                        LocalExtents = brExt,
-                        Geometry = null
-                    });
-                }
 
                 activeBlockStack.Add(btrId);
 
                 try
                 {
                     var btr = (BlockTableRecord)tr.GetObject(btrId, OpenMode.ForRead);
-
                     var nextTransform = currentTransform * br.BlockTransform;
 
                     foreach (ObjectId childId in btr)
