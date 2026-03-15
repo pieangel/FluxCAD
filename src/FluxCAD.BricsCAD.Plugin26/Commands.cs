@@ -103,6 +103,7 @@ namespace FluxCAD.BricsCAD.Plugin26
         private List<double>? _lastRecoveredGridXs;
         private List<double>? _lastRecoveredGridYs;
 
+
         [CommandMethod("FLUX_EXPORT_CELL_SCENE_ONE_LOCAL")]
         public void ExportCellSceneOneLocal()
         {
@@ -1439,7 +1440,7 @@ namespace FluxCAD.BricsCAD.Plugin26
                             if (pl.NumberOfVertices > 0)
                             {
                                 // 폴리라인은 extents center 가 더 안전한 경우가 많음
-                                if (TryGetEntityExtents(pl, out var ex))
+                                if (TryGetEntityExtents_old(pl, out var ex))
                                 {
                                     pt = GetCenter(ex);
                                     return true;
@@ -1457,7 +1458,7 @@ namespace FluxCAD.BricsCAD.Plugin26
 
                     default:
                         {
-                            if (TryGetEntityExtents(ent, out var ex))
+                            if (TryGetEntityExtents_old(ent, out var ex))
                             {
                                 pt = GetCenter(ex);
                                 return true;
@@ -1471,7 +1472,7 @@ namespace FluxCAD.BricsCAD.Plugin26
                 // fallback: extents center
                 try
                 {
-                    if (TryGetEntityExtents(ent, out var ex))
+                    if (TryGetEntityExtents_old(ent, out var ex))
                     {
                         pt = GetCenter(ex);
                         return true;
@@ -1490,7 +1491,7 @@ namespace FluxCAD.BricsCAD.Plugin26
         /// <summary>
         /// GeometricExtents 는 예외가 자주 날 수 있으므로 안전 래핑
         /// </summary>
-        private bool TryGetEntityExtents(Entity ent, out Extents3d ext)
+        private bool TryGetEntityExtents_old(Entity ent, out Extents3d ext)
         {
             ext = default;
 
@@ -3182,8 +3183,10 @@ namespace FluxCAD.BricsCAD.Plugin26
             return false;
         }
 
-        private static bool HasFluxCadCopyTag(Entity ent)
+        private static bool TryGetFluxCadCopySetId(Entity ent, out string copySetId)
         {
+            copySetId = null;
+
             if (ent == null)
                 return false;
 
@@ -3191,17 +3194,36 @@ namespace FluxCAD.BricsCAD.Plugin26
             if (rb == null)
                 return false;
 
+            bool matchedApp = false;
+
             foreach (TypedValue tv in rb)
             {
                 if (tv.TypeCode == (int)DxfCode.ExtendedDataRegAppName)
                 {
                     var app = tv.Value as string;
-                    if (string.Equals(app, CopySetRegAppName, StringComparison.OrdinalIgnoreCase))
-                        return true;
+                    matchedApp = string.Equals(app, CopySetRegAppName, StringComparison.OrdinalIgnoreCase);
+                }
+                else if (matchedApp && tv.TypeCode == (int)DxfCode.ExtendedDataAsciiString)
+                {
+                    copySetId = tv.Value as string;
+                    return !string.IsNullOrWhiteSpace(copySetId);
                 }
             }
 
             return false;
+        }
+
+        private static bool HasFluxCadCopyTag(Entity ent)
+        {
+            return TryGetFluxCadCopySetId(ent, out _);
+        }
+
+        private static bool HasFluxCadCopyTag(Entity ent, string expectedCopySetId)
+        {
+            if (!TryGetFluxCadCopySetId(ent, out var actualCopySetId))
+                return false;
+
+            return string.Equals(actualCopySetId, expectedCopySetId, StringComparison.OrdinalIgnoreCase);
         }
 
         [CommandMethod("FLUX_DUMP_PICKED_META")]
@@ -5249,7 +5271,7 @@ namespace FluxCAD.BricsCAD.Plugin26
                 if (br == null)
                     continue;
 
-                if (!TryGetEntityExtents(br, out var bounds))
+                if (!TryGetEntityExtents_old(br, out var bounds))
                     continue;
 
                 double width = bounds.MaxPoint.X - bounds.MinPoint.X;
@@ -5505,7 +5527,7 @@ namespace FluxCAD.BricsCAD.Plugin26
             return CandidateGrade.None;
         }
 
-        private bool TryGetEntityExtents_old(Entity ent, out Extents3d ext)
+        private bool TryGetEntityExtents_old2(Entity ent, out Extents3d ext)
         {
             ext = default;
             try
