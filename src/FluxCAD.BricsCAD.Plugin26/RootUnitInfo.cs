@@ -8,7 +8,7 @@ using Teigha.Geometry;
 
 namespace FluxCAD.BricsCAD.Plugin26
 {
-    public sealed class RootUnitInfo
+    public sealed class RootUnitInfo_old
     {
         public ObjectId Id { get; set; }
         public RootUnitKind Kind { get; set; }

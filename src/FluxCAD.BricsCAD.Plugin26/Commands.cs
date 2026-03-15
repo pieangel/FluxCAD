@@ -94,7 +94,39 @@ namespace FluxCAD.BricsCAD.Plugin26
         public int Accepted;
     }
 
-    
+    public enum RootRole
+    {
+        Partition,
+        BlockContent,
+        PrimitiveContent
+    }
+
+    internal sealed class RootUnitInfo
+    {
+        public ObjectId Id { get; set; }
+        public string TypeName { get; set; } = "";
+        public string? BlockName { get; set; }
+        public Extents3d Bounds { get; set; }
+        public Point3d Center { get; set; }
+        public double Width { get; set; }
+        public double Height { get; set; }
+        public RootRole Role { get; set; }
+        public string Reason { get; set; } = "";
+    }
+
+    internal sealed class PrimitiveCluster
+    {
+        public List<RootUnitInfo> Members { get; } = new();
+        public Extents3d Bounds { get; set; }
+        public Point3d Center =>
+            new Point3d(
+                (Bounds.MinPoint.X + Bounds.MaxPoint.X) * 0.5,
+                (Bounds.MinPoint.Y + Bounds.MaxPoint.Y) * 0.5,
+                0);
+    }
+
+
+
     public class Commands
     {
         List<Entity> _flattened = new List<Entity>();
@@ -102,6 +134,553 @@ namespace FluxCAD.BricsCAD.Plugin26
         private const string FluxCadRegAppName = "FLUXCAD";
         private List<double>? _lastRecoveredGridXs;
         private List<double>? _lastRecoveredGridYs;
+
+
+        [CommandMethod("FLUX_DEBUG_CELL_ROOT_CANDIDATES")]
+        public static void FluxDebugCellRootCandidates()
+        {
+            var doc = Application.DocumentManager.MdiActiveDocument;
+            var db = doc.Database;
+            var ed = doc.Editor;
+
+            using (var tr = db.TransactionManager.StartTransaction())
+            {
+                var worldBounds = GetModelSpaceBounds(db, tr);
+                var cellBounds = PromptWindow(ed, "셀 영역 첫 점 선택", "셀 영역 반대 점 선택");
+
+                ed.WriteMessage($"\n[FluxCAD] Cell Root Candidates");
+                ed.WriteMessage($"\nCell Min=({cellBounds.MinPoint.X:F2},{cellBounds.MinPoint.Y:F2}) Max=({cellBounds.MaxPoint.X:F2},{cellBounds.MaxPoint.Y:F2})");
+
+                var roots = CollectRootUnits(db, tr, worldBounds);
+
+                var related = roots
+                    .Where(r => Intersects(r.Bounds, cellBounds) || ContainsPoint(cellBounds, r.Center))
+                    .OrderByDescending(r => r.Role == RootRole.Partition ? 1 : 0)
+                    .ThenByDescending(r => r.Width * r.Height)
+                    .ToList();
+
+                var primitiveCandidates = new List<RootUnitInfo>();
+
+                foreach (var r in related)
+                {
+                    bool centerIn = ContainsPoint(cellBounds, r.Center);
+                    double overlap = IntersectionAreaRatio(cellBounds, r.Bounds);
+
+                    string verdict;
+                    string why;
+
+                    if (r.Role == RootRole.Partition)
+                    {
+                        verdict = "REJECT";
+                        why = r.Reason;
+                    }
+                    else if (r.Role == RootRole.BlockContent)
+                    {
+                        verdict = (centerIn || overlap >= 0.20) ? "ACCEPT" : "CANDIDATE";
+                        why = centerIn ? "block center in cell" :
+                              overlap >= 0.20 ? "block overlap >= 0.20" :
+                              "block intersects cell border";
+                    }
+                    else
+                    {
+                        verdict = (centerIn || overlap >= 0.20) ? "CANDIDATE" : "WEAK";
+                        why = centerIn ? "primitive center in cell" :
+                              overlap >= 0.20 ? "primitive overlap >= 0.20" :
+                              "primitive touches cell border";
+                        primitiveCandidates.Add(r);
+                    }
+
+                    ed.WriteMessage(
+                        $"\n[CellRoot] Id={HandleText(r.Id)} Type={r.TypeName}" +
+                        $" Role={r.Role} W={r.Width:F2} H={r.Height:F2}" +
+                        $" CenterIn={(centerIn ? "Y" : "N")} Overlap={overlap:F2}" +
+                        $" -> {verdict} ({why})");
+                }
+
+                // primitive cluster 디버그
+                double cellW = WidthOf(cellBounds);
+                double cellH = HeightOf(cellBounds);
+
+                // 셀 크기의 1.5%를 gap으로 사용 (추측값)
+                double clusterGap = Math.Max(1.0, Math.Min(cellW, cellH) * 0.015);
+
+                var cellPrimitiveRoots = primitiveCandidates
+                    .Where(r => Intersects(r.Bounds, cellBounds) || ContainsPoint(cellBounds, r.Center))
+                    .ToList();
+
+                var clusters = BuildPrimitiveClusters(cellPrimitiveRoots, clusterGap)
+                    .OrderByDescending(c => c.Members.Count)
+                    .ToList();
+
+                ed.WriteMessage($"\n\n[PrimitiveCluster] Gap={clusterGap:F2} Count={clusters.Count}");
+
+                int clusterIndex = 1;
+                foreach (var c in clusters.Take(20))
+                {
+                    double overlap = IntersectionAreaRatio(cellBounds, c.Bounds);
+                    bool centerIn = ContainsPoint(cellBounds, c.Center);
+
+                    ed.WriteMessage(
+                        $"\n[Cluster {clusterIndex}] Members={c.Members.Count}" +
+                        $" W={WidthOf(c.Bounds):F2} H={HeightOf(c.Bounds):F2}" +
+                        $" CenterIn={(centerIn ? "Y" : "N")} Overlap={overlap:F2}" +
+                        $" Min=({c.Bounds.MinPoint.X:F2},{c.Bounds.MinPoint.Y:F2})" +
+                        $" Max=({c.Bounds.MaxPoint.X:F2},{c.Bounds.MaxPoint.Y:F2})");
+
+                    foreach (var m in c.Members.Take(10))
+                    {
+                        ed.WriteMessage($"\n   - Id={HandleText(m.Id)} Type={m.TypeName} W={m.Width:F2} H={m.Height:F2}");
+                    }
+
+                    if (c.Members.Count > 10)
+                        ed.WriteMessage($"\n   ... +{c.Members.Count - 10} more");
+
+                    clusterIndex++;
+                }
+
+                tr.Commit();
+            }
+        }
+
+        private static void CollectCellExportIds(
+            Database db,
+            Transaction tr,
+            Extents3d worldBounds,
+            Extents3d cellBounds,
+            ObjectIdCollection ids)
+        {
+            var roots = CollectRootUnits(db, tr, worldBounds);
+
+            var primitiveCandidates = new List<RootUnitInfo>();
+
+            foreach (var r in roots)
+            {
+                if (r.Role == RootRole.Partition)
+                    continue;
+
+                bool centerIn = ContainsPoint(cellBounds, r.Center);
+                double overlap = IntersectionAreaRatio(cellBounds, r.Bounds);
+
+                if (!(centerIn || Intersects(r.Bounds, cellBounds)))
+                    continue;
+
+                if (r.Role == RootRole.BlockContent)
+                {
+                    if (centerIn || overlap >= 0.20)
+                        ids.Add(r.Id);
+
+                    continue;
+                }
+
+                primitiveCandidates.Add(r);
+            }
+
+            double cellW = WidthOf(cellBounds);
+            double cellH = HeightOf(cellBounds);
+            double clusterGap = Math.Max(1.0, Math.Min(cellW, cellH) * 0.015); // 추측값
+
+            var clusters = BuildPrimitiveClusters(primitiveCandidates, clusterGap);
+
+            foreach (var c in clusters)
+            {
+                bool centerIn = ContainsPoint(cellBounds, c.Center);
+                double overlap = IntersectionAreaRatio(cellBounds, c.Bounds);
+
+                if (!(centerIn || overlap >= 0.25))
+                    continue;
+
+                foreach (var member in c.Members)
+                    ids.Add(member.Id);
+            }
+        }
+
+        [CommandMethod("FLUX_DEBUG_ROOT_SUMMARY")]
+        public static void FluxDebugRootSummary()
+        {
+            var doc = Application.DocumentManager.MdiActiveDocument;
+            var db = doc.Database;
+            var ed = doc.Editor;
+
+            using (var tr = db.TransactionManager.StartTransaction())
+            {
+                var worldBounds = GetModelSpaceBounds(db, tr);
+                var roots = CollectRootUnits(db, tr, worldBounds);
+
+                ed.WriteMessage("\n[FluxCAD] Root Summary");
+                ed.WriteMessage($"\nWorldBounds Min=({worldBounds.MinPoint.X:F2},{worldBounds.MinPoint.Y:F2}) Max=({worldBounds.MaxPoint.X:F2},{worldBounds.MaxPoint.Y:F2})");
+
+                ed.WriteMessage($"\nTotal={roots.Count}");
+                ed.WriteMessage($"\nPartition={roots.Count(x => x.Role == RootRole.Partition)}");
+                ed.WriteMessage($"\nBlockContent={roots.Count(x => x.Role == RootRole.BlockContent)}");
+                ed.WriteMessage($"\nPrimitiveContent={roots.Count(x => x.Role == RootRole.PrimitiveContent)}");
+
+                ed.WriteMessage("\n\n[Type Histogram]");
+                foreach (var g in roots.GroupBy(x => x.TypeName).OrderByDescending(g => g.Count()).Take(20))
+                {
+                    ed.WriteMessage($"\n{g.Key} = {g.Count()}");
+                }
+
+                double thinTol = ThinTol(worldBounds);
+
+                ed.WriteMessage("\n\n[Long Horizontal Candidates]");
+                foreach (var r in roots
+                    .Where(x => x.Height <= thinTol)
+                    .OrderByDescending(x => x.Width)
+                    .Take(20))
+                {
+                    ed.WriteMessage($"\nId={HandleText(r.Id)} Type={r.TypeName} W={r.Width:F2} H={r.Height:F4} Role={r.Role} Reason={r.Reason}");
+                }
+
+                ed.WriteMessage("\n\n[Long Vertical Candidates]");
+                foreach (var r in roots
+                    .Where(x => x.Width <= thinTol)
+                    .OrderByDescending(x => x.Height)
+                    .Take(20))
+                {
+                    ed.WriteMessage($"\nId={HandleText(r.Id)} Type={r.TypeName} W={r.Width:F4} H={r.Height:F2} Role={r.Role} Reason={r.Reason}");
+                }
+
+                tr.Commit();
+            }
+        }
+
+        private static bool TryGetEntityExtents(Entity ent, out Extents3d ext)
+        {
+            try
+            {
+                ext = ent.GeometricExtents;
+                return true;
+            }
+            catch
+            {
+                ext = default;
+                return false;
+            }
+        }
+
+        private static Extents3d GetModelSpaceBounds(Database db, Transaction tr)
+        {
+            var ms = (BlockTableRecord)tr.GetObject(
+                SymbolUtilityServices.GetBlockModelSpaceId(db),
+                OpenMode.ForRead);
+
+            bool hasAny = false;
+            Extents3d acc = default;
+
+            foreach (ObjectId id in ms)
+            {
+                if (!(tr.GetObject(id, OpenMode.ForRead) is Entity ent))
+                    continue;
+
+                if (!TryGetEntityExtents(ent, out var ext))
+                    continue;
+
+                if (!hasAny)
+                {
+                    acc = ext;
+                    hasAny = true;
+                }
+                else
+                {
+                    acc.AddExtents(ext);
+                }
+            }
+
+            if (!hasAny)
+                throw new InvalidOperationException("ModelSpace bounds를 계산할 수 없습니다.");
+
+            return acc;
+        }
+
+        private static double WidthOf(Extents3d ext) => ext.MaxPoint.X - ext.MinPoint.X;
+        private static double HeightOf(Extents3d ext) => ext.MaxPoint.Y - ext.MinPoint.Y;
+
+        private static Point3d CenterOf(Extents3d ext)
+        {
+            return new Point3d(
+                (ext.MinPoint.X + ext.MaxPoint.X) * 0.5,
+                (ext.MinPoint.Y + ext.MaxPoint.Y) * 0.5,
+                0);
+        }
+
+        private static bool Intersects(Extents3d a, Extents3d b)
+        {
+            return !(a.MaxPoint.X < b.MinPoint.X ||
+                     a.MinPoint.X > b.MaxPoint.X ||
+                     a.MaxPoint.Y < b.MinPoint.Y ||
+                     a.MinPoint.Y > b.MaxPoint.Y);
+        }
+
+        private static Extents3d Expand(Extents3d ext, double gap)
+        {
+            return new Extents3d(
+                new Point3d(ext.MinPoint.X - gap, ext.MinPoint.Y - gap, 0),
+                new Point3d(ext.MaxPoint.X + gap, ext.MaxPoint.Y + gap, 0));
+        }
+
+        private static bool ContainsPoint(Extents3d ext, Point3d p)
+        {
+            return p.X >= ext.MinPoint.X && p.X <= ext.MaxPoint.X &&
+                   p.Y >= ext.MinPoint.Y && p.Y <= ext.MaxPoint.Y;
+        }
+
+        private static double IntersectionAreaRatio(Extents3d cell, Extents3d obj)
+        {
+            double ix = Math.Max(0, Math.Min(cell.MaxPoint.X, obj.MaxPoint.X) - Math.Max(cell.MinPoint.X, obj.MinPoint.X));
+            double iy = Math.Max(0, Math.Min(cell.MaxPoint.Y, obj.MaxPoint.Y) - Math.Max(cell.MinPoint.Y, obj.MinPoint.Y));
+            double interArea = ix * iy;
+
+            double objW = WidthOf(obj);
+            double objH = HeightOf(obj);
+            double objArea = objW * objH;
+
+            // 선처럼 면적이 거의 0인 경우는 center 기반으로 대체
+            if (objArea < 1e-9)
+                return ContainsPoint(cell, CenterOf(obj)) ? 1.0 : 0.0;
+
+            return interArea / objArea;
+        }
+
+        private static string HandleText(ObjectId id)
+        {
+            try { return id.Handle.ToString(); }
+            catch { return id.ToString(); }
+        }
+
+        private static double ThinTol(Extents3d worldBounds)
+        {
+            double worldW = WidthOf(worldBounds);
+            double worldH = HeightOf(worldBounds);
+            double baseLen = Math.Max(1.0, Math.Min(worldW, worldH));
+            return Math.Max(1e-6, baseLen * 0.0005);
+        }
+
+        private static bool IsGlobalPartitionLine(Line line, Extents3d ext, Extents3d worldBounds, out string reason)
+        {
+            reason = "";
+
+            double w = WidthOf(ext);
+            double h = HeightOf(ext);
+            double totalW = WidthOf(worldBounds);
+            double totalH = HeightOf(worldBounds);
+            double thinTol = ThinTol(worldBounds);
+
+            // 거의 수평 + 전체 폭의 상당 부분
+            if (h <= thinTol && w >= totalW * 0.60)
+            {
+                reason = "global horizontal partition";
+                return true;
+            }
+
+            // 거의 수직 + 전체 높이의 상당 부분
+            if (w <= thinTol && h >= totalH * 0.60)
+            {
+                reason = "global vertical partition";
+                return true;
+            }
+
+            return false;
+        }
+
+        private static bool IsGlobalPartitionPolyline(Polyline pl, Extents3d ext, Extents3d worldBounds, out string reason)
+        {
+            reason = "";
+
+            double w = WidthOf(ext);
+            double h = HeightOf(ext);
+            double totalW = WidthOf(worldBounds);
+            double totalH = HeightOf(worldBounds);
+            double thinTol = ThinTol(worldBounds);
+
+            // 길쭉한 전역선 성격
+            if (h <= thinTol && w >= totalW * 0.60)
+            {
+                reason = "global horizontal partition polyline";
+                return true;
+            }
+
+            if (w <= thinTol && h >= totalH * 0.60)
+            {
+                reason = "global vertical partition polyline";
+                return true;
+            }
+
+            // 표 전체 외곽/거대 프레임 후보
+            if (pl.Closed && w >= totalW * 0.60 && h >= totalH * 0.60)
+            {
+                reason = "global outer frame polyline";
+                return true;
+            }
+
+            return false;
+        }
+
+        private static bool IsPartitionRoot(Entity ent, Extents3d ext, Extents3d worldBounds, out string reason)
+        {
+            reason = "";
+
+            if (ent is DBPoint)
+            {
+                reason = "debug DBPoint";
+                return true;
+            }
+
+            if (ent is Line line && IsGlobalPartitionLine(line, ext, worldBounds, out reason))
+                return true;
+
+            if (ent is Polyline pl && IsGlobalPartitionPolyline(pl, ext, worldBounds, out reason))
+                return true;
+
+            if (ent is Xline)
+            {
+                reason = "construction xline";
+                return true;
+            }
+
+            if (ent is Ray)
+            {
+                reason = "construction ray";
+                return true;
+            }
+
+            return false;
+        }
+
+        private static RootRole ClassifyRootRole(Entity ent, Extents3d ext, Extents3d worldBounds, out string reason)
+        {
+            if (IsPartitionRoot(ent, ext, worldBounds, out reason))
+                return RootRole.Partition;
+
+            if (ent is BlockReference br)
+            {
+                reason = $"block:{br.Name}";
+                return RootRole.BlockContent;
+            }
+
+            reason = "primitive content";
+            return RootRole.PrimitiveContent;
+        }
+
+        private static List<RootUnitInfo> CollectRootUnits(Database db, Transaction tr, Extents3d worldBounds)
+        {
+            var result = new List<RootUnitInfo>();
+
+            var ms = (BlockTableRecord)tr.GetObject(
+                SymbolUtilityServices.GetBlockModelSpaceId(db),
+                OpenMode.ForRead);
+
+            foreach (ObjectId id in ms)
+            {
+                if (!(tr.GetObject(id, OpenMode.ForRead) is Entity ent))
+                    continue;
+
+                if (!TryGetEntityExtents(ent, out var ext))
+                    continue;
+
+                string reason;
+                var role = ClassifyRootRole(ent, ext, worldBounds, out reason);
+
+                string? blockName = null;
+                if (ent is BlockReference br)
+                    blockName = br.Name;
+
+                result.Add(new RootUnitInfo
+                {
+                    Id = id,
+                    TypeName = ent.GetType().Name,
+                    BlockName = blockName,
+                    Bounds = ext,
+                    Center = CenterOf(ext),
+                    Width = WidthOf(ext),
+                    Height = HeightOf(ext),
+                    Role = role,
+                    Reason = reason
+                });
+            }
+
+            return result;
+        }
+
+        private static bool AreNearOrTouching(Extents3d a, Extents3d b, double gap)
+        {
+            return Intersects(Expand(a, gap), b);
+        }
+
+        private static List<PrimitiveCluster> BuildPrimitiveClusters(List<RootUnitInfo> primitiveRoots, double gap)
+        {
+            var clusters = new List<PrimitiveCluster>();
+            int n = primitiveRoots.Count;
+            var visited = new bool[n];
+
+            for (int i = 0; i < n; i++)
+            {
+                if (visited[i])
+                    continue;
+
+                var cluster = new PrimitiveCluster();
+                var queue = new Queue<int>();
+                queue.Enqueue(i);
+                visited[i] = true;
+
+                bool hasAny = false;
+                Extents3d acc = default;
+
+                while (queue.Count > 0)
+                {
+                    int cur = queue.Dequeue();
+                    var item = primitiveRoots[cur];
+
+                    cluster.Members.Add(item);
+
+                    if (!hasAny)
+                    {
+                        acc = item.Bounds;
+                        hasAny = true;
+                    }
+                    else
+                    {
+                        acc.AddExtents(item.Bounds);
+                    }
+
+                    for (int j = 0; j < n; j++)
+                    {
+                        if (visited[j])
+                            continue;
+
+                        if (AreNearOrTouching(item.Bounds, primitiveRoots[j].Bounds, gap))
+                        {
+                            visited[j] = true;
+                            queue.Enqueue(j);
+                        }
+                    }
+                }
+
+                cluster.Bounds = acc;
+                clusters.Add(cluster);
+            }
+
+            return clusters;
+        }
+
+        private static Extents3d PromptWindow(Editor ed, string message1, string message2)
+        {
+            var p1 = ed.GetPoint("\n" + message1);
+            if (p1.Status != PromptStatus.OK)
+                throw new InvalidOperationException("첫 번째 점 선택이 취소되었습니다.");
+
+            var p2 = ed.GetCorner("\n" + message2, p1.Value);
+            if (p2.Status != PromptStatus.OK)
+                throw new InvalidOperationException("두 번째 점 선택이 취소되었습니다.");
+
+            double minX = Math.Min(p1.Value.X, p2.Value.X);
+            double minY = Math.Min(p1.Value.Y, p2.Value.Y);
+            double maxX = Math.Max(p1.Value.X, p2.Value.X);
+            double maxY = Math.Max(p1.Value.Y, p2.Value.Y);
+
+            return new Extents3d(
+                new Point3d(minX, minY, 0),
+                new Point3d(maxX, maxY, 0));
+        }
 
 
         [CommandMethod("FLUX_EXPORT_CELL_SCENE_ONE_LOCAL")]
@@ -2334,7 +2913,7 @@ namespace FluxCAD.BricsCAD.Plugin26
             }
         }
 
-        private static bool Intersects(Extents3d a, Extents3d b)
+        private static bool Intersects_old(Extents3d a, Extents3d b)
         {
             return !(a.MaxPoint.X < b.MinPoint.X ||
                      a.MinPoint.X > b.MaxPoint.X ||
@@ -6877,6 +7456,37 @@ namespace FluxCAD.BricsCAD.Plugin26
             Transaction tr,
             Extents3d sheetExt,
             string filePath)
+        {
+            var ids = new ObjectIdCollection();
+
+            // 사용자님이 추가하신 WorldBounds를 여기서 사용하면 더 좋습니다.
+            // 일단 독립 실행용으로는 modelspace bounds를 사용합니다.
+            var worldBounds = GetModelSpaceBounds(sourceDb, tr);
+
+            CollectCellExportIds(sourceDb, tr, worldBounds, sheetExt, ids);
+
+            Database newDb = new Database(true, true);
+
+            using (var tr2 = newDb.TransactionManager.StartTransaction())
+            {
+                var bt = (BlockTable)tr2.GetObject(newDb.BlockTableId, OpenMode.ForRead);
+                var ms2 = (BlockTableRecord)tr2.GetObject(bt[BlockTableRecord.ModelSpace], OpenMode.ForWrite);
+
+                IdMapping mapping = new IdMapping();
+                sourceDb.WblockCloneObjects(ids, ms2.ObjectId, mapping, DuplicateRecordCloning.Ignore, false);
+
+                tr2.Commit();
+            }
+
+            newDb.SaveAs(filePath, DwgVersion.Current);
+            newDb.Dispose();
+        }
+
+        void ExportSheet_old(
+    Database sourceDb,
+    Transaction tr,
+    Extents3d sheetExt,
+    string filePath)
         {
             var ms = (BlockTableRecord)tr.GetObject(
                 SymbolUtilityServices.GetBlockModelSpaceId(sourceDb),
