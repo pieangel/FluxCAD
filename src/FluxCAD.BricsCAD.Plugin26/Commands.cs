@@ -136,7 +136,7 @@ namespace FluxCAD.BricsCAD.Plugin26
                         ed.WriteMessage(
                             $"\n[Scene r{cell.Row} c{cell.Col}] " +
                             $"Entities={scene.Entities.Count}, Lines={lineCount}, Arcs={arcCount}, Texts={textCount}, Blocks={blockCount}");
-
+                        /*
                         var rects = FindRectangleCandidates(scene);
 
                         ed.WriteMessage($"\n  RectCandidates={rects.Count}");
@@ -157,6 +157,7 @@ namespace FluxCAD.BricsCAD.Plugin26
                         {
                             ed.WriteMessage("\n  PrimarySheetCandidate: NONE");
                         }
+                        */
 
                         ed.WriteMessage("\n  Rectangle detection skipped for debug.");
                     }
