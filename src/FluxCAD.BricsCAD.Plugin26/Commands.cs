@@ -97,17 +97,6 @@ namespace FluxCAD.BricsCAD.Plugin26
     
     public class Commands
     {
-        internal sealed class CellScene
-        {
-            public List<Entity> Geometry { get; } = new();
-
-            public Extents3d WorldBounds { get; set; }
-            public Extents3d LocalBounds { get; set; }
-
-            public int Row { get; set; }
-            public int Col { get; set; }
-        }
-
         List<Entity> _flattened = new List<Entity>();
         private const string CopySetRegAppName = "FLUXCAD";
         private const string FluxCadRegAppName = "FLUXCAD";
