@@ -8,6 +8,7 @@ using System.Drawing;
 using System.Drawing.Imaging;
 using System.Globalization;
 using System.IO;
+using System.Reflection;
 using System.Text.RegularExpressions;
 using System.Windows.Media.Animation;
 using Teigha.DatabaseServices;
@@ -92,13 +93,375 @@ namespace FluxCAD.BricsCAD.Plugin26
         public int RejectExtOutside;
         public int Accepted;
     }
+
+    
     public class Commands
     {
+        internal sealed class CellScene
+        {
+            public List<Entity> Geometry { get; } = new();
+
+            public Extents3d WorldBounds { get; set; }
+            public Extents3d LocalBounds { get; set; }
+
+            public int Row { get; set; }
+            public int Col { get; set; }
+        }
+
         List<Entity> _flattened = new List<Entity>();
         private const string CopySetRegAppName = "FLUXCAD";
         private const string FluxCadRegAppName = "FLUXCAD";
         private List<double>? _lastRecoveredGridXs;
         private List<double>? _lastRecoveredGridYs;
+
+
+        [CommandMethod("FLUX_EXPORT_CELL_SCENE_ONE")]
+        public void ExportCellSceneOne()
+        {
+            var doc = Application.DocumentManager.MdiActiveDocument;
+            var db = doc.Database;
+            var ed = doc.Editor;
+
+            try
+            {
+                using (var tr = db.TransactionManager.StartTransaction())
+                {
+                    // ------------------------------------------------------------
+                    // 이 부분은 현재 프로젝트의 실제 grid cell 확보 함수로 연결해 주세요.
+                    // FLUX_DEBUG_GRID_CELLS / FLUX_DEBUG_CELL_SCENE 와 동일 경로를 쓰는 것이 중요합니다.
+                    // ------------------------------------------------------------
+                    var cells = DetectGridCells(tr, db, ed); // <- 실제 메서드명으로 교체
+                    if (cells == null || cells.Count == 0)
+                    {
+                        ed.WriteMessage("\n[FluxCAD] No cached grid cells found.");
+                        return;
+                    }
+
+                    int maxRow = cells.Max(x => x.Row);
+                    int maxCol = cells.Max(x => x.Col);
+
+                    int row = PromptInt(ed, "\nTarget row", 1, 0, maxRow);
+                    int col = PromptInt(ed, "\nTarget col", 1, 0, maxCol);
+
+                    var targetCell = cells.FirstOrDefault(x => x.Row == row && x.Col == col);
+                    if (targetCell == null)
+                    {
+                        ed.WriteMessage($"\n[FluxCAD] Cell not found: r{row} c{col}");
+                        return;
+                    }
+
+                    ed.WriteMessage($"\n[FluxCAD] Export target = r{row} c{col}");
+
+                    // ------------------------------------------------------------
+                    // BuildCellScene 실제 시그니처에 맞게 연결해 주세요.
+                    // 핵심은 FLUX_DEBUG_CELL_SCENE 과 완전히 같은 방식으로 scene을 만들라는 것입니다.
+                    // ------------------------------------------------------------
+                    CellScene scene = BuildCellScene(tr, db, ed, targetCell, normalizeToLocal: true); // <- 실제 시그니처로 교체
+
+                    if (scene == null)
+                    {
+                        ed.WriteMessage($"\n[FluxCAD] BuildCellScene returned null for r{row} c{col}");
+                        return;
+                    }
+
+                    ed.WriteMessage(
+                        $"\n[FluxCAD] Scene ready: r{row} c{col}" +
+                        $"\n[FluxCAD] Scene.Entities = {scene.Entities.Count}" +
+                        $"\n[FluxCAD] Scene.LocalBounds Min=({scene.LocalBounds.MinPoint.X:F2},{scene.LocalBounds.MinPoint.Y:F2})" +
+                        $" Max=({scene.LocalBounds.MaxPoint.X:F2},{scene.LocalBounds.MaxPoint.Y:F2})");
+
+                    string sourceDir = Path.GetDirectoryName(doc.Name);
+                    if (string.IsNullOrWhiteSpace(sourceDir))
+                        sourceDir = Environment.GetFolderPath(Environment.SpecialFolder.DesktopDirectory);
+
+                    string outDir = Path.Combine(sourceDir, "FluxDebugCellScene");
+                    Directory.CreateDirectory(outDir);
+
+                    string filePath = Path.Combine(
+                        outDir,
+                        $"debug_scene_r{row}_c{col}_{DateTime.Now:yyyyMMdd_HHmmss}.dwg");
+
+                    var result = ExportCellSceneToDwg(scene, db, filePath);
+
+                    ed.WriteMessage(
+                        $"\n[FluxCAD] Scene exported: {filePath}" +
+                        $"\n[FluxCAD] Cloned by SourceId = {result.BySourceId}" +
+                        $"\n[FluxCAD] Appended by DetachedClone = {result.ByDetachedClone}" +
+                        $"\n[FluxCAD] Skipped = {result.Skipped}");
+
+                    tr.Commit();
+                }
+            }
+            catch (System.Exception ex)
+            {
+                ed.WriteMessage($"\n[FluxCAD] FLUX_EXPORT_CELL_SCENE_ONE failed: {ex.Message}");
+                ed.WriteMessage($"\n{ex.StackTrace}");
+            }
+        }
+
+        private int PromptInt(Editor ed, string message, int defaultValue, int min, int max)
+        {
+            var opt = new PromptIntegerOptions(message)
+            {
+                DefaultValue = defaultValue,
+                UseDefaultValue = true,
+                AllowNegative = false,
+                AllowZero = true,
+                LowerLimit = min,
+                UpperLimit = max
+            };
+
+            var res = ed.GetInteger(opt);
+            if (res.Status != PromptStatus.OK)
+                throw new InvalidOperationException("User cancelled integer input.");
+
+            return res.Value;
+        }
+
+        private SceneExportResult ExportCellSceneToDwg(CellScene scene, Database sourceDb, string filePath)
+        {
+            var result = new SceneExportResult();
+
+            using (var outDb = new Database(true, true))
+            using (var outTr = outDb.TransactionManager.StartTransaction())
+            {
+                var bt = (BlockTable)outTr.GetObject(outDb.BlockTableId, OpenMode.ForRead);
+                var ms = (BlockTableRecord)outTr.GetObject(bt[BlockTableRecord.ModelSpace], OpenMode.ForWrite);
+
+                var uniqueIds = new ObjectIdCollection();
+                var seenHandles = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+                foreach (var item in scene.Entities)
+                {
+                    if (item == null)
+                    {
+                        result.Skipped++;
+                        continue;
+                    }
+
+                    // 1) 원본 ObjectId가 있으면 가장 안전하게 WblockCloneObjects 사용
+                    if (TryGetSourceId(item, out ObjectId srcId) && !srcId.IsNull)
+                    {
+                        string handleKey = srcId.Handle.ToString();
+                        if (seenHandles.Add(handleKey))
+                        {
+                            uniqueIds.Add(srcId);
+                            result.BySourceId++;
+                        }
+                        continue;
+                    }
+
+                    // 2) detached Entity가 있으면 clone 후 append
+                    if (TryGetDetachedEntity(item, out Entity detached) && detached != null)
+                    {
+                        var cloned = detached.Clone() as Entity;
+                        if (cloned != null)
+                        {
+                            ms.AppendEntity(cloned);
+                            outTr.AddNewlyCreatedDBObject(cloned, true);
+                            result.ByDetachedClone++;
+                            continue;
+                        }
+                    }
+
+                    result.Skipped++;
+                }
+
+                if (uniqueIds.Count > 0)
+                {
+                    var map = new IdMapping();
+                    sourceDb.WblockCloneObjects(
+                        uniqueIds,
+                        ms.ObjectId,
+                        map,
+                        DuplicateRecordCloning.Ignore,
+                        false);
+                }
+
+                outTr.Commit();
+                outDb.SaveAs(filePath, DwgVersion.Current);
+            }
+
+            return result;
+        }
+
+        private bool TryGetSourceId(FlattenedCellEntity item, out ObjectId id)
+        {
+            id = ObjectId.Null;
+            if (item == null)
+                return false;
+
+            // 가장 먼저 흔히 쓰는 이름들을 직접 탐색
+            string[] propNames =
+            {
+                "SourceId",
+                "EntityId",
+                "ObjectId",
+                "Id"
+            };
+
+            foreach (var name in propNames)
+            {
+                var p = item.GetType().GetProperty(name,
+                    BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+
+                if (p != null && p.PropertyType == typeof(ObjectId))
+                {
+                    var val = p.GetValue(item);
+                    if (val is ObjectId oid && !oid.IsNull)
+                    {
+                        id = oid;
+                        return true;
+                    }
+                }
+            }
+
+            // Wrapper 안에 원본 id가 들어 있을 수도 있으니 한 번 더 탐색
+            var pWrapper = item.GetType().GetProperty("Wrapper",
+                BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+
+            if (pWrapper != null)
+            {
+                var wrapper = pWrapper.GetValue(item);
+                if (wrapper != null)
+                    return TryGetSourceIdFromObject(wrapper, out id);
+            }
+
+            return false;
+        }
+
+        private bool TryGetSourceIdFromObject(object obj, out ObjectId id)
+        {
+            id = ObjectId.Null;
+            if (obj == null)
+                return false;
+
+            string[] propNames =
+            {
+                "SourceId",
+                "EntityId",
+                "ObjectId",
+                "Id"
+            };
+
+            foreach (var name in propNames)
+            {
+                var p = obj.GetType().GetProperty(name,
+                    BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+
+                if (p != null && p.PropertyType == typeof(ObjectId))
+                {
+                    var val = p.GetValue(obj);
+                    if (val is ObjectId oid && !oid.IsNull)
+                    {
+                        id = oid;
+                        return true;
+                    }
+                }
+            }
+
+            return false;
+        }
+
+        private bool TryGetDetachedEntity(FlattenedCellEntity item, out Entity entity)
+        {
+            entity = null;
+            if (item == null)
+                return false;
+
+            // item 자체가 Entity인 경우
+            // 추가 또는 우선 사용
+            if (item.Geometry != null)
+            {
+                entity = item.Geometry;
+                return true;
+            }
+
+            // 흔히 있을 법한 프로퍼티명 탐색
+            string[] propNames =
+            {
+                "Entity",
+                "Geometry",
+                "DbEntity",
+                "Curve"
+            };
+
+            foreach (var name in propNames)
+            {
+                var p = item.GetType().GetProperty(name,
+                    BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+
+                if (p == null)
+                    continue;
+
+                var val = p.GetValue(item);
+                if (val is Entity e)
+                {
+                    entity = e;
+                    return true;
+                }
+            }
+
+            // Wrapper 내부에도 있을 수 있음
+            var pWrapper = item.GetType().GetProperty("Wrapper",
+                BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+
+            if (pWrapper != null)
+            {
+                var wrapper = pWrapper.GetValue(item);
+                if (wrapper != null)
+                    return TryGetDetachedEntityFromObject(wrapper, out entity);
+            }
+
+            return false;
+        }
+
+        private bool TryGetDetachedEntityFromObject(object obj, out Entity entity)
+        {
+            entity = null;
+            if (obj == null)
+                return false;
+
+            if (obj is Entity e0)
+            {
+                entity = e0;
+                return true;
+            }
+
+            string[] propNames =
+            {
+                "Entity",
+                "Geometry",
+                "DbEntity",
+                "Curve"
+            };
+
+            foreach (var name in propNames)
+            {
+                var p = obj.GetType().GetProperty(name,
+                    BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+
+                if (p == null)
+                    continue;
+
+                var val = p.GetValue(obj);
+                if (val is Entity e1)
+                {
+                    entity = e1;
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        private sealed class SceneExportResult
+        {
+            public int BySourceId { get; set; }
+            public int ByDetachedClone { get; set; }
+            public int Skipped { get; set; }
+        }
+
 
         [CommandMethod("FLUX_DEBUG_CELL_SCENE")]
         public void DebugCellScene()
