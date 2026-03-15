@@ -103,6 +103,571 @@ namespace FluxCAD.BricsCAD.Plugin26
         private List<double>? _lastRecoveredGridXs;
         private List<double>? _lastRecoveredGridYs;
 
+        [CommandMethod("FLUX_EXPORT_CELL_SCENE_ONE_LOCAL")]
+        public void ExportCellSceneOneLocal()
+        {
+            var doc = Application.DocumentManager.MdiActiveDocument;
+            var db = doc.Database;
+            var ed = doc.Editor;
+
+            try
+            {
+                using (var tr = db.TransactionManager.StartTransaction())
+                {
+                    // 실제 프로젝트의 셀 확보 함수로 교체
+                    var cells = DetectGridCells(tr, db, ed);
+                    if (cells == null || cells.Count == 0)
+                    {
+                        ed.WriteMessage("\n[FluxCAD] No grid cells found.");
+                        return;
+                    }
+
+                    int maxRow = cells.Max(x => x.Row);
+                    int maxCol = cells.Max(x => x.Col);
+
+                    int row = 1;
+                    int col = 1;
+
+                    var rowOpt = new PromptIntegerOptions($"\nTarget row [0..{maxRow}] <{row}>: ")
+                    {
+                        AllowNegative = false,
+                        AllowZero = true,
+                        AllowNone = true
+                    };
+
+                    var rowRes = ed.GetInteger(rowOpt);
+                    if (rowRes.Status == PromptStatus.OK)
+                        row = rowRes.Value;
+                    else if (rowRes.Status != PromptStatus.None)
+                        return;
+
+                    if (row < 0 || row > maxRow)
+                    {
+                        ed.WriteMessage($"\n[FluxCAD] Row out of range: {row}");
+                        return;
+                    }
+
+                    var colOpt = new PromptIntegerOptions($"\nTarget col [0..{maxCol}] <{col}>: ")
+                    {
+                        AllowNegative = false,
+                        AllowZero = true,
+                        AllowNone = true
+                    };
+
+                    var colRes = ed.GetInteger(colOpt);
+                    if (colRes.Status == PromptStatus.OK)
+                        col = colRes.Value;
+                    else if (colRes.Status != PromptStatus.None)
+                        return;
+
+                    if (col < 0 || col > maxCol)
+                    {
+                        ed.WriteMessage($"\n[FluxCAD] Col out of range: {col}");
+                        return;
+                    }
+
+                    var targetCell = cells.FirstOrDefault(x => x.Row == row && x.Col == col);
+                    if (targetCell == null)
+                    {
+                        ed.WriteMessage($"\n[FluxCAD] Cell not found: r{row} c{col}");
+                        return;
+                    }
+
+                    ed.WriteMessage($"\n[FluxCAD] LOCAL export target = r{row} c{col}");
+
+                    // 실제 BuildCellScene 시그니처에 맞게 교체
+                    var scene = BuildCellScene(tr, db, ed, targetCell, normalizeToLocal: true);
+                    if (scene == null)
+                    {
+                        ed.WriteMessage($"\n[FluxCAD] BuildCellScene returned null: r{row} c{col}");
+                        return;
+                    }
+
+                    ed.WriteMessage(
+                        $"\n[FluxCAD] Scene.Entities = {scene.Entities.Count}" +
+                        $"\n[FluxCAD] Scene.LocalBounds Min=({scene.LocalBounds.MinPoint.X:F2},{scene.LocalBounds.MinPoint.Y:F2})" +
+                        $" Max=({scene.LocalBounds.MaxPoint.X:F2},{scene.LocalBounds.MaxPoint.Y:F2})");
+
+                    string sourceDir = Path.GetDirectoryName(doc.Name);
+                    if (string.IsNullOrWhiteSpace(sourceDir))
+                        sourceDir = Environment.GetFolderPath(Environment.SpecialFolder.DesktopDirectory);
+
+                    string outDir = Path.Combine(sourceDir, "FluxDebugCellSceneLocal");
+                    Directory.CreateDirectory(outDir);
+
+                    string filePath = Path.Combine(
+                        outDir,
+                        $"debug_scene_local_r{row}_c{col}_{DateTime.Now:yyyyMMdd_HHmmss}.dwg");
+
+                    // 이미 만들어 둔 함수 호출
+                    ExportLocalCellScene(ed,db, scene, row, col, filePath);
+
+                    ed.WriteMessage($"\n[FluxCAD] LOCAL scene exported: {filePath}");
+
+                    tr.Commit();
+                }
+            }
+            catch (System.Exception ex)
+            {
+                ed.WriteMessage($"\n[FluxCAD] FLUX_EXPORT_CELL_SCENE_ONE_LOCAL failed: {ex.Message}");
+                ed.WriteMessage($"\n{ex.StackTrace}");
+            }
+        }
+
+        private static Extents3d MakeLocalBounds(Extents3d worldBounds)
+        {
+            double w = worldBounds.MaxPoint.X - worldBounds.MinPoint.X;
+            double h = worldBounds.MaxPoint.Y - worldBounds.MinPoint.Y;
+
+            return new Extents3d(
+                Point3d.Origin,
+                new Point3d(w, h, 0));
+        }
+
+        private void CollectFlattened(
+    Entity entity,
+    Matrix3d worldTransform,
+    ObjectId rootSourceId,
+    CellScene scene)
+        {
+            if (entity == null)
+                return;
+
+            // rootSourceId가 비어 있으면 현재 entity가 root
+            ObjectId effectiveSourceId = rootSourceId.IsNull
+                ? entity.ObjectId
+                : rootSourceId;
+
+            if (entity is BlockReference br)
+            {
+                // block 내부를 재귀적으로 훑더라도
+                // SourceId는 br.ObjectId를 유지하는 것이 핵심
+                var block = (BlockTableRecord)br.BlockTableRecord.GetObject(OpenMode.ForRead);
+
+                Matrix3d childTransform = worldTransform * br.BlockTransform;
+
+                foreach (ObjectId id in block)
+                {
+                    var child = id.GetObject(OpenMode.ForRead) as Entity;
+                    if (child == null)
+                        continue;
+
+                    CollectFlattened(child, childTransform, br.ObjectId, scene);
+                }
+
+                return;
+            }
+
+            // leaf geometry는 분석용으로 clone + transform
+            Entity geo = entity.Clone() as Entity;
+            if (geo == null)
+                return;
+
+            geo.TransformBy(worldTransform);
+
+            Extents3d worldBounds;
+            try
+            {
+                worldBounds = geo.GeometricExtents;
+            }
+            catch
+            {
+                geo.Dispose();
+                return;
+            }
+
+            // 여기서 셀 안에 들어가는지 검사
+            if (!IsInside(scene.WorldBounds, worldBounds))
+            {
+                geo.Dispose();
+                return;
+            }
+
+            var localGeo = geo.Clone() as Entity;
+            if (localGeo == null)
+            {
+                geo.Dispose();
+                return;
+            }
+
+            localGeo.TransformBy(Matrix3d.Displacement(
+                new Vector3d(
+                    -scene.WorldBounds.MinPoint.X,
+                    -scene.WorldBounds.MinPoint.Y,
+                    0)));
+
+            Extents3d localBounds;
+            try
+            {
+                localBounds = localGeo.GeometricExtents;
+            }
+            catch
+            {
+                geo.Dispose();
+                localGeo.Dispose();
+                return;
+            }
+
+            scene.Entities.Add(new FlattenedCellEntity
+            {
+                SourceId = effectiveSourceId,
+                Geometry = localGeo,        // 분석/디버그용
+                WorldBounds = worldBounds,
+                LocalBounds = localBounds,
+                Role = entity.GetType().Name
+            });
+
+            geo.Dispose();
+        }
+
+        private static ObjectId GetLayerId(Database db, Transaction tr, string layerName)
+        {
+            var lt = (LayerTable)tr.GetObject(db.LayerTableId, OpenMode.ForRead);
+
+            if (!lt.Has(layerName))
+            {
+                lt.UpgradeOpen();
+
+                var ltr = new LayerTableRecord
+                {
+                    Name = layerName
+                };
+
+                var id = lt.Add(ltr);
+                tr.AddNewlyCreatedDBObject(ltr, true);
+                return id;
+            }
+
+            return lt[layerName];
+        }
+
+        private void ExportLocalCellScene(
+                Editor ed,
+    Database sourceDb,
+    CellScene scene,
+    int row,
+    int col,
+    string filePath)
+        {
+            if (scene == null)
+            {
+                ed.WriteMessage("\n[FluxCAD] scene is null.");
+                return;
+            }
+
+            var uniqueIds = new HashSet<ObjectId>();
+
+            foreach (var item in scene.Entities)
+            {
+                if (item == null)
+                    continue;
+
+                if (item.SourceId.IsNull)
+                    continue;
+
+                uniqueIds.Add(item.SourceId);
+            }
+
+            if (uniqueIds.Count == 0)
+            {
+                ed.WriteMessage(
+    $"\n[FluxCAD] CELL ({row},{col}) flattened={scene.Entities.Count}, sources={uniqueIds.Count}");
+                return;
+            }
+
+            var ids = new ObjectIdCollection();
+            foreach (var id in uniqueIds)
+                ids.Add(id);
+
+            using (var outDb = new Database(true, true))
+            using (var trOut = outDb.TransactionManager.StartTransaction())
+            {
+                var bt = (BlockTable)trOut.GetObject(outDb.BlockTableId, OpenMode.ForRead);
+                var ms = (BlockTableRecord)trOut.GetObject(
+                    bt[BlockTableRecord.ModelSpace],
+                    OpenMode.ForWrite);
+
+                var mapping = new IdMapping();
+
+                sourceDb.WblockCloneObjects(
+                    ids,
+                    ms.ObjectId,
+                    mapping,
+                    DuplicateRecordCloning.Ignore,
+                    false);
+
+                // 원본 셀 월드 좌하단을 (0,0)으로 이동
+                Matrix3d move = Matrix3d.Displacement(
+                    new Vector3d(
+                        -scene.WorldBounds.MinPoint.X,
+                        -scene.WorldBounds.MinPoint.Y,
+                        -scene.WorldBounds.MinPoint.Z));
+
+                foreach (ObjectId id in ms)
+                {
+                    var ent = trOut.GetObject(id, OpenMode.ForWrite) as Entity;
+                    if (ent == null)
+                        continue;
+
+                    ent.TransformBy(move);
+                }
+
+                // 새 DB 기준 장식 엔티티 생성
+                AppendLocalFrame(outDb, ms, trOut, scene.LocalBounds);
+                AppendCellLabel(outDb, ms, trOut, scene.LocalBounds, row, col, uniqueIds.Count);
+                AppendOriginCross(outDb, ms, trOut, scene.LocalBounds);
+
+                trOut.Commit();
+                outDb.SaveAs(filePath, DwgVersion.Current);
+            }
+
+            ed.WriteMessage(
+                $"\n[FluxCAD] LOCAL scene exported: r{row}, c{col}, sourceCount={uniqueIds.Count}, file={filePath}");
+        }
+
+
+        private static void AppendOriginCross(
+    Database db,
+    BlockTableRecord ms,
+    Transaction tr,
+    Extents3d bounds)
+        {
+            double size = Math.Max(
+                10.0,
+                Math.Min(
+                    bounds.MaxPoint.X - bounds.MinPoint.X,
+                    bounds.MaxPoint.Y - bounds.MinPoint.Y) * 0.03);
+
+            var h = new Line(
+                new Point3d(-size, 0, 0),
+                new Point3d(size, 0, 0));
+            h.SetDatabaseDefaults(db);
+            ms.AppendEntity(h);
+            tr.AddNewlyCreatedDBObject(h, true);
+
+            var v = new Line(
+                new Point3d(0, -size, 0),
+                new Point3d(0, size, 0));
+            v.SetDatabaseDefaults(db);
+            ms.AppendEntity(v);
+            tr.AddNewlyCreatedDBObject(v, true);
+        }
+
+        private static void AppendLocalFrame(
+    Database db,
+    BlockTableRecord ms,
+    Transaction tr,
+    Extents3d bounds)
+        {
+            var min = bounds.MinPoint;
+            var max = bounds.MaxPoint;
+
+            var pl = new Polyline();
+            pl.SetDatabaseDefaults(db);
+
+            pl.AddVertexAt(0, new Point2d(min.X, min.Y), 0, 0, 0);
+            pl.AddVertexAt(1, new Point2d(max.X, min.Y), 0, 0, 0);
+            pl.AddVertexAt(2, new Point2d(max.X, max.Y), 0, 0, 0);
+            pl.AddVertexAt(3, new Point2d(min.X, max.Y), 0, 0, 0);
+            pl.Closed = true;
+
+            ms.AppendEntity(pl);
+            tr.AddNewlyCreatedDBObject(pl, true);
+        }
+
+        private static void AppendCellLabel(
+    Database db,
+    BlockTableRecord ms,
+    Transaction tr,
+    Extents3d bounds,
+    int row,
+    int col,
+    int sourceCount)
+        {
+            var pt = new Point3d(
+                bounds.MinPoint.X,
+                bounds.MaxPoint.Y + 20.0,
+                0);
+
+            var text = new DBText();
+            text.SetDatabaseDefaults(db);
+            text.Position = pt;
+            text.Height = 10.0;
+            text.TextString = $"CELL ({row},{col})  source={sourceCount}";
+
+            ms.AppendEntity(text);
+            tr.AddNewlyCreatedDBObject(text, true);
+        }
+
+        private static void ExportLocalCellScene_old(Editor ed, CellScene scene, int row, int col, string filePath)
+        {
+            using var outDb = new Database(true, true);
+            using var tr = outDb.TransactionManager.StartTransaction();
+
+            var bt = (BlockTable)tr.GetObject(outDb.BlockTableId, OpenMode.ForRead);
+            var ms = (BlockTableRecord)tr.GetObject(bt[BlockTableRecord.ModelSpace], OpenMode.ForWrite);
+
+            var geomLayerId = GetLayerId(outDb, tr, "_FLUX_CELL_GEOM");
+            var frameLayerId = GetLayerId(outDb, tr, "_FLUX_CELL_FRAME");
+            var labelLayerId = GetLayerId(outDb, tr, "_FLUX_CELL_LABEL");
+            var originLayerId = GetLayerId(outDb, tr, "_FLUX_CELL_ORIGIN");
+
+            int inspect = 0;
+            foreach (var item in scene.Entities)
+            {
+                if (item == null || item.Geometry == null)
+                    continue;
+
+                Entity clone = null;
+
+                try
+                {
+                    clone = item.Geometry.Clone() as Entity;
+                    if (clone == null)
+                        continue;
+
+                    if (inspect < 10)
+                    {
+                        ed.WriteMessage(
+                            $"\n[FluxCAD] geom inspect " +
+                            $"Type={item.Geometry.GetType().Name}, " +
+                            $"ObjectId={item.Geometry.ObjectId}, " +
+                            $"IsNullId={item.Geometry.ObjectId.IsNull}, " +
+                            $"Db={(item.Geometry.Database == null ? "null" : "attached")}");
+                        inspect++;
+                    }
+
+                    clone.SetDatabaseDefaults();
+
+                    ms.AppendEntity(clone);
+                    tr.AddNewlyCreatedDBObject(clone, true);
+
+                    clone.LayerId = geomLayerId;
+                }
+                catch (System.Exception ex)
+                {
+                    ed.WriteMessage($"\n[FluxCAD] append failed: {ex.Message}");
+                    clone?.Dispose();
+                }
+            }
+
+            // local frame
+            AppendLocalFrame_old(ms, tr, scene.LocalBounds, "_FLUX_CELL_FRAME");
+
+            // label
+            AppendCellLabel_old(ms, tr, scene.LocalBounds, row, col, scene.Entities.Count, "_FLUX_CELL_LABEL");
+
+            // origin cross
+            AppendOriginCross_old(ms, tr, scene.LocalBounds, "_FLUX_CELL_ORIGIN");
+
+            tr.Commit();
+
+            if (File.Exists(filePath))
+                File.Delete(filePath);
+
+            outDb.SaveAs(filePath, DwgVersion.Current);
+        }
+
+        private  static void AppendLocalFrame_old(
+    BlockTableRecord ms,
+    Transaction tr,
+    Extents3d bounds,
+    string layerName)
+        {
+            var min = bounds.MinPoint;
+            var max = bounds.MaxPoint;
+
+            var pl = new Polyline();
+            pl.SetDatabaseDefaults();
+            //pl.Layer = layerName;
+            pl.AddVertexAt(0, new Point2d(min.X, min.Y), 0, 0, 0);
+            pl.AddVertexAt(1, new Point2d(max.X, min.Y), 0, 0, 0);
+            pl.AddVertexAt(2, new Point2d(max.X, max.Y), 0, 0, 0);
+            pl.AddVertexAt(3, new Point2d(min.X, max.Y), 0, 0, 0);
+            pl.Closed = true;
+
+            ms.AppendEntity(pl);
+            tr.AddNewlyCreatedDBObject(pl, true);
+        }
+
+        private static  void AppendCellLabel_old(
+            BlockTableRecord ms,
+            Transaction tr,
+            Extents3d bounds,
+            int row,
+            int col,
+            int entityCount,
+            string layerName)
+        {
+            var min = bounds.MinPoint;
+            var max = bounds.MaxPoint;
+
+            double width = max.X - min.X;
+            double height = max.Y - min.Y;
+            double minDim = Math.Max(1.0, Math.Min(width, height));
+            double textHeight = Math.Max(10.0, minDim * 0.05);
+
+            var txt = new DBText();
+            txt.SetDatabaseDefaults();
+            //txt.Layer = layerName;
+            txt.Height = textHeight;
+            txt.TextString = $"CELL r{row} c{col} ents={entityCount}";
+            txt.Position = new Point3d(
+                min.X + textHeight * 0.5,
+                max.Y - textHeight * 1.5,
+                0);
+
+            ms.AppendEntity(txt);
+            tr.AddNewlyCreatedDBObject(txt, true);
+        }
+
+        private static void AppendOriginCross_old(
+            BlockTableRecord ms,
+            Transaction tr,
+            Extents3d bounds,
+            string layerName)
+        {
+            double width = bounds.MaxPoint.X - bounds.MinPoint.X;
+            double height = bounds.MaxPoint.Y - bounds.MinPoint.Y;
+            double minDim = Math.Max(1.0, Math.Min(width, height));
+            double crossSize = Math.Max(10.0, minDim * 0.06);
+
+            var h = new Line(
+                new Point3d(-crossSize, 0, 0),
+                new Point3d(crossSize, 0, 0));
+            h.SetDatabaseDefaults();
+            //h.Layer = layerName;
+
+            var v = new Line(
+                new Point3d(0, -crossSize, 0),
+                new Point3d(0, crossSize, 0));
+            v.SetDatabaseDefaults();
+            //v.Layer = layerName;
+
+            ms.AppendEntity(h);
+            tr.AddNewlyCreatedDBObject(h, true);
+
+            ms.AppendEntity(v);
+            tr.AddNewlyCreatedDBObject(v, true);
+        }
+
+        private  void EnsureLayer(Database db, Transaction tr, string layerName)
+        {
+            var lt = (LayerTable)tr.GetObject(db.LayerTableId, OpenMode.ForRead);
+
+            if (lt.Has(layerName))
+                return;
+
+            lt.UpgradeOpen();
+
+            var ltr = new LayerTableRecord
+            {
+                Name = layerName
+            };
+
+            lt.Add(ltr);
+            tr.AddNewlyCreatedDBObject(ltr, true);
+        }
 
         [CommandMethod("FLUX_EXPORT_CELL_SCENE_ONE")]
         public void ExportCellSceneOne()
@@ -152,12 +717,23 @@ namespace FluxCAD.BricsCAD.Plugin26
                         ed.WriteMessage($"\n[FluxCAD] BuildCellScene returned null for r{row} c{col}");
                         return;
                     }
+                    /*
+                    string folder = Path.Combine(
+                        Environment.GetFolderPath(Environment.SpecialFolder.Desktop),
+                        "FluxCAD_CellScene_Local");
+
+                    Directory.CreateDirectory(folder);
+
+                    string filePath = Path.Combine(folder, $"CELL_r{row}_c{col}_LOCAL.dwg");
+
+                    ExportLocalCellScene(scene, row, col, filePath);
 
                     ed.WriteMessage(
                         $"\n[FluxCAD] Scene ready: r{row} c{col}" +
                         $"\n[FluxCAD] Scene.Entities = {scene.Entities.Count}" +
                         $"\n[FluxCAD] Scene.LocalBounds Min=({scene.LocalBounds.MinPoint.X:F2},{scene.LocalBounds.MinPoint.Y:F2})" +
                         $" Max=({scene.LocalBounds.MaxPoint.X:F2},{scene.LocalBounds.MaxPoint.Y:F2})");
+                    */
 
                     string sourceDir = Path.GetDirectoryName(doc.Name);
                     if (string.IsNullOrWhiteSpace(sourceDir))

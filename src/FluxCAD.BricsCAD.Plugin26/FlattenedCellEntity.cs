@@ -10,7 +10,6 @@ namespace FluxCAD.BricsCAD.Plugin26
 {
     public class FlattenedCellEntity
     {
-        public ObjectId SourceId { get; set; }
         public string SourcePath { get; set; } = "";
         public string EntityType { get; set; } = "";
 
@@ -22,5 +21,17 @@ namespace FluxCAD.BricsCAD.Plugin26
         // BuildCellScene(normalizeToLocal: true) 이면 local 좌표로 저장됨
         // false 이면 world 좌표로 저장됨
         public Entity Geometry { get; set; }
+
+
+        // export용 핵심키
+        // "이 flatten 결과가 원래 어떤 원본 엔티티에서 나왔는가"
+        public ObjectId SourceId { get; set; }
+
+        // 분석/디버그/시각화용
+
+        public Extents3d WorldBounds { get; set; }
+        public Extents3d LocalBounds { get; set; }
+
+        public string? Role { get; set; }   // 기존에 있다면 유지
     }
 }
