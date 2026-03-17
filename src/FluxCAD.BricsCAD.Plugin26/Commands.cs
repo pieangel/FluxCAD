@@ -922,12 +922,30 @@ namespace FluxCAD.BricsCAD.Plugin26
                             $"Delta=({bucket.Wrapper.Bounds.MinPoint.X - bucket.Bounds.MinPoint.X:F2}," +
                             $"{bucket.Wrapper.Bounds.MinPoint.Y - bucket.Bounds.MinPoint.Y:F2})");
 
+                        var traceHandles = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+                            {
+                                GetRootHandle(bucket.Wrapper),
+                                "7B934"
+                            };
+
+                        var normalizeBounds = GetNormalizationBounds(bucket);
+
+                        ed.WriteMessage(
+                            $"\n    [NormalizeAnchor {bucket.Index}] " +
+                            $"Mode={CurrentNormalizeAnchorMode} " +
+                            $"SrcMin=({normalizeBounds.MinPoint.X:F2},{normalizeBounds.MinPoint.Y:F2}) " +
+                            $"WrapperMin=({bucket.Wrapper.Bounds.MinPoint.X:F2},{bucket.Wrapper.Bounds.MinPoint.Y:F2}) " +
+                            $"BucketMin=({bucket.Bounds.MinPoint.X:F2},{bucket.Bounds.MinPoint.Y:F2}) " +
+                            $"DeltaWB=({bucket.Wrapper.Bounds.MinPoint.X - bucket.Bounds.MinPoint.X:F2}," +
+                            $"{bucket.Wrapper.Bounds.MinPoint.Y - bucket.Bounds.MinPoint.Y:F2})");
+
                         ExportObjectIdsToNormalizedDwg(
-                            db,
-                            ids,
-                            bucket.Wrapper.Bounds,
-                            filePath,
-                            margin: 100.0);
+                             db,
+                             ids,
+                             normalizeBounds,
+                             filePath,
+                             margin: 100.0,
+                             ed: (r == 1 && c == 4 && bucket.Index == 10) ? ed : null);
 
                         ed.WriteMessage(
                             $"\n    [Exported Wrapper {bucket.Index}] " +
@@ -947,6 +965,54 @@ namespace FluxCAD.BricsCAD.Plugin26
                 $"readyCells={totalCellsReady}, " +
                 $"wrapperBuckets={totalBuckets}, " +
                 $"exported={totalExported}, skipped={totalSkipped}");
+        }
+
+        private static bool TryGetModelSpaceUnionExtents(
+    Transaction tr,
+    BlockTableRecord ms,
+    out Extents3d union)
+        {
+            bool hasAny = false;
+            union = default;
+
+            foreach (ObjectId id in ms)
+            {
+                var ent = tr.GetObject(id, OpenMode.ForRead) as Entity;
+                if (ent == null)
+                    continue;
+
+                if (!TryGetEntityExtents(ent, out var ext))
+                    continue;
+
+                if (!hasAny)
+                {
+                    union = ext;
+                    hasAny = true;
+                }
+                else
+                {
+                    union.AddExtents(ext);
+                }
+            }
+
+            return hasAny;
+        }
+
+        private enum NormalizeAnchorMode
+        {
+            WrapperMin,
+            BucketMin
+        }
+
+        private static readonly NormalizeAnchorMode CurrentNormalizeAnchorMode =
+            NormalizeAnchorMode.BucketMin;
+
+        private static Extents3d GetNormalizationBounds(WrapperExportBucket bucket)
+        {
+            if (CurrentNormalizeAnchorMode == NormalizeAnchorMode.BucketMin && bucket.HasBounds)
+                return bucket.Bounds;
+
+            return bucket.Wrapper.Bounds;
         }
 
         private static List<WrapperExportBucket> BuildWrapperExportBucketsForCell(
@@ -1176,11 +1242,13 @@ namespace FluxCAD.BricsCAD.Plugin26
         }
 
         private static void ExportObjectIdsToNormalizedDwg(
-            Database sourceDb,
-            ObjectIdCollection ids,
-            Extents3d sourceBounds,
-            string outputPath,
-            double margin = 100.0)
+    Database sourceDb,
+    ObjectIdCollection ids,
+    Extents3d sourceBounds,
+    string outputPath,
+    double margin = 100.0,
+    Editor? ed = null,
+    ISet<string>? traceHandles = null)
         {
             Directory.CreateDirectory(Path.GetDirectoryName(outputPath)!);
 
@@ -1207,20 +1275,124 @@ namespace FluxCAD.BricsCAD.Plugin26
                         margin - sourceBounds.MinPoint.Y,
                         0));
 
+                ed?.WriteMessage(
+                    $"\n      [NormalizeMove] " +
+                    $"SrcMin=({sourceBounds.MinPoint.X:F2},{sourceBounds.MinPoint.Y:F2}) " +
+                    $"Move=({margin - sourceBounds.MinPoint.X:F2},{margin - sourceBounds.MinPoint.Y:F2})");
+
+                // top-level source ids만 추적용으로 저장
+                var topLevelSourceIds = new HashSet<ObjectId>();
+                foreach (ObjectId id in ids)
+                    topLevelSourceIds.Add(id);
+
+                // cloned top-level entity -> source handle 매핑
+                var clonedTopLevelHandleMap = new Dictionary<ObjectId, string>();
                 foreach (IdPair pair in map)
                 {
                     if (!pair.IsCloned)
                         continue;
 
-                    var ent = newTr.GetObject(pair.Value, OpenMode.ForWrite) as Entity;
-                    ent?.TransformBy(move);
+                    if (!topLevelSourceIds.Contains(pair.Key))
+                        continue;
+
+                    clonedTopLevelHandleMap[pair.Value] = pair.Key.Handle.ToString();
+                }
+
+                // 중요:
+                // 이동은 map 전체가 아니라 newMs(최상위 엔티티)만 대상으로 한다.
+                foreach (ObjectId id in newMs)
+                {
+                    var ent = newTr.GetObject(id, OpenMode.ForWrite) as Entity;
+                    if (ent == null)
+                        continue;
+
+                    clonedTopLevelHandleMap.TryGetValue(id, out var srcHandle);
+
+                    Extents3d before = default;
+                    Extents3d after = default;
+                    bool hasBefore = TryGetEntityExtents(ent, out before);
+
+                    ent.TransformBy(move);
+
+                    bool hasAfter = TryGetEntityExtents(ent, out after);
+
+                    if (traceHandles != null &&
+                        srcHandle != null &&
+                        traceHandles.Contains(srcHandle))
+                    {
+                        ed?.WriteMessage(
+                            $"\n      [CloneTrace] Handle={srcHandle} Type={ent.GetType().Name}");
+
+                        if (hasBefore)
+                        {
+                            ed?.WriteMessage(
+                                $"\n        Before Min=({before.MinPoint.X:F2},{before.MinPoint.Y:F2}) " +
+                                $"Max=({before.MaxPoint.X:F2},{before.MaxPoint.Y:F2})");
+                        }
+
+                        if (hasAfter)
+                        {
+                            ed?.WriteMessage(
+                                $"\n        After  Min=({after.MinPoint.X:F2},{after.MinPoint.Y:F2}) " +
+                                $"Max=({after.MaxPoint.X:F2},{after.MaxPoint.Y:F2})");
+                        }
+                    }
+                }
+
+                // post-check도 newMs 최상위 엔티티만 기준으로 계산
+                double minX = double.PositiveInfinity;
+                double minY = double.PositiveInfinity;
+                double maxX = double.NegativeInfinity;
+                double maxY = double.NegativeInfinity;
+                int underMarginCount = 0;
+
+                foreach (ObjectId id in newMs)
+                {
+                    var ent = newTr.GetObject(id, OpenMode.ForRead) as Entity;
+                    if (ent == null)
+                        continue;
+
+                    if (!TryGetEntityExtents(ent, out var ext))
+                        continue;
+
+                    minX = Math.Min(minX, ext.MinPoint.X);
+                    minY = Math.Min(minY, ext.MinPoint.Y);
+                    maxX = Math.Max(maxX, ext.MaxPoint.X);
+                    maxY = Math.Max(maxY, ext.MaxPoint.Y);
+
+                    const double tol = 1e-6;
+                    if (ext.MinPoint.X < margin - tol || ext.MinPoint.Y < margin - tol)
+                    {
+                        underMarginCount++;
+
+                        string handleText = clonedTopLevelHandleMap.TryGetValue(id, out var srcHandle)
+                            ? srcHandle
+                            : ent.Handle.ToString();
+
+                        if (ed != null)
+                        {
+                            ed.WriteMessage(
+                                $"\n      [UnderMargin] Handle={handleText} " +
+                                $"Type={ent.GetType().Name} " +
+                                $"Min=({ext.MinPoint.X:F2},{ext.MinPoint.Y:F2}) " +
+                                $"Max=({ext.MaxPoint.X:F2},{ext.MaxPoint.Y:F2})");
+                        }
+                    }
+                }
+
+                if (double.IsFinite(minX))
+                {
+                    ed?.WriteMessage(
+                        $"\n      [PostNormalize] " +
+                        $"UnionMin=({minX:F2},{minY:F2}) " +
+                        $"UnionMax=({maxX:F2},{maxY:F2}) " +
+                        $"UnderMargin={underMarginCount}");
                 }
 
                 newTr.Commit();
                 newDb.SaveAs(outputPath, DwgVersion.Current);
             }
         }
-
         private static string SanitizeFileNamePart(string? value)
         {
             if (string.IsNullOrWhiteSpace(value))
