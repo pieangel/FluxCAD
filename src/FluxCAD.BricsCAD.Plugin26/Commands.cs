@@ -20,6 +20,39 @@ using Teigha.Runtime;
 
 namespace FluxCAD.BricsCAD.Plugin26
 {
+    internal sealed class CellInnerSceneAnalysis
+    {
+        public int Row { get; set; }
+        public int Col { get; set; }
+
+        public string Status { get; set; } = "";
+
+        public Extents3d CellBounds { get; set; }
+
+        public CellLocalCollectResult LocalCollect { get; set; } = new();
+
+        public List<RootUnitInfo> AcceptedRoots { get; } = new();
+
+        public bool HasAcceptedUnion { get; set; }
+        public Extents3d AcceptedUnion { get; set; }
+        public double AcceptedUnionAreaRatio { get; set; }
+
+        public double PadX { get; set; }
+        public double PadY { get; set; }
+
+        public bool HasExpandedBeforeClamp { get; set; }
+        public Extents3d ExpandedBeforeClamp { get; set; }
+
+        public bool HasInnerSceneBounds { get; set; }
+        public Extents3d InnerSceneBounds { get; set; }
+
+        public bool ClampApplied { get; set; }
+
+        public List<RootUnitInfo> ExportRoots { get; } = new();
+        public ObjectIdCollection ExportIds { get; } = new ObjectIdCollection();
+
+        public string ExportFilePath { get; set; } = "";
+    }
     public sealed class CellLocalExportResult
     {
         public List<SpatialNode> ExportNodes { get; } = new();
@@ -455,6 +488,106 @@ namespace FluxCAD.BricsCAD.Plugin26
         }
     }
 
+    internal sealed class SheetCandidate_new
+    {
+        public int Id { get; set; }
+        public List<RootUnitInfo> Members { get; } = new();
+        public Extents3d Bounds { get; set; }
+        public Point3d Center =>
+            new Point3d(
+                (Bounds.MinPoint.X + Bounds.MaxPoint.X) * 0.5,
+                (Bounds.MinPoint.Y + Bounds.MaxPoint.Y) * 0.5,
+                0);
+
+        public int LineLikeCount { get; set; }
+        public int TextLikeCount { get; set; }
+        public int BlockLikeCount { get; set; }
+
+        public double FillRatio { get; set; }
+        public double Score { get; set; }
+    }
+
+    internal sealed class SheetOwnershipResult
+    {
+        public int Row { get; set; }
+        public int Col { get; set; }
+
+        public CellInnerSceneAnalysis Cell { get; set; } = new();
+
+        public List<SheetCandidate> Candidates { get; } = new();
+        public SheetCandidate? MainSheet { get; set; }
+
+        public List<RootUnitInfo> AssignedToSheet { get; } = new();
+        public List<RootUnitInfo> OutsideSheet { get; } = new();
+
+        public ObjectIdCollection SheetExportIds { get; } = new ObjectIdCollection();
+        public string Status { get; set; } = "";
+
+    }
+
+    internal sealed class SheetCandidate
+    {
+        public int Id { get; set; }
+        public List<RootUnitInfo> Members { get; } = new();
+        public Extents3d Bounds { get; set; }
+
+        public Point3d Center =>
+            new Point3d(
+                (Bounds.MinPoint.X + Bounds.MaxPoint.X) * 0.5,
+                (Bounds.MinPoint.Y + Bounds.MaxPoint.Y) * 0.5,
+                0);
+
+        public int LineLikeCount { get; set; }
+        public int TextLikeCount { get; set; }
+        public int BlockLikeCount { get; set; }
+
+        public double AreaRatioToCell { get; set; }
+        public double FillRatioX { get; set; }
+        public double FillRatioY { get; set; }
+
+        public double Score { get; set; }
+
+
+        
+    }
+
+    internal sealed class SheetOwnershipResulta_old
+    {
+        public int Row { get; set; }
+        public int Col { get; set; }
+
+        public CellInnerSceneAnalysis Cell { get; set; } = new();
+
+        public List<SheetCandidate> Candidates { get; } = new();
+        public SheetCandidate? MainSheet { get; set; }
+
+        public List<RootUnitInfo> AssignedToSheet { get; } = new();
+        public List<RootUnitInfo> OutsideSheet { get; } = new();
+
+        public ObjectIdCollection SheetExportIds { get; } = new ObjectIdCollection();
+
+        public string Status { get; set; } = "";
+    }
+
+    internal sealed class WrapperFamilyCandidate
+    {
+        public string BlockName { get; set; } = "";
+        public List<RootUnitInfo> All { get; } = new();
+        public List<RootUnitInfo> Distinct { get; } = new();
+        public List<RootUnitInfo> NonContaining { get; } = new();
+
+        public int TotalCount => All.Count;
+        public int DistinctCount => Distinct.Count;
+        public int WrapperCount => NonContaining.Count;
+
+        public double TotalArea => All.Sum(x => x.Width * x.Height);
+        public double MinW => All.Count == 0 ? 0.0 : All.Min(x => x.Width);
+        public double MaxW => All.Count == 0 ? 0.0 : All.Max(x => x.Width);
+        public double MinH => All.Count == 0 ? 0.0 : All.Min(x => x.Height);
+        public double MaxH => All.Count == 0 ? 0.0 : All.Max(x => x.Height);
+    }
+
+    
 
     public class Commands
     {
@@ -463,6 +596,3751 @@ namespace FluxCAD.BricsCAD.Plugin26
         private const string FluxCadRegAppName = "FLUXCAD";
         private static List<double>? _cachedGridXs;
         private static List<double>? _cachedGridYs;
+
+        private sealed class WrapperExportBucket
+        {
+            public int Row { get; set; }
+            public int Col { get; set; }
+            public int Index { get; set; }
+
+            public RootUnitInfo Wrapper { get; set; } = null!;
+            public List<RootUnitInfo> Members { get; } = new();
+
+            public bool HasBounds { get; set; }
+            public Extents3d Bounds { get; set; }
+
+            public int ValidIdCount =>
+                Members.Count(x => x != null && !x.Id.IsNull && x.Id.IsValid);
+        }
+
+        private static void DumpSpecificRootTraceInExport(
+    Editor ed,
+    int row,
+    int col,
+    WrapperExportBucket currentBucket,
+    List<WrapperExportBucket> allBuckets,
+    string targetHandle)
+        {
+            // 지금은 딱 이 셀만 추적
+            if (row != 1 || col != 4)
+                return;
+
+            if (currentBucket == null || allBuckets == null || allBuckets.Count == 0)
+                return;
+
+            var target = currentBucket.Members
+                .FirstOrDefault(x =>
+                    x != null &&
+                    string.Equals(GetRootHandle(x), targetHandle, StringComparison.OrdinalIgnoreCase));
+
+            if (target == null)
+                return;
+
+            ed.WriteMessage(
+                $"\n    [TraceRoot] row={row} col={col} " +
+                $"CurrentWrapperIdx={currentBucket.Index} " +
+                $"CurrentWrapperHandle={GetRootHandle(currentBucket.Wrapper)}");
+
+            ed.WriteMessage(
+                $"\n      [Target] " +
+                $"Handle={GetRootHandle(target)} " +
+                $"Type={target.TypeName} " +
+                $"BlockName={target.BlockName ?? "<null>"} " +
+                $"Center=({target.Center.X:F2},{target.Center.Y:F2}) " +
+                $"W={target.Width:F2} H={target.Height:F2}");
+
+            ed.WriteMessage(
+                $"\n      [TargetBounds] " +
+                $"Min=({target.Bounds.MinPoint.X:F2},{target.Bounds.MinPoint.Y:F2}) " +
+                $"Max=({target.Bounds.MaxPoint.X:F2},{target.Bounds.MaxPoint.Y:F2})");
+
+            int bestIdx = -1;
+            string bestHandle = "";
+            double bestScore = double.NegativeInfinity;
+
+            foreach (var b in allBuckets)
+            {
+                var w = b.Wrapper;
+
+                bool centerIn = ContainsPoint(w.Bounds, target.Center);
+                double overlap = IntersectionAreaRatio(w.Bounds, target.Bounds);
+
+                double dx = target.Center.X - w.Center.X;
+                double dy = target.Center.Y - w.Center.Y;
+                double dist = Math.Sqrt(dx * dx + dy * dy);
+
+                double diag = Math.Sqrt(w.Width * w.Width + w.Height * w.Height);
+                if (diag < 1e-9)
+                    diag = 1.0;
+
+                double distNorm = dist / diag;
+
+                // 기존 FindBestWrapperExportBucketIndex와 동일한 점수 공식
+                bool eligible = centerIn || overlap >= 0.20;
+
+                double score = double.NegativeInfinity;
+                if (eligible)
+                {
+                    score = 0.0;
+                    score += overlap * 1000.0;
+
+                    if (centerIn)
+                        score += 100.0;
+
+                    score -= distNorm * 10.0;
+
+                    if (target.IsBlockReference)
+                        score += overlap * 100.0;
+                }
+
+                double left = w.Bounds.MinPoint.X - target.Bounds.MinPoint.X;
+                double right = target.Bounds.MaxPoint.X - w.Bounds.MaxPoint.X;
+                double bottom = w.Bounds.MinPoint.Y - target.Bounds.MinPoint.Y;
+                double top = target.Bounds.MaxPoint.Y - w.Bounds.MaxPoint.Y;
+
+                ed.WriteMessage(
+                    $"\n      [CandidateWrapper {b.Index}] " +
+                    $"Handle={GetRootHandle(w)} " +
+                    $"BlockName={w.BlockName ?? "<null>"} " +
+                    $"CenterIn={(centerIn ? "Y" : "N")} " +
+                    $"Overlap={overlap:F4} " +
+                    $"DistNorm={distNorm:F4} " +
+                    $"Eligible={(eligible ? "Y" : "N")} " +
+                    $"Score={(double.IsNegativeInfinity(score) ? "-INF" : score.ToString("F4"))} " +
+                    $"L={left:F2} R={right:F2} B={bottom:F2} T={top:F2}");
+
+                if (score > bestScore)
+                {
+                    bestScore = score;
+                    bestIdx = b.Index;
+                    bestHandle = GetRootHandle(w);
+                }
+            }
+
+            ed.WriteMessage(
+                $"\n      [TraceBest] " +
+                $"Target={targetHandle} " +
+                $"BestWrapperIdx={bestIdx} " +
+                $"BestWrapperHandle={bestHandle} " +
+                $"BestScore={(double.IsNegativeInfinity(bestScore) ? "-INF" : bestScore.ToString("F4"))}");
+        }
+
+        private static void DumpSpecificRootTraceInExport(
+            Editor ed,
+            int row,
+            int col,
+            WrapperExportBucket currentBucket,
+            List<WrapperExportBucket> allBuckets)
+        {
+            DumpSpecificRootTraceInExport(ed, row, col, currentBucket, allBuckets, "7B934");
+        }
+
+        [CommandMethod("FLUX_EXPORT_ROW_WRAPPERS")]
+        public static void FluxExportRowWrappers()
+        {
+            var doc = Application.DocumentManager.MdiActiveDocument;
+            var db = doc.Database;
+            var ed = doc.Editor;
+
+            if (_cachedGridXs == null || _cachedGridYs == null ||
+                _cachedGridXs.Count < 2 || _cachedGridYs.Count < 2)
+            {
+                ed.WriteMessage("\n[FluxCAD] Cached grid가 없습니다. 먼저 FLUX_DEBUG_GRID_CELLS를 실행하세요.");
+                return;
+            }
+
+            int rows = _cachedGridYs.Count - 1;
+            int cols = _cachedGridXs.Count - 1;
+
+            var rowOpt = new PromptIntegerOptions($"\nexport할 row 입력 (0 ~ {rows - 1})")
+            {
+                AllowNegative = false,
+                AllowZero = true,
+                AllowNone = false,
+                DefaultValue = 1
+            };
+            var rowRes = ed.GetInteger(rowOpt);
+            if (rowRes.Status != PromptStatus.OK)
+                return;
+
+            int r = rowRes.Value;
+            if (r < 0 || r >= rows)
+            {
+                ed.WriteMessage("\n[FluxCAD] row 범위가 잘못되었습니다.");
+                return;
+            }
+
+            string srcPath = !string.IsNullOrWhiteSpace(db.Filename)
+                ? db.Filename
+                : doc.Name;
+
+            string baseDir = Path.GetDirectoryName(srcPath) ?? Environment.CurrentDirectory;
+            string baseName = Path.GetFileNameWithoutExtension(srcPath);
+            if (string.IsNullOrWhiteSpace(baseName))
+                baseName = "drawing";
+
+            string exportRoot = Path.Combine(baseDir, $"{baseName}_row{r:D2}_wrappers");
+            Directory.CreateDirectory(exportRoot);
+
+            var gridBounds = new Extents3d(
+                new Point3d(_cachedGridXs.First(), _cachedGridYs.First(), 0),
+                new Point3d(_cachedGridXs.Last(), _cachedGridYs.Last(), 0));
+
+            int totalCellsReady = 0;
+            int totalBuckets = 0;
+            int totalExported = 0;
+            int totalSkipped = 0;
+
+            using (var tr = db.TransactionManager.StartTransaction())
+            {
+                var roots = CollectRootUnitsInBounds(db, tr, gridBounds);
+
+                ed.WriteMessage($"\n[FluxCAD] FLUX_EXPORT_ROW_WRAPPERS row={r} cols={cols}");
+                ed.WriteMessage($"\n[FluxCAD] Export Root Folder = {exportRoot}");
+
+                for (int c = 0; c < cols; c++)
+                {
+                    var cell = AnalyzeCellInnerScene(roots, r, c);
+
+                    ed.WriteMessage($"\n[ExportCell] row={r} col={c} status={cell.Status}");
+
+                    if (cell.Status != "READY")
+                    {
+                        ed.WriteMessage("\n  skipped: cell not ready.");
+                        totalSkipped++;
+                        continue;
+                    }
+
+                    totalCellsReady++;
+
+                    var buckets = BuildWrapperExportBucketsForCell(
+                        roots,
+                        cell,
+                        r,
+                        c,
+                        out int unassignedCount);
+
+                    ed.WriteMessage(
+                        $"\n  exportRoots={cell.ExportRoots.Count} " +
+                        $"wrapperBuckets={buckets.Count} " +
+                        $"unassigned={unassignedCount}");
+
+                    if (buckets.Count == 0)
+                    {
+                        ed.WriteMessage("\n  skipped: no wrapper buckets.");
+                        totalSkipped++;
+                        continue;
+                    }
+
+                    string cellDir = Path.Combine(exportRoot, $"r{r:D2}_c{c:D2}");
+                    Directory.CreateDirectory(cellDir);
+
+                    totalBuckets += buckets.Count;
+
+                    foreach (var bucket in buckets)
+                    {
+                        if (!bucket.HasBounds)
+                        {
+                            ed.WriteMessage(
+                                $"\n    [Skip Wrapper {bucket.Index}] no bounds. " +
+                                $"Handle={GetRootHandle(bucket.Wrapper)}");
+                            totalSkipped++;
+                            continue;
+                        }
+
+                        var ids = CollectDistinctObjectIds(bucket.Members);
+
+                        if (ids.Count == 0)
+                        {
+                            ed.WriteMessage(
+                                $"\n    [Skip Wrapper {bucket.Index}] no valid object ids. " +
+                                $"Handle={GetRootHandle(bucket.Wrapper)}");
+                            totalSkipped++;
+                            continue;
+                        }
+
+                        // 여기에 추가
+                        DumpSpecificRootTraceInExport(ed, r, c, bucket, buckets);
+
+                        string blockName = SanitizeFileNamePart(bucket.Wrapper.BlockName);
+                        if (string.IsNullOrWhiteSpace(blockName))
+                            blockName = "wrapper";
+
+                        // 문제 bucket만 보고 싶으면 이렇게 제한
+                        if (r == 1 && c == 4 && bucket.Index == 10)
+                        {
+                            var wb = bucket.Wrapper.Bounds;
+
+                            ed.WriteMessage(
+                                $"\n    [WrapperOverflow {bucket.Index}] " +
+                                $"WrapperHandle={GetRootHandle(bucket.Wrapper)} " +
+                                $"Members={bucket.Members.Count}");
+
+                            foreach (var m in bucket.Members)
+                            {
+                                if (m == null)
+                                    continue;
+
+                                double left = wb.MinPoint.X - m.Bounds.MinPoint.X;
+                                double right = m.Bounds.MaxPoint.X - wb.MaxPoint.X;
+                                double bottom = wb.MinPoint.Y - m.Bounds.MinPoint.Y;
+                                double top = m.Bounds.MaxPoint.Y - wb.MaxPoint.Y;
+
+                                // tolerance는 필요에 따라 조정
+                                const double tol = 50.0;
+
+                                if (left > tol || right > tol || bottom > tol || top > tol)
+                                {
+                                    ed.WriteMessage(
+                                        $"\n      [Outlier] " +
+                                        $"Handle={GetRootHandle(m)} " +
+                                        $"Type={m.TypeName} " +
+                                        $"L={left:F2} R={right:F2} B={bottom:F2} T={top:F2} " +
+                                        $"Min=({m.Bounds.MinPoint.X:F2},{m.Bounds.MinPoint.Y:F2}) " +
+                                        $"Max=({m.Bounds.MaxPoint.X:F2},{m.Bounds.MaxPoint.Y:F2})");
+                                }
+                            }
+                        }
+
+                        blockName = SanitizeFileNamePart(bucket.Wrapper.BlockName);
+                        if (string.IsNullOrWhiteSpace(blockName))
+                            blockName = "wrapper";
+
+                        string handle = SanitizeFileNamePart(GetRootHandle(bucket.Wrapper));
+                        if (string.IsNullOrWhiteSpace(handle))
+                            handle = $"w{bucket.Index:D2}";
+
+                        string fileName =
+                            $"r{r:D2}_c{c:D2}_w{bucket.Index:D2}_{blockName}_{handle}.dwg";
+
+                        string filePath = Path.Combine(cellDir, fileName);
+
+                        ed.WriteMessage(
+                            $"\n    [NormalizeAnchor {bucket.Index}] " +
+                            $"WrapperMin=({bucket.Wrapper.Bounds.MinPoint.X:F2},{bucket.Wrapper.Bounds.MinPoint.Y:F2}) " +
+                            $"BucketMin=({bucket.Bounds.MinPoint.X:F2},{bucket.Bounds.MinPoint.Y:F2}) " +
+                            $"Delta=({bucket.Wrapper.Bounds.MinPoint.X - bucket.Bounds.MinPoint.X:F2}," +
+                            $"{bucket.Wrapper.Bounds.MinPoint.Y - bucket.Bounds.MinPoint.Y:F2})");
+
+                        ExportObjectIdsToNormalizedDwg(
+                            db,
+                            ids,
+                            bucket.Wrapper.Bounds,
+                            filePath,
+                            margin: 100.0);
+
+                        ed.WriteMessage(
+                            $"\n    [Exported Wrapper {bucket.Index}] " +
+                            $"Handle={GetRootHandle(bucket.Wrapper)} " +
+                            $"Members={bucket.Members.Count} Ids={ids.Count} " +
+                            $"File={fileName}");
+
+                        totalExported++;
+                    }
+                }
+
+                tr.Commit();
+            }
+
+            ed.WriteMessage(
+                $"\n[FluxCAD] Export Done. " +
+                $"readyCells={totalCellsReady}, " +
+                $"wrapperBuckets={totalBuckets}, " +
+                $"exported={totalExported}, skipped={totalSkipped}");
+        }
+
+        private static List<WrapperExportBucket> BuildWrapperExportBucketsForCell(
+            IReadOnlyList<RootUnitInfo> roots,
+            CellInnerSceneAnalysis cell,
+            int row,
+            int col,
+            out int unassignedCount)
+        {
+            unassignedCount = 0;
+
+            if (cell == null || cell.Status != "READY")
+                return new List<WrapperExportBucket>();
+
+            var looseBlocks = CollectWrapperBlocksLoose(roots, cell.CellBounds)
+                .OrderByDescending(x => x.Center.Y)
+                .ThenBy(x => x.Center.X)
+                .ToList();
+
+            var mergedWrappers = SelectWrapperBlocksByMultiFamily(
+                looseBlocks,
+                out var _);
+
+            if (mergedWrappers.Count == 0)
+                return new List<WrapperExportBucket>();
+
+            var buckets = mergedWrappers
+                .OrderByDescending(x => x.Center.Y)
+                .ThenBy(x => x.Center.X)
+                .Select((w, i) => new WrapperExportBucket
+                {
+                    Row = row,
+                    Col = col,
+                    Index = i + 1,
+                    Wrapper = w
+                })
+                .ToList();
+
+            foreach (var root in cell.ExportRoots)
+            {
+                int bucketIndex = FindBestWrapperExportBucketIndex(root, buckets);
+
+                if (bucketIndex >= 0)
+                    buckets[bucketIndex].Members.Add(root);
+                else
+                    unassignedCount++;
+            }
+
+            foreach (var b in buckets)
+            {
+                // 1. wrapper 자신을 반드시 넣는다
+                if (!b.Members.Any(x => SameRootForExport(x, b.Wrapper)))
+                    b.Members.Insert(0, b.Wrapper);
+
+                // 2. 중복 제거
+                var distinct = new List<RootUnitInfo>();
+                var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+                foreach (var m in b.Members)
+                {
+                    string key = GetRootHandle(m);
+                    if (string.IsNullOrWhiteSpace(key))
+                        key = m.Id.ToString();
+
+                    if (seen.Add(key))
+                        distinct.Add(m);
+                }
+
+                b.Members.Clear();
+                b.Members.AddRange(distinct);
+
+                // 3. bounds 재계산
+                if (TryUnionRootBounds(b.Members, out var union))
+                {
+                    b.HasBounds = true;
+                    b.Bounds = union;
+                }
+                else
+                {
+                    b.HasBounds = false;
+                }
+            }
+
+            return buckets;
+        }
+
+        private static int FindBestWrapperExportBucketIndex(
+            RootUnitInfo root,
+            List<WrapperExportBucket> buckets)
+        {
+            if (root == null || buckets == null || buckets.Count == 0)
+                return -1;
+
+            // wrapper 자신이면 자기 bucket
+            for (int i = 0; i < buckets.Count; i++)
+            {
+                if (SameRootForExport(root, buckets[i].Wrapper))
+                    return i;
+            }
+
+            int bestIndex = -1;
+            double bestScore = double.NegativeInfinity;
+
+            for (int i = 0; i < buckets.Count; i++)
+            {
+                var w = buckets[i].Wrapper;
+
+                bool centerIn = ContainsPoint(w.Bounds, root.Center);
+                double overlap = IntersectionAreaRatio(w.Bounds, root.Bounds);
+
+                if (!centerIn && overlap < 0.20)
+                    continue;
+
+                double dx = root.Center.X - w.Center.X;
+                double dy = root.Center.Y - w.Center.Y;
+                double dist = Math.Sqrt(dx * dx + dy * dy);
+
+                double diag = Math.Sqrt(w.Width * w.Width + w.Height * w.Height);
+                if (diag < 1e-9)
+                    diag = 1.0;
+
+                double distNorm = dist / diag;
+
+                double score = 0.0;
+                score += overlap * 1000.0;
+
+                if (centerIn)
+                    score += 100.0;
+
+                score -= distNorm * 10.0;
+
+                if (root.IsBlockReference)
+                    score += overlap * 100.0;
+
+                if (score > bestScore)
+                {
+                    bestScore = score;
+                    bestIndex = i;
+                }
+            }
+
+            return bestIndex;
+        }
+
+        private static bool SameRootForExport(RootUnitInfo a, RootUnitInfo b)
+        {
+            if (a == null || b == null)
+                return false;
+
+            if (!a.Id.IsNull && !b.Id.IsNull && a.Id == b.Id)
+                return true;
+
+            string ha = GetRootHandle(a);
+            string hb = GetRootHandle(b);
+
+            return !string.IsNullOrWhiteSpace(ha) &&
+                   !string.IsNullOrWhiteSpace(hb) &&
+                   string.Equals(ha, hb, StringComparison.OrdinalIgnoreCase);
+        }
+
+        private static ObjectIdCollection CollectDistinctObjectIds(
+            IEnumerable<RootUnitInfo> members)
+        {
+            var ids = new ObjectIdCollection();
+            var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+            if (members == null)
+                return ids;
+
+            foreach (var m in members)
+            {
+                if (m == null)
+                    continue;
+
+                if (m.Id.IsNull || !m.Id.IsValid)
+                    continue;
+
+                string key = GetRootHandle(m);
+                if (string.IsNullOrWhiteSpace(key))
+                    key = m.Id.Handle.ToString();
+
+                if (!seen.Add(key))
+                    continue;
+
+                ids.Add(m.Id);
+            }
+
+            return ids;
+        }
+
+        private static bool TryUnionRootBounds(
+            IEnumerable<RootUnitInfo> members,
+            out Extents3d union)
+        {
+            union = default;
+            bool hasAny = false;
+
+            if (members == null)
+                return false;
+
+            foreach (var m in members)
+            {
+                if (m == null)
+                    continue;
+
+                var e = m.Bounds;
+
+                if (!hasAny)
+                {
+                    union = e;
+                    hasAny = true;
+                    continue;
+                }
+
+                union = new Extents3d(
+                    new Point3d(
+                        Math.Min(union.MinPoint.X, e.MinPoint.X),
+                        Math.Min(union.MinPoint.Y, e.MinPoint.Y),
+                        Math.Min(union.MinPoint.Z, e.MinPoint.Z)),
+                    new Point3d(
+                        Math.Max(union.MaxPoint.X, e.MaxPoint.X),
+                        Math.Max(union.MaxPoint.Y, e.MaxPoint.Y),
+                        Math.Max(union.MaxPoint.Z, e.MaxPoint.Z)));
+            }
+
+            return hasAny;
+        }
+
+        private static void ExportObjectIdsToNormalizedDwg(
+            Database sourceDb,
+            ObjectIdCollection ids,
+            Extents3d sourceBounds,
+            string outputPath,
+            double margin = 100.0)
+        {
+            Directory.CreateDirectory(Path.GetDirectoryName(outputPath)!);
+
+            using (var newDb = new Database(true, true))
+            using (var newTr = newDb.TransactionManager.StartTransaction())
+            {
+                var bt = (BlockTable)newTr.GetObject(newDb.BlockTableId, OpenMode.ForRead);
+                var newMs = (BlockTableRecord)newTr.GetObject(
+                    bt[BlockTableRecord.ModelSpace],
+                    OpenMode.ForWrite);
+
+                var map = new IdMapping();
+
+                sourceDb.WblockCloneObjects(
+                    ids,
+                    newMs.ObjectId,
+                    map,
+                    DuplicateRecordCloning.Ignore,
+                    false);
+
+                var move = Matrix3d.Displacement(
+                    new Vector3d(
+                        margin - sourceBounds.MinPoint.X,
+                        margin - sourceBounds.MinPoint.Y,
+                        0));
+
+                foreach (IdPair pair in map)
+                {
+                    if (!pair.IsCloned)
+                        continue;
+
+                    var ent = newTr.GetObject(pair.Value, OpenMode.ForWrite) as Entity;
+                    ent?.TransformBy(move);
+                }
+
+                newTr.Commit();
+                newDb.SaveAs(outputPath, DwgVersion.Current);
+            }
+        }
+
+        private static string SanitizeFileNamePart(string? value)
+        {
+            if (string.IsNullOrWhiteSpace(value))
+                return "";
+
+            string s = value.Trim();
+
+            foreach (char ch in Path.GetInvalidFileNameChars())
+                s = s.Replace(ch, '_');
+
+            s = s.Replace(' ', '_');
+
+            while (s.Contains("__"))
+                s = s.Replace("__", "_");
+
+            if (s.Length > 80)
+                s = s.Substring(0, 80);
+
+            return s.Trim('_');
+        }
+
+        private sealed class WrapperOwnershipBucket
+        {
+            public int Index { get; set; }
+            public RootUnitInfo Wrapper { get; set; } = null!;
+            public List<RootUnitInfo> Members { get; } = new();
+
+            public int TotalAssigned =>
+                Members.Count;
+
+            public int TextCount =>
+                Members.Count(x => !SameRoot(x, Wrapper) && IsTextLike(x));
+
+            public int DimensionCount =>
+                Members.Count(x => !SameRoot(x, Wrapper) && IsDimensionLike(x));
+
+            public int NestedBlockCount =>
+                Members.Count(x => !SameRoot(x, Wrapper) && x.IsBlockReference);
+
+            public int PrimitiveCount =>
+                Members.Count(x =>
+                    !SameRoot(x, Wrapper) &&
+                    !x.IsBlockReference &&
+                    !IsTextLike(x) &&
+                    !IsDimensionLike(x));
+        }
+
+        [CommandMethod("FLUX_DEBUG_ROW_WRAPPER_OWNERSHIP")]
+        public static void FluxDebugRowWrapperOwnership()
+        {
+            var doc = Application.DocumentManager.MdiActiveDocument;
+            var db = doc.Database;
+            var ed = doc.Editor;
+
+            if (_cachedGridXs == null || _cachedGridYs == null ||
+                _cachedGridXs.Count < 2 || _cachedGridYs.Count < 2)
+            {
+                ed.WriteMessage("\n[FluxCAD] Cached grid가 없습니다. 먼저 FLUX_DEBUG_GRID_CELLS를 실행하세요.");
+                return;
+            }
+
+            int rows = _cachedGridYs.Count - 1;
+            int cols = _cachedGridXs.Count - 1;
+
+            var rowOpt = new PromptIntegerOptions($"\nrow 입력 (0 ~ {rows - 1})")
+            {
+                AllowNegative = false,
+                AllowZero = true,
+                AllowNone = false,
+                DefaultValue = 1
+            };
+            var rowRes = ed.GetInteger(rowOpt);
+            if (rowRes.Status != PromptStatus.OK)
+                return;
+
+            int r = rowRes.Value;
+            if (r < 0 || r >= rows)
+            {
+                ed.WriteMessage("\n[FluxCAD] row 범위가 잘못되었습니다.");
+                return;
+            }
+
+            var gridBounds = new Extents3d(
+                new Point3d(_cachedGridXs.First(), _cachedGridYs.First(), 0),
+                new Point3d(_cachedGridXs.Last(), _cachedGridYs.Last(), 0));
+
+            using (var tr = db.TransactionManager.StartTransaction())
+            {
+                var roots = CollectRootUnitsInBounds(db, tr, gridBounds);
+
+                ed.WriteMessage($"\n[FluxCAD] FLUX_DEBUG_ROW_WRAPPER_OWNERSHIP row={r} cols={cols}");
+
+                for (int c = 0; c < cols; c++)
+                {
+                    var cell = AnalyzeCellInnerScene(roots, r, c);
+
+                    ed.WriteMessage($"\n[WrapperOwnership] row={r} col={c} cellStatus={cell.Status}");
+
+                    if (cell.Status != "READY")
+                    {
+                        ed.WriteMessage("\n  cell not ready.");
+                        continue;
+                    }
+
+                    var looseBlocks = CollectWrapperBlocksLoose(roots, cell.CellBounds)
+                        .OrderByDescending(x => x.Center.Y)
+                        .ThenBy(x => x.Center.X)
+                        .ToList();
+
+                    var mergedWrappers = SelectWrapperBlocksByMultiFamily(
+                        looseBlocks,
+                        out var selectedFamilies);
+
+                    ed.WriteMessage(
+                        $"\n  exportRoots={cell.ExportRoots.Count} " +
+                        $"looseBlocks={looseBlocks.Count} " +
+                        $"selectedFamilies={selectedFamilies.Count} " +
+                        $"mergedWrappers={mergedWrappers.Count}");
+
+                    if (selectedFamilies.Count > 0)
+                    {
+                        int fidx = 1;
+                        foreach (var f in selectedFamilies)
+                        {
+                            ed.WriteMessage(
+                                $"\n    [Family {fidx++}] " +
+                                $"Name={f.BlockName} " +
+                                $"distinct={f.DistinctCount} total={f.TotalCount} " +
+                                $"avgAspect={f.AvgAspect:F3} " +
+                                $"sizeRange=({f.MinW:F0}~{f.MaxW:F0}) x ({f.MinH:F0}~{f.MaxH:F0})");
+                        }
+                    }
+
+                    if (mergedWrappers.Count == 0)
+                    {
+                        ed.WriteMessage("\n  no merged wrappers.");
+                        continue;
+                    }
+
+                    var buckets = mergedWrappers
+                        .OrderByDescending(x => x.Center.Y)
+                        .ThenBy(x => x.Center.X)
+                        .Select((w, i) => new WrapperOwnershipBucket
+                        {
+                            Index = i + 1,
+                            Wrapper = w
+                        })
+                        .ToList();
+
+                    var unassigned = new List<RootUnitInfo>();
+
+                    foreach (var root in cell.ExportRoots)
+                    {
+                        int bucketIndex = FindBestWrapperBucketIndex(root, buckets);
+
+                        if (bucketIndex >= 0)
+                            buckets[bucketIndex].Members.Add(root);
+                        else
+                            unassigned.Add(root);
+                    }
+
+                    foreach (var b in buckets)
+                    {
+                        var w = b.Wrapper;
+
+                        ed.WriteMessage(
+                            $"\n    [Wrapper {b.Index}] " +
+                            $"Handle={GetRootHandle(w)} " +
+                            $"BlockName={w.BlockName ?? "<null>"} " +
+                            $"W={w.Width:F2} H={w.Height:F2}");
+
+                        ed.WriteMessage(
+                            $"\n      Bounds Min=({w.Bounds.MinPoint.X:F2},{w.Bounds.MinPoint.Y:F2}) " +
+                            $"Max=({w.Bounds.MaxPoint.X:F2},{w.Bounds.MaxPoint.Y:F2}) " +
+                            $"Center=({w.Center.X:F2},{w.Center.Y:F2})");
+
+                        ed.WriteMessage(
+                            $"\n      Assigned={b.TotalAssigned} " +
+                            $"Primitive={b.PrimitiveCount} " +
+                            $"Text={b.TextCount} " +
+                            $"Dimension={b.DimensionCount} " +
+                            $"NestedBlock={b.NestedBlockCount}");
+
+                        var previewTexts = b.Members
+                            .Where(x => !SameRoot(x, w))
+                            .Where(IsTextLike)
+                            .OrderByDescending(x => x.Center.Y)
+                            .ThenBy(x => x.Center.X)
+                            .Take(5)
+                            .ToList();
+
+                        int tidx = 1;
+                        foreach (var t in previewTexts)
+                        {
+                            ed.WriteMessage(
+                                $"\n        [Text {tidx++}] " +
+                                $"Handle={GetRootHandle(t)} " +
+                                $"Type={t.TypeName} " +
+                                $"Center=({t.Center.X:F2},{t.Center.Y:F2}) " +
+                                $"W={t.Width:F2} H={t.Height:F2}");
+                        }
+
+                        var previewBlocks = b.Members
+                            .Where(x => !SameRoot(x, w))
+                            .Where(x => x.IsBlockReference)
+                            .OrderByDescending(x => x.Center.Y)
+                            .ThenBy(x => x.Center.X)
+                            .Take(5)
+                            .ToList();
+
+                        int bidx = 1;
+                        foreach (var nb in previewBlocks)
+                        {
+                            ed.WriteMessage(
+                                $"\n        [NestedBlock {bidx++}] " +
+                                $"Handle={GetRootHandle(nb)} " +
+                                $"BlockName={nb.BlockName ?? "<null>"} " +
+                                $"Center=({nb.Center.X:F2},{nb.Center.Y:F2}) " +
+                                $"W={nb.Width:F2} H={nb.Height:F2}");
+                        }
+                    }
+
+                    ed.WriteMessage($"\n  unassigned={unassigned.Count}");
+
+                    int uidx = 1;
+                    foreach (var u in unassigned
+                        .OrderByDescending(x => x.Center.Y)
+                        .ThenBy(x => x.Center.X)
+                        .Take(12))
+                    {
+                        ed.WriteMessage(
+                            $"\n    [Unassigned {uidx++}] " +
+                            $"Handle={GetRootHandle(u)} " +
+                            $"Type={u.TypeName} " +
+                            $"BlockName={u.BlockName ?? "<null>"} " +
+                            $"Center=({u.Center.X:F2},{u.Center.Y:F2}) " +
+                            $"W={u.Width:F2} H={u.Height:F2}");
+                    }
+                }
+
+                tr.Commit();
+            }
+        }
+
+        private static int FindBestWrapperBucketIndex(
+            RootUnitInfo root,
+            List<WrapperOwnershipBucket> buckets)
+        {
+            if (buckets == null || buckets.Count == 0)
+                return -1;
+
+            // wrapper 자기 자신은 무조건 자기 bucket
+            for (int i = 0; i < buckets.Count; i++)
+            {
+                if (SameRoot(root, buckets[i].Wrapper))
+                    return i;
+            }
+
+            int bestIndex = -1;
+            double bestScore = double.NegativeInfinity;
+
+            for (int i = 0; i < buckets.Count; i++)
+            {
+                var w = buckets[i].Wrapper;
+
+                bool centerIn = ContainsPoint(w.Bounds, root.Center);
+                double overlap = IntersectionAreaRatio(w.Bounds, root.Bounds);
+
+                // center도 안 들어가고 overlap도 너무 낮으면 후보 제외
+                if (!centerIn && overlap < 0.20)
+                    continue;
+
+                double dx = root.Center.X - w.Center.X;
+                double dy = root.Center.Y - w.Center.Y;
+                double dist = Math.Sqrt(dx * dx + dy * dy);
+
+                double diag = Math.Sqrt(w.Width * w.Width + w.Height * w.Height);
+                if (diag < 1e-9)
+                    diag = 1.0;
+
+                double distNorm = dist / diag;
+
+                double score = 0.0;
+                score += overlap * 1000.0;
+                if (centerIn)
+                    score += 100.0;
+
+                // wrapper 안쪽에 깊숙할수록 약간 가점
+                score -= distNorm * 10.0;
+
+                // block는 overlap을 더 중시
+                if (root.IsBlockReference)
+                    score += overlap * 100.0;
+
+                if (score > bestScore)
+                {
+                    bestScore = score;
+                    bestIndex = i;
+                }
+            }
+
+            return bestIndex;
+        }
+
+        private static bool SameRoot(RootUnitInfo a, RootUnitInfo b)
+        {
+            if (a == null || b == null)
+                return false;
+
+            if (!a.Id.IsNull && !b.Id.IsNull && a.Id == b.Id)
+                return true;
+
+            string ha = GetRootHandle(a);
+            string hb = GetRootHandle(b);
+
+            return !string.IsNullOrWhiteSpace(ha) &&
+                   !string.IsNullOrWhiteSpace(hb) &&
+                   string.Equals(ha, hb, StringComparison.OrdinalIgnoreCase);
+        }
+
+        private static bool IsDimensionLike(RootUnitInfo r)
+        {
+            if (r == null || string.IsNullOrWhiteSpace(r.TypeName))
+                return false;
+
+            return r.TypeName.EndsWith("Dimension", StringComparison.OrdinalIgnoreCase);
+        }
+
+        [CommandMethod("FLUX_DEBUG_ROW_WRAPPER_COUNTS_LOOSE")]
+        public static void FluxDebugRowWrapperCountsLoose()
+        {
+            var doc = Application.DocumentManager.MdiActiveDocument;
+            var db = doc.Database;
+            var ed = doc.Editor;
+
+            if (_cachedGridXs == null || _cachedGridYs == null ||
+                _cachedGridXs.Count < 2 || _cachedGridYs.Count < 2)
+            {
+                ed.WriteMessage("\n[FluxCAD] Cached grid가 없습니다. 먼저 FLUX_DEBUG_GRID_CELLS를 실행하세요.");
+                return;
+            }
+
+            int rows = _cachedGridYs.Count - 1;
+            int cols = _cachedGridXs.Count - 1;
+
+            var rowOpt = new PromptIntegerOptions($"\nrow 입력 (0 ~ {rows - 1})")
+            {
+                AllowNegative = false,
+                AllowZero = true,
+                AllowNone = false,
+                DefaultValue = 1
+            };
+            var rowRes = ed.GetInteger(rowOpt);
+            if (rowRes.Status != PromptStatus.OK)
+                return;
+
+            int r = rowRes.Value;
+            if (r < 0 || r >= rows)
+            {
+                ed.WriteMessage("\n[FluxCAD] row 범위가 잘못되었습니다.");
+                return;
+            }
+
+            var gridBounds = new Extents3d(
+                new Point3d(_cachedGridXs.First(), _cachedGridYs.First(), 0),
+                new Point3d(_cachedGridXs.Last(), _cachedGridYs.Last(), 0));
+
+            using (var tr = db.TransactionManager.StartTransaction())
+            {
+                var roots = CollectRootUnitsInBounds(db, tr, gridBounds);
+
+                ed.WriteMessage($"\n[FluxCAD] FLUX_DEBUG_ROW_WRAPPER_COUNTS_LOOSE row={r} cols={cols}");
+
+                for (int c = 0; c < cols; c++)
+                {
+                    var cellBounds = GetCachedCellBoundsRaw(r, c);
+
+                    // strict pass
+                    var strictLocal = CellLocalCollector.CollectHandles(
+                        roots,
+                        cellBounds,
+                        x => x.Bounds,
+                        x => GetRootHandle(x),
+                        x => x.IsPartition,
+                        x => x.IsBlockReference
+                    );
+
+                    var strictHandleSet = new HashSet<string>(
+                        strictLocal.Handles.Where(h => !string.IsNullOrWhiteSpace(h)),
+                        StringComparer.OrdinalIgnoreCase);
+
+                    var strictBlocks = roots
+                        .Where(x => strictHandleSet.Contains(GetRootHandle(x)))
+                        .Where(x => x.IsBlockReference)
+                        .OrderByDescending(x => x.Center.Y)
+                        .ThenBy(x => x.Center.X)
+                        .ToList();
+
+                    var strictFamilies = BuildLooseWrapperFamiliesForCell(strictBlocks);
+                    var strictTop = strictFamilies.FirstOrDefault();
+
+                    // loose pass
+                    var looseBlocks = CollectWrapperBlocksLoose(roots, cellBounds)
+                        .OrderByDescending(x => x.Center.Y)
+                        .ThenBy(x => x.Center.X)
+                        .ToList();
+
+                    var mergedLooseWrappers = SelectWrapperBlocksByMultiFamily(
+                        looseBlocks,
+                        out var selectedFamilies);
+
+                    ed.WriteMessage($"\n[WrapperCompare] row={r} col={c}");
+
+                    ed.WriteMessage(
+                        $"\n  strict blocks={strictBlocks.Count} " +
+                        $"strict dominant={(strictTop?.BlockName ?? "<none>")} " +
+                        $"strict wrappers={(strictTop?.DistinctCount ?? 0)}");
+
+                    ed.WriteMessage(
+                        $"\n  loose blocks={looseBlocks.Count} " +
+                        $"selected families={selectedFamilies.Count} " +
+                        $"merged wrappers={mergedLooseWrappers.Count}");
+
+                    if (selectedFamilies.Count > 0)
+                    {
+                        int fidx = 1;
+                        foreach (var f in selectedFamilies)
+                        {
+                            ed.WriteMessage(
+                                $"\n    [SelectedFamily {fidx++}] " +
+                                $"Name={f.BlockName} " +
+                                $"distinct={f.DistinctCount} total={f.TotalCount} " +
+                                $"avgAspect={f.AvgAspect:F3} " +
+                                $"sizeRange=({f.MinW:F0}~{f.MaxW:F0}) x ({f.MinH:F0}~{f.MaxH:F0})");
+                        }
+                    }
+
+                    int idx = 1;
+                    foreach (var w in mergedLooseWrappers)
+                    {
+                        ed.WriteMessage(
+                            $"\n    [MergedWrapper {idx++}] " +
+                            $"Handle={GetRootHandle(w)} " +
+                            $"BlockName={w.BlockName ?? "<null>"} " +
+                            $"W={w.Width:F2} H={w.Height:F2} " +
+                            $"Center=({w.Center.X:F2},{w.Center.Y:F2}) " +
+                            $"Min=({w.Bounds.MinPoint.X:F2},{w.Bounds.MinPoint.Y:F2}) " +
+                            $"Max=({w.Bounds.MaxPoint.X:F2},{w.Bounds.MaxPoint.Y:F2})");
+                    }
+                }
+
+                tr.Commit();
+            }
+        }
+
+
+
+        private sealed class WrapperFamilyPick
+        {
+            public string BlockName { get; set; } = "";
+            public List<RootUnitInfo> All { get; } = new();
+            public List<RootUnitInfo> Distinct { get; } = new();
+
+            public int TotalCount => All.Count;
+            public int DistinctCount => Distinct.Count;
+
+            public double AvgAspect { get; set; }
+            public double MinW { get; set; }
+            public double MaxW { get; set; }
+            public double MinH { get; set; }
+            public double MaxH { get; set; }
+            public double TotalArea { get; set; }
+        }
+
+        private static bool IsSheetLikeAspectOnly(
+    WrapperFamilyPick family,
+    double dominantAspect,
+    double aspectTolerance = 0.25)
+        {
+            if (family == null)
+                return false;
+
+            double aspect = family.AvgAspect;
+            if (aspect <= 0.0)
+                return false;
+
+            // title / banner 류 제외
+            if (aspect < 0.90 || aspect > 2.10)
+                return false;
+
+            if (Math.Abs(aspect - dominantAspect) > aspectTolerance)
+                return false;
+
+            return true;
+        }
+
+        private static bool IsSingletonWrapperNearSmallEnd(
+            WrapperFamilyPick family,
+            List<WrapperFamilyPick> selectedFamilies,
+            double minRatio = 0.75,
+            double maxRatio = 1.10)
+        {
+            if (family == null || family.DistinctCount != 1)
+                return false;
+
+            if (selectedFamilies == null || selectedFamilies.Count == 0)
+                return false;
+
+            var selectedWrappers = selectedFamilies
+                .SelectMany(f => f.Distinct)
+                .OrderBy(x => x.Width * x.Height)
+                .ToList();
+
+            if (selectedWrappers.Count == 0)
+                return false;
+
+            // 현재 선택된 wrapper 중 가장 작은 것 기준
+            var smallest = selectedWrappers[0];
+            var single = family.Distinct[0];
+
+            double wr = smallest.Width <= 1e-9 ? 0.0 : single.Width / smallest.Width;
+            double hr = smallest.Height <= 1e-9 ? 0.0 : single.Height / smallest.Height;
+
+            if (wr < minRatio || wr > maxRatio)
+                return false;
+
+            if (hr < minRatio || hr > maxRatio)
+                return false;
+
+            return true;
+        }
+
+        private static double AspectOf(RootUnitInfo x)
+        {
+            return x.Height <= 1e-9 ? 0.0 : x.Width / x.Height;
+        }
+
+        private static List<WrapperFamilyPick> BuildLooseWrapperFamiliesForCell(
+            List<RootUnitInfo> blocks)
+        {
+            if (blocks == null || blocks.Count == 0)
+                return new List<WrapperFamilyPick>();
+
+            var families = blocks
+                .GroupBy(x => string.IsNullOrWhiteSpace(x.BlockName) ? "<null>" : x.BlockName!)
+                .Select(g =>
+                {
+                    var all = g
+                        .OrderByDescending(x => x.Center.Y)
+                        .ThenBy(x => x.Center.X)
+                        .ToList();
+
+                    var distinct = BlockFamilyKeepDistinctInstances(all);
+
+                    var f = new WrapperFamilyPick
+                    {
+                        BlockName = g.Key,
+                        AvgAspect = distinct.Count == 0 ? 0.0 : distinct.Average(AspectOf),
+                        MinW = all.Min(x => x.Width),
+                        MaxW = all.Max(x => x.Width),
+                        MinH = all.Min(x => x.Height),
+                        MaxH = all.Max(x => x.Height),
+                        TotalArea = all.Sum(x => x.Width * x.Height)
+                    };
+
+                    foreach (var x in all)
+                        f.All.Add(x);
+
+                    foreach (var x in distinct)
+                        f.Distinct.Add(x);
+
+                    return f;
+                })
+                .OrderByDescending(x => x.DistinctCount)
+                .ThenByDescending(x => x.TotalCount)
+                .ThenByDescending(x => x.TotalArea)
+                .ToList();
+
+            return families;
+        }
+
+        private static bool IsSheetLikeMergedFamily(
+            WrapperFamilyPick family,
+            double dominantAspect,
+            int minDistinctCount = 2,
+            double aspectTolerance = 0.25)
+        {
+            if (family == null)
+                return false;
+
+            if (family.DistinctCount < minDistinctCount)
+                return false;
+
+            double aspect = family.AvgAspect;
+
+            if (aspect <= 0.0)
+                return false;
+
+            // title / banner 류처럼 너무 납작한 것 제외
+            if (aspect < 0.90 || aspect > 2.10)
+                return false;
+
+            if (Math.Abs(aspect - dominantAspect) > aspectTolerance)
+                return false;
+
+            return true;
+        }
+
+        private static List<RootUnitInfo> SelectWrapperBlocksByMultiFamily(
+            List<RootUnitInfo> looseBlocks,
+            out List<WrapperFamilyPick> selectedFamilies)
+        {
+            selectedFamilies = new List<WrapperFamilyPick>();
+
+            var families = BuildLooseWrapperFamiliesForCell(looseBlocks);
+            if (families.Count == 0)
+                return new List<RootUnitInfo>();
+
+            var dominant = families[0];
+            double dominantAspect = dominant.AvgAspect;
+
+            // 1차: 반복 등장하는 wrapper family 선택
+            var pickedFamilies = families
+                .Where(f => f.DistinctCount >= 2)
+                .Where(f => IsSheetLikeAspectOnly(f, dominantAspect))
+                .OrderByDescending(f => f.DistinctCount)
+                .ThenByDescending(f => f.TotalCount)
+                .ThenByDescending(f => f.TotalArea)
+                .ToList();
+
+            // 2차: singleton인데도 sheet-like 한 후보 추가
+            var singletonFamilies = families
+                .Where(f => f.DistinctCount == 1)
+                .Where(f => IsSheetLikeAspectOnly(f, dominantAspect))
+                .Where(f => IsSingletonWrapperNearSmallEnd(f, pickedFamilies))
+                .OrderByDescending(f => f.TotalArea)
+                .ToList();
+
+            foreach (var f in singletonFamilies)
+                pickedFamilies.Add(f);
+
+            var merged = pickedFamilies
+                .SelectMany(f => f.Distinct)
+                .OrderByDescending(x => x.Center.Y)
+                .ThenBy(x => x.Center.X)
+                .ToList();
+
+            merged = BlockFamilyKeepDistinctInstances(merged);
+            merged = KeepOutermostNonContainingBlocks(merged);
+
+            selectedFamilies = pickedFamilies;
+            return merged;
+        }
+
+        private static List<RootUnitInfo> SelectWrapperBlocksByMultiFamily_old(
+            List<RootUnitInfo> looseBlocks,
+            out List<WrapperFamilyPick> selectedFamilies)
+        {
+            selectedFamilies = new List<WrapperFamilyPick>();
+
+            var families = BuildLooseWrapperFamiliesForCell(looseBlocks);
+            if (families.Count == 0)
+                return new List<RootUnitInfo>();
+
+            var dominant = families[0];
+            double dominantAspect = dominant.AvgAspect;
+
+            selectedFamilies = families
+                .Where(f => IsSheetLikeMergedFamily(f, dominantAspect))
+                .OrderByDescending(f => f.DistinctCount)
+                .ThenByDescending(f => f.TotalCount)
+                .ThenByDescending(f => f.TotalArea)
+                .ToList();
+
+            var merged = selectedFamilies
+                .SelectMany(f => f.Distinct)
+                .OrderByDescending(x => x.Center.Y)
+                .ThenBy(x => x.Center.X)
+                .ToList();
+
+            // family를 합친 뒤 다시 중복 제거
+            merged = BlockFamilyKeepDistinctInstances(merged);
+
+            // 마지막으로 포함 제거
+            return KeepOutermostNonContainingBlocks(merged);
+        }
+
+        [CommandMethod("FLUX_DEBUG_CELL_LOOSE_BLOCKS_ALL")]
+        public static void FluxDebugCellLooseBlocksAll()
+        {
+            var doc = Application.DocumentManager.MdiActiveDocument;
+            var db = doc.Database;
+            var ed = doc.Editor;
+
+            if (_cachedGridXs == null || _cachedGridYs == null ||
+                _cachedGridXs.Count < 2 || _cachedGridYs.Count < 2)
+            {
+                ed.WriteMessage("\n[FluxCAD] Cached grid가 없습니다. 먼저 FLUX_DEBUG_GRID_CELLS를 실행하세요.");
+                return;
+            }
+
+            int rows = _cachedGridYs.Count - 1;
+            int cols = _cachedGridXs.Count - 1;
+
+            var rowRes = ed.GetInteger(new PromptIntegerOptions($"\nrow 입력 (0 ~ {rows - 1})")
+            {
+                AllowNegative = false,
+                AllowZero = true,
+                AllowNone = false,
+                DefaultValue = 1
+            });
+            if (rowRes.Status != PromptStatus.OK) return;
+
+            var colRes = ed.GetInteger(new PromptIntegerOptions($"\ncol 입력 (0 ~ {cols - 1})")
+            {
+                AllowNegative = false,
+                AllowZero = true,
+                AllowNone = false,
+                DefaultValue = 1
+            });
+            if (colRes.Status != PromptStatus.OK) return;
+
+            int r = rowRes.Value;
+            int c = colRes.Value;
+
+            var gridBounds = new Extents3d(
+                new Point3d(_cachedGridXs.First(), _cachedGridYs.First(), 0),
+                new Point3d(_cachedGridXs.Last(), _cachedGridYs.Last(), 0));
+
+            using (var tr = db.TransactionManager.StartTransaction())
+            {
+                var roots = CollectRootUnitsInBounds(db, tr, gridBounds);
+                var cellBounds = GetCachedCellBoundsRaw(r, c);
+
+                var looseBlocks = CollectWrapperBlocksLoose(roots, cellBounds)
+                    .OrderByDescending(x => x.Center.Y)
+                    .ThenBy(x => x.Center.X)
+                    .ToList();
+
+                ed.WriteMessage($"\n[FluxCAD] FLUX_DEBUG_CELL_LOOSE_BLOCKS_ALL row={r} col={c}");
+                ed.WriteMessage($"\n  loose block count = {looseBlocks.Count}");
+
+                int idx = 1;
+                foreach (var b in looseBlocks)
+                {
+                    double areaRatio = (b.Width * b.Height) / Math.Max(1.0, WidthOf(cellBounds) * HeightOf(cellBounds));
+                    double overlap = IntersectionAreaRatio(cellBounds, b.Bounds);
+
+                    ed.WriteMessage(
+                        $"\n  [LooseBlock {idx++}] " +
+                        $"Handle={GetRootHandle(b)} " +
+                        $"BlockName={b.BlockName ?? "<null>"} " +
+                        $"W={b.Width:F2} H={b.Height:F2} " +
+                        $"AreaRatio={areaRatio:F4} Overlap={overlap:F4} " +
+                        $"Center=({b.Center.X:F2},{b.Center.Y:F2}) " +
+                        $"Min=({b.Bounds.MinPoint.X:F2},{b.Bounds.MinPoint.Y:F2}) " +
+                        $"Max=({b.Bounds.MaxPoint.X:F2},{b.Bounds.MaxPoint.Y:F2})");
+                }
+
+                var groups = looseBlocks
+                    .GroupBy(x => string.IsNullOrWhiteSpace(x.BlockName) ? "<null>" : x.BlockName!)
+                    .Select(g => new
+                    {
+                        Name = g.Key,
+                        Count = g.Count(),
+                        MinW = g.Min(x => x.Width),
+                        MaxW = g.Max(x => x.Width),
+                        MinH = g.Min(x => x.Height),
+                        MaxH = g.Max(x => x.Height)
+                    })
+                    .OrderByDescending(x => x.Count)
+                    .ThenByDescending(x => x.MaxW * x.MaxH)
+                    .ToList();
+
+                ed.WriteMessage($"\n  family count = {groups.Count}");
+                foreach (var g in groups)
+                {
+                    ed.WriteMessage(
+                        $"\n    [Family] Name={g.Name} Count={g.Count} " +
+                        $"SizeRange=({g.MinW:F0}~{g.MaxW:F0}) x ({g.MinH:F0}~{g.MaxH:F0})");
+                }
+
+                tr.Commit();
+            }
+        }
+
+//         private static double AspectOf(RootUnitInfo x)
+//         {
+//             return x.Height <= 1e-9 ? 0.0 : x.Width / x.Height;
+//         }
+
+        private static bool IsSheetLikeWrapperFamily(
+            WrapperFamilyCandidate family,
+            double dominantAspect,
+            int minDistinctCount = 2,
+            double aspectTolerance = 0.20)
+        {
+            if (family == null || family.DistinctCount < minDistinctCount)
+                return false;
+
+            if (family.Distinct.Count == 0)
+                return false;
+
+            double avgAspect = family.Distinct.Average(AspectOf);
+
+            // title류처럼 너무 납작한 것은 제외
+            if (avgAspect > 2.2 || avgAspect < 0.8)
+                return false;
+
+            // dominant wrapper 비율과 비슷한 family만 채택
+            if (Math.Abs(avgAspect - dominantAspect) > aspectTolerance)
+                return false;
+
+            return true;
+        }
+
+        private static List<RootUnitInfo> SelectWrapperBlocksByMultiFamily(
+            List<RootUnitInfo> acceptedBlocks)
+        {
+            var families = BuildWrapperFamilies(acceptedBlocks);
+            if (families.Count == 0)
+                return new List<RootUnitInfo>();
+
+            var dominant = families[0];
+            if (dominant.Distinct.Count == 0)
+                return new List<RootUnitInfo>();
+
+            double dominantAspect = dominant.Distinct.Average(AspectOf);
+
+            var selected = families
+                .Where(f => IsSheetLikeWrapperFamily(f, dominantAspect))
+                .SelectMany(f => f.Distinct)
+                .OrderByDescending(x => x.Center.Y)
+                .ThenBy(x => x.Center.X)
+                .ToList();
+
+            // family를 합친 뒤 다시 전역 중복 제거
+            selected = BlockFamilyKeepDistinctInstances(selected);
+
+            // 마지막으로 포함 제거
+            return KeepOutermostNonContainingBlocks(selected);
+        }
+        /*
+        [CommandMethod("FLUX_DEBUG_ROW_WRAPPER_COUNTS_LOOSE")]
+        public static void FluxDebugRowWrapperCountsLoose()
+        {
+            var doc = Application.DocumentManager.MdiActiveDocument;
+            var db = doc.Database;
+            var ed = doc.Editor;
+
+            if (_cachedGridXs == null || _cachedGridYs == null ||
+                _cachedGridXs.Count < 2 || _cachedGridYs.Count < 2)
+            {
+                ed.WriteMessage("\n[FluxCAD] Cached grid가 없습니다. 먼저 FLUX_DEBUG_GRID_CELLS를 실행하세요.");
+                return;
+            }
+
+            int rows = _cachedGridYs.Count - 1;
+            int cols = _cachedGridXs.Count - 1;
+
+            var rowOpt = new PromptIntegerOptions($"\nrow 입력 (0 ~ {rows - 1})")
+            {
+                AllowNegative = false,
+                AllowZero = true,
+                AllowNone = false,
+                DefaultValue = 1
+            };
+            var rowRes = ed.GetInteger(rowOpt);
+            if (rowRes.Status != PromptStatus.OK)
+                return;
+
+            int r = rowRes.Value;
+            if (r < 0 || r >= rows)
+            {
+                ed.WriteMessage("\n[FluxCAD] row 범위가 잘못되었습니다.");
+                return;
+            }
+
+            var gridBounds = new Extents3d(
+                new Point3d(_cachedGridXs.First(), _cachedGridYs.First(), 0),
+                new Point3d(_cachedGridXs.Last(), _cachedGridYs.Last(), 0));
+
+            using (var tr = db.TransactionManager.StartTransaction())
+            {
+                var roots = CollectRootUnitsInBounds(db, tr, gridBounds);
+
+                ed.WriteMessage($"\n[FluxCAD] FLUX_DEBUG_ROW_WRAPPER_COUNTS_LOOSE row={r} cols={cols}");
+
+                for (int c = 0; c < cols; c++)
+                {
+                    var cellBounds = GetCachedCellBoundsRaw(r, c);
+
+                    // 기존 strict
+                    var strictLocal = CellLocalCollector.CollectHandles(
+                        roots,
+                        cellBounds,
+                        x => x.Bounds,
+                        x => GetRootHandle(x),
+                        x => x.IsPartition,
+                        x => x.IsBlockReference
+                    );
+
+                    var strictHandleSet = new HashSet<string>(
+                        strictLocal.Handles.Where(h => !string.IsNullOrWhiteSpace(h)),
+                        StringComparer.OrdinalIgnoreCase);
+
+                    var strictBlocks = roots
+                        .Where(x => strictHandleSet.Contains(GetRootHandle(x)))
+                        .Where(x => x.IsBlockReference)
+                        .ToList();
+
+                    var strictFamilies = BuildWrapperFamilies(strictBlocks);
+                    var strictTop = strictFamilies.FirstOrDefault();
+
+                    // 새 loose
+                    var looseBlocks = CollectWrapperBlocksLoose(roots, cellBounds);
+                    var looseFamilies = BuildWrapperFamilies(looseBlocks);
+                    var looseTop = looseFamilies.FirstOrDefault();
+
+                    ed.WriteMessage($"\n[WrapperCompare] row={r} col={c}");
+
+                    ed.WriteMessage(
+                        $"\n  strict blocks={strictBlocks.Count} " +
+                        $"strict dominant={(strictTop?.BlockName ?? "<none>")} " +
+                        $"strict wrappers={(strictTop?.WrapperCount ?? 0)}");
+
+                    ed.WriteMessage(
+                        $"\n  loose blocks={looseBlocks.Count} " +
+                        $"loose dominant={(looseTop?.BlockName ?? "<none>")} " +
+                        $"loose wrappers={(looseTop?.WrapperCount ?? 0)}");
+
+                    if (looseTop != null)
+                    {
+                        int idx = 1;
+                        foreach (var w in looseTop.NonContaining)
+                        {
+                            ed.WriteMessage(
+                                $"\n    [LooseWrapper {idx++}] " +
+                                $"Handle={GetRootHandle(w)} " +
+                                $"W={w.Width:F2} H={w.Height:F2} " +
+                                $"Center=({w.Center.X:F2},{w.Center.Y:F2}) " +
+                                $"Min=({w.Bounds.MinPoint.X:F2},{w.Bounds.MinPoint.Y:F2}) " +
+                                $"Max=({w.Bounds.MaxPoint.X:F2},{w.Bounds.MaxPoint.Y:F2})");
+                        }
+                    }
+                }
+
+                tr.Commit();
+            }
+        }
+        */
+
+        private static bool IsWrapperBlockPlausibleLoose(
+    RootUnitInfo block,
+    Extents3d cellBounds,
+    double minWidthRatio = 0.008,
+    double minHeightRatio = 0.008,
+    double maxWidthRatio = 0.98,
+    double maxHeightRatio = 0.98)
+        {
+            double cellW = WidthOf(cellBounds);
+            double cellH = HeightOf(cellBounds);
+
+            if (cellW <= 1e-9 || cellH <= 1e-9)
+                return false;
+
+            double wr = block.Width / cellW;
+            double hr = block.Height / cellH;
+
+            if (wr < minWidthRatio || hr < minHeightRatio)
+                return false;
+
+            if (wr > maxWidthRatio || hr > maxHeightRatio)
+                return false;
+
+            return true;
+        }
+
+        private static List<RootUnitInfo> CollectWrapperBlocksLoose(
+    IReadOnlyList<RootUnitInfo> roots,
+    Extents3d cellBounds)
+        {
+            var candidates = roots
+                .Where(x => x.IsBlockReference)
+                .Where(x => !x.IsPartition)
+                .Where(x => Intersects(x.Bounds, cellBounds))
+                .Where(x => IsWrapperBlockPlausibleLoose(x, cellBounds))
+                .Where(x =>
+                {
+                    double overlapToBlock = IntersectionAreaRatio(cellBounds, x.Bounds);
+                    return overlapToBlock >= 0.05;
+                })
+                .OrderByDescending(x => x.Center.Y)
+                .ThenBy(x => x.Center.X)
+                .ToList();
+
+            return candidates;
+        }
+
+
+        [CommandMethod("FLUX_DEBUG_ROW_WRAPPER_COUNTS")]
+        public static void FluxDebugRowWrapperCounts()
+        {
+            var doc = Application.DocumentManager.MdiActiveDocument;
+            var db = doc.Database;
+            var ed = doc.Editor;
+
+            if (_cachedGridXs == null || _cachedGridYs == null ||
+                _cachedGridXs.Count < 2 || _cachedGridYs.Count < 2)
+            {
+                ed.WriteMessage("\n[FluxCAD] Cached grid가 없습니다. 먼저 FLUX_DEBUG_GRID_CELLS를 실행하세요.");
+                return;
+            }
+
+            int rows = _cachedGridYs.Count - 1;
+            int cols = _cachedGridXs.Count - 1;
+
+            var rowOpt = new PromptIntegerOptions($"\nrow 입력 (0 ~ {rows - 1})")
+            {
+                AllowNegative = false,
+                AllowZero = true,
+                AllowNone = false,
+                DefaultValue = 1
+            };
+            var rowRes = ed.GetInteger(rowOpt);
+            if (rowRes.Status != PromptStatus.OK)
+                return;
+
+            int r = rowRes.Value;
+            if (r < 0 || r >= rows)
+            {
+                ed.WriteMessage("\n[FluxCAD] row 범위가 잘못되었습니다.");
+                return;
+            }
+
+            var gridBounds = new Extents3d(
+                new Point3d(_cachedGridXs.First(), _cachedGridYs.First(), 0),
+                new Point3d(_cachedGridXs.Last(), _cachedGridYs.Last(), 0));
+
+            using (var tr = db.TransactionManager.StartTransaction())
+            {
+                var roots = CollectRootUnitsInBounds(db, tr, gridBounds);
+
+                ed.WriteMessage($"\n[FluxCAD] FLUX_DEBUG_ROW_WRAPPER_COUNTS row={r} cols={cols}");
+
+                for (int c = 0; c < cols; c++)
+                {
+                    var cell = AnalyzeCellInnerScene(roots, r, c);
+
+                    ed.WriteMessage($"\n[WrapperCount] row={r} col={c} status={cell.Status}");
+
+                    if (cell.Status != "READY")
+                    {
+                        ed.WriteMessage("\n  cell not ready.");
+                        continue;
+                    }
+
+                    var acceptedBlocks = cell.AcceptedRoots
+                        .Where(x => x.IsBlockReference)
+                        .ToList();
+
+                    ed.WriteMessage(
+                        $"\n  accepted roots={cell.AcceptedRoots.Count}, accepted blocks={acceptedBlocks.Count}");
+
+                    if (acceptedBlocks.Count == 0)
+                    {
+                        ed.WriteMessage("\n  no accepted block references.");
+                        continue;
+                    }
+
+                    var families = BuildWrapperFamilies(acceptedBlocks);
+
+                    ed.WriteMessage($"\n  family count={families.Count}");
+
+                    if (families.Count == 0)
+                    {
+                        ed.WriteMessage("\n  no wrapper family.");
+                        continue;
+                    }
+
+                    var dominant = families[0];
+
+                    ed.WriteMessage(
+                        $"\n  dominant family={dominant.BlockName}" +
+                        $" wrapperCount={dominant.WrapperCount}" +
+                        $" distinct={dominant.DistinctCount}" +
+                        $" total={dominant.TotalCount}");
+
+                    int showFamilies = Math.Min(families.Count, 6);
+                    for (int i = 0; i < showFamilies; i++)
+                    {
+                        var f = families[i];
+
+                        ed.WriteMessage(
+                            $"\n    [Family {i + 1}] Name={f.BlockName}" +
+                            $" wrapper={f.WrapperCount}" +
+                            $" distinct={f.DistinctCount}" +
+                            $" total={f.TotalCount}" +
+                            $" sizeRange=({f.MinW:F0}~{f.MaxW:F0}) x ({f.MinH:F0}~{f.MaxH:F0})");
+                    }
+
+                    int idx = 1;
+                    foreach (var w in dominant.NonContaining)
+                    {
+                        ed.WriteMessage(
+                            $"\n    [Wrapper {idx++}] " +
+                            $"Handle={GetRootHandle(w)} " +
+                            $"W={w.Width:F2} H={w.Height:F2} " +
+                            $"Center=({w.Center.X:F2},{w.Center.Y:F2}) " +
+                            $"Min=({w.Bounds.MinPoint.X:F2},{w.Bounds.MinPoint.Y:F2}) " +
+                            $"Max=({w.Bounds.MaxPoint.X:F2},{w.Bounds.MaxPoint.Y:F2})");
+                    }
+                }
+
+                tr.Commit();
+            }
+        }
+        private static bool IsAlmostContainedBy(
+    Extents3d inner,
+    Extents3d outer,
+    double tol = 5.0,
+    double containmentRatio = 0.98)
+        {
+            bool rectInside =
+                inner.MinPoint.X >= outer.MinPoint.X - tol &&
+                inner.MinPoint.Y >= outer.MinPoint.Y - tol &&
+                inner.MaxPoint.X <= outer.MaxPoint.X + tol &&
+                inner.MaxPoint.Y <= outer.MaxPoint.Y + tol;
+
+            if (rectInside)
+                return true;
+
+            // existing helper 재사용:
+            // IntersectionAreaRatio(outer, inner) == inner 면적 대비 outer와 겹친 비율
+            return IntersectionAreaRatio(outer, inner) >= containmentRatio;
+        }
+
+        private static List<RootUnitInfo> KeepOutermostNonContainingBlocks(
+            List<RootUnitInfo> blocks,
+            double tol = 5.0,
+            double containmentRatio = 0.98)
+        {
+            var kept = new List<RootUnitInfo>();
+
+            // 큰 것부터 남기면 nested frame이 있을 때 바깥 wrapper가 남음
+            var ordered = blocks
+                .OrderByDescending(x => x.Width * x.Height)
+                .ThenByDescending(x => x.Center.Y)
+                .ThenBy(x => x.Center.X)
+                .ToList();
+
+            foreach (var b in ordered)
+            {
+                bool containedByKept = kept.Any(k =>
+                    IsAlmostContainedBy(b.Bounds, k.Bounds, tol, containmentRatio));
+
+                if (!containedByKept)
+                    kept.Add(b);
+            }
+
+            return kept
+                .OrderByDescending(x => x.Center.Y)
+                .ThenBy(x => x.Center.X)
+                .ToList();
+        }
+
+        private static List<WrapperFamilyCandidate> BuildWrapperFamilies(
+            List<RootUnitInfo> acceptedBlocks)
+        {
+            var result = new List<WrapperFamilyCandidate>();
+
+            foreach (var g in acceptedBlocks
+                .GroupBy(x => string.IsNullOrWhiteSpace(x.BlockName) ? "<null>" : x.BlockName!))
+            {
+                var family = new WrapperFamilyCandidate
+                {
+                    BlockName = g.Key
+                };
+
+                foreach (var x in g
+                    .OrderByDescending(x => x.Center.Y)
+                    .ThenBy(x => x.Center.X))
+                {
+                    family.All.Add(x);
+                }
+
+                var distinct = BlockFamilyKeepDistinctInstances(family.All);
+                foreach (var x in distinct)
+                    family.Distinct.Add(x);
+
+                var nonContaining = KeepOutermostNonContainingBlocks(family.Distinct);
+                foreach (var x in nonContaining)
+                    family.NonContaining.Add(x);
+
+                result.Add(family);
+            }
+
+            return result
+                .OrderByDescending(x => x.WrapperCount)
+                .ThenByDescending(x => x.DistinctCount)
+                .ThenByDescending(x => x.TotalCount)
+                .ThenByDescending(x => x.TotalArea)
+                .ToList();
+        }
+
+        [CommandMethod("FLUX_DEBUG_ROW_BLOCK_FAMILIES")]
+        public static void FluxDebugRowBlockFamilies()
+        {
+            var doc = Application.DocumentManager.MdiActiveDocument;
+            var db = doc.Database;
+            var ed = doc.Editor;
+
+            if (_cachedGridXs == null || _cachedGridYs == null ||
+                _cachedGridXs.Count < 2 || _cachedGridYs.Count < 2)
+            {
+                ed.WriteMessage("\n[FluxCAD] Cached grid가 없습니다. 먼저 FLUX_DEBUG_GRID_CELLS를 실행하세요.");
+                return;
+            }
+
+            int rows = _cachedGridYs.Count - 1;
+            int cols = _cachedGridXs.Count - 1;
+
+            var rowOpt = new PromptIntegerOptions($"\nrow 입력 (0 ~ {rows - 1})")
+            {
+                AllowNegative = false,
+                AllowZero = true,
+                AllowNone = false,
+                DefaultValue = 1
+            };
+            var rowRes = ed.GetInteger(rowOpt);
+            if (rowRes.Status != PromptStatus.OK)
+                return;
+
+            int r = rowRes.Value;
+            if (r < 0 || r >= rows)
+            {
+                ed.WriteMessage("\n[FluxCAD] row 범위가 잘못되었습니다.");
+                return;
+            }
+
+            var gridBounds = new Extents3d(
+                new Point3d(_cachedGridXs.First(), _cachedGridYs.First(), 0),
+                new Point3d(_cachedGridXs.Last(), _cachedGridYs.Last(), 0));
+
+            using (var tr = db.TransactionManager.StartTransaction())
+            {
+                // 현재 로컬 소스에서 이미 사용 중인 방식 재사용
+                var roots = CollectRootUnitsInBounds(db, tr, gridBounds);
+
+                ed.WriteMessage($"\n[FluxCAD] FLUX_DEBUG_ROW_BLOCK_FAMILIES row={r} cols={cols}");
+
+                for (int c = 0; c < cols; c++)
+                {
+                    var cellBounds = GetCachedCellBoundsRaw(r, c);
+
+                    var local = CellLocalCollector.CollectHandles(
+                        roots,
+                        cellBounds,
+                        x => x.Bounds,
+                        x => GetRootHandle(x),
+                        x => x.IsPartition,
+                        x => x.IsBlockReference
+                    );
+
+                    var handleSet = new HashSet<string>(
+                        local.Handles.Where(h => !string.IsNullOrWhiteSpace(h)),
+                        StringComparer.OrdinalIgnoreCase);
+
+                    var acceptedRoots = roots
+                        .Where(x => handleSet.Contains(GetRootHandle(x)))
+                        .OrderByDescending(x => x.Center.Y)
+                        .ThenBy(x => x.Center.X)
+                        .ToList();
+
+                    var acceptedBlocks = acceptedRoots
+                        .Where(x => x.IsBlockReference)
+                        .ToList();
+
+                    ed.WriteMessage(
+                        $"\n[BlockFamilies] row={r} col={c} " +
+                        $"accepted roots={acceptedRoots.Count} accepted blocks={acceptedBlocks.Count}");
+
+                    if (acceptedBlocks.Count == 0)
+                    {
+                        ed.WriteMessage("\n  no accepted block references.");
+                        continue;
+                    }
+
+                    var families = acceptedBlocks
+                        .GroupBy(x => string.IsNullOrWhiteSpace(x.BlockName) ? "<null>" : x.BlockName!)
+                        .Select(g =>
+                        {
+                            var all = g
+                                .OrderByDescending(x => x.Center.Y)
+                                .ThenBy(x => x.Center.X)
+                                .ToList();
+
+                            var distinct = BlockFamilyKeepDistinctInstances(all);
+
+                            double minW = all.Min(x => x.Width);
+                            double maxW = all.Max(x => x.Width);
+                            double minH = all.Min(x => x.Height);
+                            double maxH = all.Max(x => x.Height);
+
+                            return new
+                            {
+                                BlockName = g.Key,
+                                TotalCount = all.Count,
+                                DistinctCount = distinct.Count,
+                                All = all,
+                                Distinct = distinct,
+                                MinW = minW,
+                                MaxW = maxW,
+                                MinH = minH,
+                                MaxH = maxH,
+                                TotalArea = all.Sum(x => x.Width * x.Height)
+                            };
+                        })
+                        .OrderByDescending(x => x.DistinctCount)
+                        .ThenByDescending(x => x.TotalCount)
+                        .ThenByDescending(x => x.TotalArea)
+                        .ToList();
+
+                    ed.WriteMessage($"\n  family count = {families.Count}");
+
+                    if (families.Count > 0)
+                    {
+                        var top = families[0];
+                        ed.WriteMessage(
+                            $"\n  dominant family = {top.BlockName} " +
+                            $"distinct={top.DistinctCount} total={top.TotalCount}");
+                    }
+
+                    int show = Math.Min(families.Count, 8);
+                    for (int i = 0; i < show; i++)
+                    {
+                        var f = families[i];
+
+                        ed.WriteMessage(
+                            $"\n    [Family {i + 1}] Name={f.BlockName}" +
+                            $" distinct={f.DistinctCount}" +
+                            $" total={f.TotalCount}" +
+                            $" sizeRange=({f.MinW:F0}~{f.MaxW:F0}) x ({f.MinH:F0}~{f.MaxH:F0})");
+
+                        ed.WriteMessage(
+                            $"\n      sizes   = {BlockFamilyPreviewSizes(f.Distinct, 12)}");
+
+                        ed.WriteMessage(
+                            $"\n      centers = {BlockFamilyPreviewCenters(f.Distinct, 8)}");
+                    }
+                }
+
+                tr.Commit();
+            }
+        }
+        private static bool IsNearDuplicateBlockForFamily(
+    RootUnitInfo a,
+    RootUnitInfo b,
+    double overlapThreshold = 0.90,
+    double centerTol = 5.0,
+    double sizeTol = 5.0)
+        {
+            double ab = IntersectionAreaRatio(a.Bounds, b.Bounds);
+            double ba = IntersectionAreaRatio(b.Bounds, a.Bounds);
+
+            bool heavyOverlap = ab >= overlapThreshold || ba >= overlapThreshold;
+
+            double dx = a.Center.X - b.Center.X;
+            double dy = a.Center.Y - b.Center.Y;
+            double centerDist = Math.Sqrt(dx * dx + dy * dy);
+
+            bool similarSize =
+                Math.Abs(a.Width - b.Width) <= sizeTol &&
+                Math.Abs(a.Height - b.Height) <= sizeTol;
+
+            return heavyOverlap && centerDist <= centerTol && similarSize;
+        }
+
+        private static List<RootUnitInfo> BlockFamilyKeepDistinctInstances(
+            List<RootUnitInfo> familyBlocks)
+        {
+            var kept = new List<RootUnitInfo>();
+
+            var ordered = familyBlocks
+                .OrderByDescending(x => x.Center.Y)
+                .ThenBy(x => x.Center.X)
+                .ThenByDescending(x => x.Width * x.Height)
+                .ToList();
+
+            foreach (var b in ordered)
+            {
+                bool duplicate = kept.Any(k => IsNearDuplicateBlockForFamily(k, b));
+                if (!duplicate)
+                    kept.Add(b);
+            }
+
+            return kept;
+        }
+
+        private static string BlockFamilyPreviewSizes(List<RootUnitInfo> items, int max = 12)
+        {
+            if (items == null || items.Count == 0)
+                return "<empty>";
+
+            var parts = items
+                .Take(max)
+                .Select(x => $"{x.Width:F0}x{x.Height:F0}")
+                .ToList();
+
+            if (items.Count > max)
+                parts.Add($"... total {items.Count}");
+
+            return string.Join(", ", parts);
+        }
+
+        private static string BlockFamilyPreviewCenters(List<RootUnitInfo> items, int max = 8)
+        {
+            if (items == null || items.Count == 0)
+                return "<empty>";
+
+            var parts = items
+                .Take(max)
+                .Select(x => $"({x.Center.X:F0},{x.Center.Y:F0})")
+                .ToList();
+
+            if (items.Count > max)
+                parts.Add($"... total {items.Count}");
+
+            return string.Join(", ", parts);
+        }
+
+        [CommandMethod("FLUX_DEBUG_ROW_BLOCK_ANCHORS")]
+        public static void FluxDebugRowBlockAnchors()
+        {
+            var doc = Application.DocumentManager.MdiActiveDocument;
+            var db = doc.Database;
+            var ed = doc.Editor;
+
+            if (_cachedGridXs == null || _cachedGridYs == null ||
+                _cachedGridXs.Count < 2 || _cachedGridYs.Count < 2)
+            {
+                ed.WriteMessage("\n[FluxCAD] Cached grid가 없습니다. 먼저 FLUX_DEBUG_GRID_CELLS를 실행하세요.");
+                return;
+            }
+
+            int rows = _cachedGridYs.Count - 1;
+            int cols = _cachedGridXs.Count - 1;
+
+            var rowOpt = new PromptIntegerOptions($"\nrow 입력 (0 ~ {rows - 1})")
+            {
+                AllowNegative = false,
+                AllowZero = true,
+                AllowNone = false,
+                DefaultValue = 1
+            };
+            var rowRes = ed.GetInteger(rowOpt);
+            if (rowRes.Status != PromptStatus.OK)
+                return;
+
+            int r = rowRes.Value;
+            if (r < 0 || r >= rows)
+            {
+                ed.WriteMessage("\n[FluxCAD] row 범위가 잘못되었습니다.");
+                return;
+            }
+
+            var gridBounds = new Extents3d(
+                new Point3d(_cachedGridXs.First(), _cachedGridYs.First(), 0),
+                new Point3d(_cachedGridXs.Last(), _cachedGridYs.Last(), 0));
+
+            using (var tr = db.TransactionManager.StartTransaction())
+            {
+                var roots = CollectRootUnitsInBounds(db, tr, gridBounds);
+
+                ed.WriteMessage($"\n[FluxCAD] FLUX_DEBUG_ROW_BLOCK_ANCHORS row={r} cols={cols}");
+
+                for (int c = 0; c < cols; c++)
+                {
+                    var cellBounds = GetCachedCellBoundsRaw(r, c);
+
+                    var local = CellLocalCollector.CollectHandles(
+                        roots,
+                        cellBounds,
+                        x => x.Bounds,
+                        x => GetRootHandle(x),
+                        x => x.IsPartition,
+                        x => x.IsBlockReference
+                    );
+
+                    var handleSet = new HashSet<string>(
+                        local.Handles.Where(h => !string.IsNullOrWhiteSpace(h)),
+                        StringComparer.OrdinalIgnoreCase);
+
+                    var acceptedRoots = roots
+                        .Where(x => handleSet.Contains(GetRootHandle(x)))
+                        .OrderByDescending(x => x.Center.Y)
+                        .ThenBy(x => x.Center.X)
+                        .ToList();
+
+                    var rawBlockCandidates = acceptedRoots
+                        .Where(x => x.IsBlockReference)
+                        .Where(x => IsAnchorBlockSizePlausibleForCell(x, cellBounds))
+                        .OrderByDescending(x => ComputeAnchorBlockScore(x, cellBounds))
+                        .ThenByDescending(x => x.Width * x.Height)
+                        .ToList();
+
+                    var finalAnchors = SuppressOverlappingAnchorBlocks(rawBlockCandidates, cellBounds);
+
+                    WriteAnchorBlockSummary(
+                        ed,
+                        r,
+                        c,
+                        cellBounds,
+                        acceptedRoots,
+                        rawBlockCandidates,
+                        finalAnchors);
+                }
+
+                tr.Commit();
+            }
+        }
+
+        private static bool IsAnchorBlockSizePlausibleForCell(
+    RootUnitInfo block,
+    Extents3d cellBounds,
+    double minWidthRatio = 0.03,
+    double minHeightRatio = 0.03,
+    double maxWidthRatio = 0.95,
+    double maxHeightRatio = 0.95)
+        {
+            double cellW = WidthOf(cellBounds);
+            double cellH = HeightOf(cellBounds);
+
+            if (cellW <= 1e-9 || cellH <= 1e-9)
+                return false;
+
+            double wr = block.Width / cellW;
+            double hr = block.Height / cellH;
+
+            if (wr < minWidthRatio || hr < minHeightRatio)
+                return false;
+
+            if (wr > maxWidthRatio || hr > maxHeightRatio)
+                return false;
+
+            return true;
+        }
+
+        private static double ComputeAnchorBlockScore(
+            RootUnitInfo block,
+            Extents3d cellBounds)
+        {
+            double cellW = WidthOf(cellBounds);
+            double cellH = HeightOf(cellBounds);
+            double cellArea = Math.Max(1.0, cellW * cellH);
+
+            double area = Math.Max(1.0, block.Width * block.Height);
+            double areaRatio = area / cellArea;
+
+            double overlap = IntersectionAreaRatio(cellBounds, block.Bounds);
+            bool centerIn = ContainsPoint(cellBounds, block.Center);
+
+            double cellCx = (cellBounds.MinPoint.X + cellBounds.MaxPoint.X) * 0.5;
+            double cellCy = (cellBounds.MinPoint.Y + cellBounds.MaxPoint.Y) * 0.5;
+
+            double dx = block.Center.X - cellCx;
+            double dy = block.Center.Y - cellCy;
+            double dist = Math.Sqrt(dx * dx + dy * dy);
+            double diag = Math.Sqrt(cellW * cellW + cellH * cellH);
+            double centerNorm = diag <= 1e-9 ? 0.0 : dist / diag;
+
+            double score = 0.0;
+
+            // 크기가 너무 작아도 안 되고, 셀 전체를 거의 먹어도 안 좋음
+            if (areaRatio >= 0.02 && areaRatio <= 0.35) score += 40.0;
+            else if (areaRatio >= 0.01 && areaRatio <= 0.55) score += 20.0;
+            else score -= 20.0;
+
+            // 셀 안에 충분히 걸쳐 있을수록 좋음
+            score += overlap * 40.0;
+
+            if (centerIn)
+                score += 10.0;
+
+            // 셀 중심에서 너무 멀면 감점
+            score += Math.Max(0.0, 12.0 - centerNorm * 20.0);
+
+            // 이름이 있으면 약간 가점
+            if (!string.IsNullOrWhiteSpace(block.BlockName))
+                score += 5.0;
+
+            return score;
+        }
+
+        private static List<RootUnitInfo> SuppressOverlappingAnchorBlocks(
+            List<RootUnitInfo> blocks,
+            Extents3d cellBounds)
+        {
+            var ordered = blocks
+                .OrderByDescending(b => ComputeAnchorBlockScore(b, cellBounds))
+                .ThenByDescending(b => b.Width * b.Height)
+                .ToList();
+
+            var kept = new List<RootUnitInfo>();
+
+            foreach (var b in ordered)
+            {
+                bool overlapped = kept.Any(k =>
+                    IntersectionAreaRatio(k.Bounds, b.Bounds) >= 0.60 ||
+                    IntersectionAreaRatio(b.Bounds, k.Bounds) >= 0.60);
+
+                if (!overlapped)
+                    kept.Add(b);
+            }
+
+            return kept
+                .OrderByDescending(b => b.Center.Y)
+                .ThenBy(b => b.Center.X)
+                .ToList();
+        }
+
+        private static void WriteAnchorBlockSummary(
+            Editor ed,
+            int row,
+            int col,
+            Extents3d cellBounds,
+            List<RootUnitInfo> acceptedRoots,
+            List<RootUnitInfo> rawBlockCandidates,
+            List<RootUnitInfo> finalAnchors)
+        {
+            ed.WriteMessage($"\n[BlockAnchors] row={row} col={col}");
+
+            ed.WriteMessage(
+                $"\n  accepted roots = {acceptedRoots.Count}, accepted blocks = {acceptedRoots.Count(x => x.IsBlockReference)}");
+
+            ed.WriteMessage(
+                $"\n  raw block candidates = {rawBlockCandidates.Count}, final anchors = {finalAnchors.Count}");
+
+            int idx = 1;
+            foreach (var b in finalAnchors)
+            {
+                double areaRatio = (b.Width * b.Height) / Math.Max(1.0, WidthOf(cellBounds) * HeightOf(cellBounds));
+                double overlap = IntersectionAreaRatio(cellBounds, b.Bounds);
+                double score = ComputeAnchorBlockScore(b, cellBounds);
+
+                ed.WriteMessage(
+                    $"\n    [Anchor {idx++}] " +
+                    $"Handle={GetRootHandle(b)} " +
+                    $"BlockName={b.BlockName ?? "<null>"} " +
+                    $"Score={score:F2} " +
+                    $"W={b.Width:F2} H={b.Height:F2} " +
+                    $"AreaRatio={areaRatio:F3} Overlap={overlap:F3} " +
+                    $"Center=({b.Center.X:F2},{b.Center.Y:F2}) " +
+                    $"Min=({b.Bounds.MinPoint.X:F2},{b.Bounds.MinPoint.Y:F2}) " +
+                    $"Max=({b.Bounds.MaxPoint.X:F2},{b.Bounds.MaxPoint.Y:F2})");
+            }
+        }
+
+
+        [CommandMethod("FLUX_DEBUG_ROW_SHEET_CANDIDATES")]
+        public static void FluxDebugRowSheetCandidates()
+        {
+            var doc = Application.DocumentManager.MdiActiveDocument;
+            var db = doc.Database;
+            var ed = doc.Editor;
+
+            if (_cachedGridXs == null || _cachedGridYs == null ||
+                _cachedGridXs.Count < 2 || _cachedGridYs.Count < 2)
+            {
+                ed.WriteMessage("\n[FluxCAD] Cached grid가 없습니다. 먼저 FLUX_DEBUG_GRID_CELLS를 실행하세요.");
+                return;
+            }
+
+            int rows = _cachedGridYs.Count - 1;
+            int cols = _cachedGridXs.Count - 1;
+
+            var rowOpt = new PromptIntegerOptions($"\nrow 입력 (0 ~ {rows - 1})")
+            {
+                AllowNegative = false,
+                AllowZero = true,
+                AllowNone = false,
+                DefaultValue = 1
+            };
+            var rowRes = ed.GetInteger(rowOpt);
+            if (rowRes.Status != PromptStatus.OK)
+                return;
+
+            int r = rowRes.Value;
+            if (r < 0 || r >= rows)
+            {
+                ed.WriteMessage("\n[FluxCAD] row 범위가 잘못되었습니다.");
+                return;
+            }
+
+            var gridBounds = new Extents3d(
+                new Point3d(_cachedGridXs.First(), _cachedGridYs.First(), 0),
+                new Point3d(_cachedGridXs.Last(), _cachedGridYs.Last(), 0));
+
+            using (var tr = db.TransactionManager.StartTransaction())
+            {
+                var roots = CollectRootUnitsInBounds(db, tr, gridBounds);
+
+                ed.WriteMessage($"\n[FluxCAD] FLUX_DEBUG_ROW_SHEET_CANDIDATES row={r} cols={cols}");
+
+                for (int c = 0; c < cols; c++)
+                {
+                    var ownership = AnalyzeSheetOwnership(roots, r, c);
+                    WriteSheetOwnershipDebug(ed, ownership);
+                }
+
+                tr.Commit();
+            }
+        }
+
+        
+
+        [CommandMethod("FLUX_EXPORT_ROW_INNER_SCENES")]
+        public static void FluxExportRowInnerScenes()
+        {
+            var doc = Application.DocumentManager.MdiActiveDocument;
+            var db = doc.Database;
+            var ed = doc.Editor;
+
+            if (_cachedGridXs == null || _cachedGridYs == null ||
+                _cachedGridXs.Count < 2 || _cachedGridYs.Count < 2)
+            {
+                ed.WriteMessage("\n[FluxCAD] Cached grid가 없습니다. 먼저 FLUX_DEBUG_GRID_CELLS를 실행하세요.");
+                return;
+            }
+
+            int rows = _cachedGridYs.Count - 1;
+            int cols = _cachedGridXs.Count - 1;
+
+            var rowOpt = new PromptIntegerOptions($"\nrow 입력 (0 ~ {rows - 1})")
+            {
+                AllowNegative = false,
+                AllowZero = true,
+                AllowNone = false,
+                DefaultValue = 1
+            };
+
+            var rowRes = ed.GetInteger(rowOpt);
+            if (rowRes.Status != PromptStatus.OK)
+                return;
+
+            int r = rowRes.Value;
+            if (r < 0 || r >= rows)
+            {
+                ed.WriteMessage("\n[FluxCAD] row 범위가 잘못되었습니다.");
+                return;
+            }
+
+            string baseFolder = Path.GetDirectoryName(doc.Name) ?? Environment.CurrentDirectory;
+            string outFolder = Path.Combine(baseFolder, $"FluxRowInnerScenes_r{r}");
+            Directory.CreateDirectory(outFolder);
+
+            var gridBounds = new Extents3d(
+                new Point3d(_cachedGridXs.First(), _cachedGridYs.First(), 0),
+                new Point3d(_cachedGridXs.Last(), _cachedGridYs.Last(), 0));
+
+            using (var tr = db.TransactionManager.StartTransaction())
+            {
+                var roots = CollectRootUnitsInBounds(db, tr, gridBounds);
+
+                int exportedCount = 0;
+                int emptyCount = 0;
+                int abnormalCount = 0;
+
+                ed.WriteMessage($"\n[FluxCAD] FLUX_EXPORT_ROW_INNER_SCENES start row={r}, cols={cols}");
+
+                for (int c = 0; c < cols; c++)
+                {
+                    var analysis = AnalyzeCellInnerScene(roots, r, c);
+
+                    string fileName = $"cell_r{r}_c{c}_inner.dwg";
+                    string filePath = Path.Combine(outFolder, fileName);
+
+                    if (analysis.Status == "READY")
+                    {
+                        ExportObjectIdsToDwg(db, analysis.ExportIds, filePath);
+                        analysis.ExportFilePath = fileName;
+                        exportedCount++;
+                    }
+                    else
+                    {
+                        analysis.ExportFilePath = "<skip>";
+                        if (analysis.Status == "EMPTY")
+                            emptyCount++;
+                        else
+                            abnormalCount++;
+                    }
+
+                    WriteRowInnerSceneLog(ed, analysis);
+                }
+
+                ed.WriteMessage(
+                    $"\n[FluxCAD] RowExportSummary row={r} exported={exportedCount} empty={emptyCount} abnormal={abnormalCount} out={outFolder}");
+
+                tr.Commit();
+            }
+        }
+
+        private static bool IsTextLike(RootUnitInfo r)
+        {
+            return string.Equals(r.TypeName, nameof(DBText), StringComparison.OrdinalIgnoreCase) ||
+                   string.Equals(r.TypeName, nameof(MText), StringComparison.OrdinalIgnoreCase) ||
+                   string.Equals(r.TypeName, nameof(AttributeDefinition), StringComparison.OrdinalIgnoreCase) ||
+                   string.Equals(r.TypeName, nameof(AttributeReference), StringComparison.OrdinalIgnoreCase);
+        }
+
+        private static bool IsLineLike(RootUnitInfo r)
+        {
+            return string.Equals(r.TypeName, nameof(Line), StringComparison.OrdinalIgnoreCase) ||
+                   string.Equals(r.TypeName, nameof(Polyline), StringComparison.OrdinalIgnoreCase) ||
+                   string.Equals(r.TypeName, nameof(Arc), StringComparison.OrdinalIgnoreCase) ||
+                   string.Equals(r.TypeName, nameof(Circle), StringComparison.OrdinalIgnoreCase) ||
+                   string.Equals(r.TypeName, nameof(RotatedDimension), StringComparison.OrdinalIgnoreCase) ||
+                   string.Equals(r.TypeName, nameof(AlignedDimension), StringComparison.OrdinalIgnoreCase) ||
+                   string.Equals(r.TypeName, nameof(RadialDimension), StringComparison.OrdinalIgnoreCase) ||
+                   string.Equals(r.TypeName, nameof(DiametricDimension), StringComparison.OrdinalIgnoreCase);
+        }
+
+        private static double AreaOf(Extents3d ext)
+        {
+            return Math.Max(0.0, WidthOf(ext)) * Math.Max(0.0, HeightOf(ext));
+        }
+
+        private static double SafeRatio(double num, double den)
+        {
+            return Math.Abs(den) <= 1e-9 ? 0.0 : num / den;
+        }
+
+        private static double Distance2D(Point3d a, Point3d b)
+        {
+            double dx = a.X - b.X;
+            double dy = a.Y - b.Y;
+            return Math.Sqrt(dx * dx + dy * dy);
+        }
+
+        private static bool AreRootsConnected(RootUnitInfo a, RootUnitInfo b, double gap)
+        {
+            if (AreNearOrTouching(a.Bounds, b.Bounds, gap))
+                return true;
+
+            if (ContainsPoint(Expand(a.Bounds, gap), b.Center))
+                return true;
+
+            if (ContainsPoint(Expand(b.Bounds, gap), a.Center))
+                return true;
+
+            double d = Distance2D(a.Center, b.Center);
+            if (d <= gap * 1.25)
+                return true;
+
+            return false;
+        }
+
+        private static List<List<RootUnitInfo>> BuildRootClusters(
+    List<RootUnitInfo> roots,
+    double gap)
+        {
+            var clusters = new List<List<RootUnitInfo>>();
+            int n = roots.Count;
+            var visited = new bool[n];
+
+            for (int i = 0; i < n; i++)
+            {
+                if (visited[i])
+                    continue;
+
+                var cluster = new List<RootUnitInfo>();
+                var queue = new Queue<int>();
+
+                queue.Enqueue(i);
+                visited[i] = true;
+
+                while (queue.Count > 0)
+                {
+                    int cur = queue.Dequeue();
+                    var item = roots[cur];
+                    cluster.Add(item);
+
+                    for (int j = 0; j < n; j++)
+                    {
+                        if (visited[j])
+                            continue;
+
+                        if (AreRootsConnected(item, roots[j], gap))
+                        {
+                            visited[j] = true;
+                            queue.Enqueue(j);
+                        }
+                    }
+                }
+
+                clusters.Add(cluster);
+            }
+
+            return clusters;
+        }
+
+        private static void WriteSheetOwnershipDebug(Editor ed, SheetOwnershipResult x)
+        {
+            ed.WriteMessage(
+                $"\n[SheetOwnership] row={x.Row} col={x.Col} status={x.Status}");
+
+            ed.WriteMessage(
+                $"\n  candidates = {x.Candidates.Count}");
+
+            if (x.MainSheet == null)
+            {
+                ed.WriteMessage("\n  main sheet = <none>");
+                return;
+            }
+
+            var m = x.MainSheet;
+
+            ed.WriteMessage(
+                $"\n  main sheet id = {m.Id} score={m.Score:F2} members={m.Members.Count}" +
+                $" line={m.LineLikeCount} text={m.TextLikeCount} block={m.BlockLikeCount}");
+
+            ed.WriteMessage(
+                $"\n  main bounds = Min=({m.Bounds.MinPoint.X:F2},{m.Bounds.MinPoint.Y:F2}) " +
+                $"Max=({m.Bounds.MaxPoint.X:F2},{m.Bounds.MaxPoint.Y:F2}) " +
+                $"FillX={m.FillRatioX:F3} FillY={m.FillRatioY:F3} AreaRatio={m.AreaRatioToCell:F3}");
+
+            ed.WriteMessage(
+                $"\n  assigned = {x.AssignedToSheet.Count}, outside = {x.OutsideSheet.Count}");
+
+            int preview = 0;
+            foreach (var root in x.OutsideSheet
+                .Where(IsTextLike)
+                .OrderByDescending(r => r.Center.Y)
+                .ThenBy(r => r.Center.X)
+                .Take(10))
+            {
+                ed.WriteMessage(
+                    $"\n    [OutsideText {preview++}] Handle={GetRootHandle(root)} " +
+                    $"Type={root.TypeName} Center=({root.Center.X:F2},{root.Center.Y:F2}) " +
+                    $"W={root.Width:F2} H={root.Height:F2}");
+            }
+
+            int cidx = 1;
+            foreach (var c in x.Candidates.Take(5))
+            {
+                ed.WriteMessage(
+                    $"\n    [Candidate {cidx++}] " +
+                    $"Score={c.Score:F2} Members={c.Members.Count} " +
+                    $"Line={c.LineLikeCount} Text={c.TextLikeCount} Block={c.BlockLikeCount} " +
+                    $"AreaRatio={c.AreaRatioToCell:F3} " +
+                    $"Min=({c.Bounds.MinPoint.X:F2},{c.Bounds.MinPoint.Y:F2}) " +
+                    $"Max=({c.Bounds.MaxPoint.X:F2},{c.Bounds.MaxPoint.Y:F2})");
+            }
+        }
+
+        private static SheetOwnershipResult AnalyzeSheetOwnership(
+    IReadOnlyList<RootUnitInfo> roots,
+    int row,
+    int col)
+        {
+            var result = new SheetOwnershipResult
+            {
+                Row = row,
+                Col = col
+            };
+
+            var cell = AnalyzeCellInnerScene(roots, row, col);
+            result.Cell = cell;
+
+            if (cell.Status != "READY")
+            {
+                result.Status = "CELL_NOT_READY";
+                return result;
+            }
+
+            if (!cell.HasInnerSceneBounds || cell.ExportRoots.Count == 0)
+            {
+                result.Status = "NO_EXPORT_ROOTS";
+                return result;
+            }
+
+            var candidates = BuildSheetCandidates(cell.ExportRoots, cell.CellBounds);
+            result.Candidates.Clear();
+            result.Candidates.AddRange(candidates);
+
+            if (result.Candidates.Count == 0)
+            {
+                result.Status = "NO_SHEET_CANDIDATE";
+                return result;
+            }
+
+            var main = result.Candidates
+                .OrderByDescending(x => x.Score)
+                .ThenByDescending(x => x.Members.Count)
+                .First();
+
+            result.MainSheet = main;
+
+            result.AssignedToSheet.Clear();
+            result.OutsideSheet.Clear();
+
+            foreach (var root in cell.ExportRoots)
+            {
+                bool assigned =
+                    ContainsPoint(main.Bounds, root.Center) ||
+                    IntersectionAreaRatio(main.Bounds, root.Bounds) >= 0.35;
+
+                if (assigned)
+                    result.AssignedToSheet.Add(root);
+                else
+                    result.OutsideSheet.Add(root);
+            }
+
+            result.SheetExportIds.Clear();
+            var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+            foreach (var root in result.AssignedToSheet)
+            {
+                string key = root.Id.ToString();
+                if (seen.Add(key))
+                    result.SheetExportIds.Add(root.Id);
+            }
+
+            result.Status = result.SheetExportIds.Count > 0
+                ? "READY"
+                : "NO_SHEET_EXPORT_IDS";
+
+            return result;
+        }
+
+        private static List<SheetCandidate> BuildSheetCandidates(
+    List<RootUnitInfo> exportRoots,
+    Extents3d cellBounds)
+        {
+            var result = new List<SheetCandidate>();
+
+            if (exportRoots == null || exportRoots.Count == 0)
+                return result;
+
+            double cellW = WidthOf(cellBounds);
+            double cellH = HeightOf(cellBounds);
+
+            // inner scene 단계보다 조금 더 촘촘하게
+            double gap = Math.Max(10.0, Math.Min(cellW, cellH) * 0.012);
+
+            var rawClusters = BuildRootClusters(exportRoots, gap);
+
+            int id = 1;
+            foreach (var clusterMembers in rawClusters)
+            {
+                if (clusterMembers == null || clusterMembers.Count == 0)
+                    continue;
+
+                if (!TryUnionBounds(clusterMembers.Select(x => x.Bounds), out var bounds))
+                    continue;
+
+                var candidate = new SheetCandidate
+                {
+                    Id = id++,
+                    Bounds = bounds
+                };
+
+                foreach (var m in clusterMembers)
+                    candidate.Members.Add(m);
+
+                candidate.LineLikeCount = clusterMembers.Count(IsLineLike);
+                candidate.TextLikeCount = clusterMembers.Count(IsTextLike);
+                candidate.BlockLikeCount = clusterMembers.Count(x => x.IsBlockReference);
+
+                candidate.AreaRatioToCell = SafeRatio(AreaOf(bounds), Math.Max(AreaOf(cellBounds), 1.0));
+                candidate.FillRatioX = SafeRatio(WidthOf(bounds), Math.Max(cellW, 1.0));
+                candidate.FillRatioY = SafeRatio(HeightOf(bounds), Math.Max(cellH, 1.0));
+                candidate.Score = ScoreSheetCandidate(candidate, cellBounds);
+
+                result.Add(candidate);
+            }
+
+            return result
+                .OrderByDescending(x => x.Score)
+                .ThenByDescending(x => x.Members.Count)
+                .ToList();
+        }
+
+        private static double ScoreSheetCandidate(
+    SheetCandidate c,
+    Extents3d cellBounds)
+        {
+            double cellArea = Math.Max(1.0, AreaOf(cellBounds));
+
+            double cellCx = (cellBounds.MinPoint.X + cellBounds.MaxPoint.X) * 0.5;
+            double cellCy = (cellBounds.MinPoint.Y + cellBounds.MaxPoint.Y) * 0.5;
+            var cellCenter = new Point3d(cellCx, cellCy, 0);
+
+            double cellDiag = Math.Sqrt(
+                Math.Pow(WidthOf(cellBounds), 2) +
+                Math.Pow(HeightOf(cellBounds), 2));
+
+            double centerDist = Distance2D(c.Center, cellCenter);
+            double centerNorm = SafeRatio(centerDist, Math.Max(cellDiag, 1.0));
+
+            double score = 0.0;
+
+            score += c.Members.Count * 1.0;
+            score += c.LineLikeCount * 0.20;
+            score += c.TextLikeCount * 0.40;
+            score += c.BlockLikeCount * 0.10;
+
+            // 적당한 면적 비율 가점
+            if (c.AreaRatioToCell >= 0.20 && c.AreaRatioToCell <= 0.75)
+                score += 30.0;
+            else if (c.AreaRatioToCell >= 0.10 && c.AreaRatioToCell <= 0.90)
+                score += 10.0;
+            else
+                score -= 25.0;
+
+            // 중심에 가까울수록 가점
+            score += Math.Max(0.0, 20.0 - centerNorm * 40.0);
+
+            // 너무 빈약한 후보 감점
+            if (c.LineLikeCount == 0 && c.TextLikeCount <= 1 && c.BlockLikeCount <= 1)
+                score -= 40.0;
+
+            // 너무 작은 후보 감점
+            if (c.AreaRatioToCell < 0.03)
+                score -= 60.0;
+
+            return score;
+        }
+
+        private static SheetOwnershipResult AnalyzeSheetOwnership_old(
+    IReadOnlyList<RootUnitInfo> roots,
+    int row,
+    int col)
+        {
+            var result = new SheetOwnershipResult
+            {
+                Row = row,
+                Col = col
+            };
+
+            var cell = AnalyzeCellInnerScene(roots, row, col);
+            result.Cell = cell;
+
+            if (cell.Status != "READY" || cell.ExportRoots.Count == 0)
+            {
+                result.Status = "CELL_NOT_READY";
+                return result;
+            }
+
+            var candidates = BuildSheetCandidates(cell.ExportRoots, cell.InnerSceneBounds);
+            result.Candidates.AddRange(candidates);
+
+            if (candidates.Count == 0)
+            {
+                result.Status = "NO_SHEET_CANDIDATE";
+                return result;
+            }
+
+            var main = candidates
+                .OrderByDescending(x => x.Score)
+                .First();
+
+            result.MainSheet = main;
+
+            foreach (var root in cell.ExportRoots)
+            {
+                bool assigned =
+                    ContainsPoint(main.Bounds, root.Center) ||
+                    IntersectionAreaRatio(main.Bounds, root.Bounds) >= 0.35;
+
+                if (assigned)
+                    result.AssignedToSheet.Add(root);
+                else
+                    result.OutsideSheet.Add(root);
+            }
+
+            var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var root in result.AssignedToSheet)
+            {
+                string key = root.Id.ToString();
+                if (seen.Add(key))
+                    result.SheetExportIds.Add(root.Id);
+            }
+
+            result.Status = result.SheetExportIds.Count > 0 ? "READY" : "NO_EXPORT_IDS";
+            return result;
+        }
+
+        private static CellInnerSceneAnalysis AnalyzeCellInnerScene(
+    IReadOnlyList<RootUnitInfo> roots,
+    int row,
+    int col)
+        {
+            var result = new CellInnerSceneAnalysis
+            {
+                Row = row,
+                Col = col,
+                CellBounds = GetCachedCellBoundsRaw(row, col)
+            };
+
+            var cellBounds = result.CellBounds;
+
+            var local = CellLocalCollector.CollectHandles(
+                roots,
+                cellBounds,
+                x => x.Bounds,
+                x => GetRootHandle(x),
+                x => x.IsPartition,
+                x => x.IsBlockReference
+            );
+
+            result.LocalCollect = local;
+
+            if (local.Handles.Count == 0)
+            {
+                result.Status = "EMPTY";
+                return result;
+            }
+
+            var handleSet = new HashSet<string>(
+                local.Handles.Where(h => !string.IsNullOrWhiteSpace(h)),
+                StringComparer.OrdinalIgnoreCase);
+
+            var acceptedRoots = roots
+                .Where(x => handleSet.Contains(GetRootHandle(x)))
+                .OrderByDescending(x => x.Center.Y)
+                .ThenBy(x => x.Center.X)
+                .ToList();
+
+            result.AcceptedRoots.AddRange(acceptedRoots);
+
+            if (acceptedRoots.Count == 0)
+            {
+                result.Status = "NO_ACCEPTED_ROOTS";
+                return result;
+            }
+
+            if (!TryUnionBounds(acceptedRoots.Select(x => x.Bounds), out var acceptedUnion))
+            {
+                result.Status = "NO_ACCEPTED_UNION";
+                return result;
+            }
+
+            result.HasAcceptedUnion = true;
+            result.AcceptedUnion = acceptedUnion;
+            result.AcceptedUnionAreaRatio = SafeAreaRatio(acceptedUnion, cellBounds);
+
+            double cellW = WidthOf(cellBounds);
+            double cellH = HeightOf(cellBounds);
+
+            double padX = Math.Max(20.0, cellW * 0.015);
+            double padY = Math.Max(20.0, cellH * 0.040);
+
+            result.PadX = padX;
+            result.PadY = padY;
+
+            var expandedUnion = ExpandXY(acceptedUnion, padX, padY);
+            result.HasExpandedBeforeClamp = true;
+            result.ExpandedBeforeClamp = expandedUnion;
+
+            var innerSceneBounds = ClampExtentsTo(expandedUnion, cellBounds);
+            result.HasInnerSceneBounds = true;
+            result.InnerSceneBounds = innerSceneBounds;
+            result.ClampApplied = !NearlySameExtents(expandedUnion, innerSceneBounds);
+
+            var exportRoots = acceptedRoots
+                .Where(x =>
+                    ContainsPoint(innerSceneBounds, x.Center) ||
+                    IntersectionAreaRatio(innerSceneBounds, x.Bounds) >= 0.25)
+                .ToList();
+
+            result.ExportRoots.AddRange(exportRoots);
+
+            if (exportRoots.Count == 0)
+            {
+                result.Status = "NO_EXPORT_ROOTS";
+                return result;
+            }
+
+            var seenIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+            foreach (var root in exportRoots)
+            {
+                string key = root.Id.ToString();
+                if (seenIds.Add(key))
+                    result.ExportIds.Add(root.Id);
+            }
+
+            if (result.ExportIds.Count == 0)
+            {
+                result.Status = "NO_EXPORT_IDS";
+                return result;
+            }
+
+            result.Status = "READY";
+            return result;
+        }
+
+
+        private static double AreaOf_old(Extents3d ext)
+        {
+            return Math.Max(0.0, WidthOf(ext)) * Math.Max(0.0, HeightOf(ext));
+        }
+
+        private static double SafeAreaRatio(Extents3d inner, Extents3d outer)
+        {
+            double outerArea = AreaOf(outer);
+            if (outerArea <= 1e-9)
+                return 0.0;
+
+            return AreaOf(inner) / outerArea;
+        }
+
+        private static bool NearlySameExtents(Extents3d a, Extents3d b, double tol = 1e-6)
+        {
+            return Math.Abs(a.MinPoint.X - b.MinPoint.X) <= tol &&
+                   Math.Abs(a.MinPoint.Y - b.MinPoint.Y) <= tol &&
+                   Math.Abs(a.MaxPoint.X - b.MaxPoint.X) <= tol &&
+                   Math.Abs(a.MaxPoint.Y - b.MaxPoint.Y) <= tol;
+        }
+
+        private static void ExportObjectIdsToDwg(
+            Database sourceDb,
+            ObjectIdCollection exportIds,
+            string filePath)
+        {
+            if (exportIds == null || exportIds.Count == 0)
+                return;
+
+            if (File.Exists(filePath))
+                File.Delete(filePath);
+
+            using (Database newDb = new Database(true, true))
+            {
+                using (Transaction trNew = newDb.TransactionManager.StartTransaction())
+                {
+                    ObjectId newMsId = SymbolUtilityServices.GetBlockModelSpaceId(newDb);
+                    IdMapping map = new IdMapping();
+
+                    sourceDb.WblockCloneObjects(
+                        exportIds,
+                        newMsId,
+                        map,
+                        DuplicateRecordCloning.Ignore,
+                        false);
+
+                    trNew.Commit();
+                }
+
+                newDb.SaveAs(filePath, DwgVersion.Current);
+            }
+        }
+
+        private static void WriteRowInnerSceneLog(Editor ed, CellInnerSceneAnalysis x)
+        {
+            ed.WriteMessage(
+                $"\n[RowInnerScene] row={x.Row} col={x.Col} status={x.Status}");
+
+            ed.WriteMessage(
+                $"\n  accepted root count = {x.LocalCollect.TotalAccepted}");
+
+            if (x.HasAcceptedUnion)
+            {
+                ed.WriteMessage(
+                    $"\n  accepted union bounds = " +
+                    $"Min=({x.AcceptedUnion.MinPoint.X:F2},{x.AcceptedUnion.MinPoint.Y:F2}) " +
+                    $"Max=({x.AcceptedUnion.MaxPoint.X:F2},{x.AcceptedUnion.MaxPoint.Y:F2})");
+            }
+            else
+            {
+                ed.WriteMessage("\n  accepted union bounds = <empty>");
+            }
+
+            ed.WriteMessage(
+                $"\n  cell 대비 union 면적 비율 = {x.AcceptedUnionAreaRatio:F4}");
+
+            if (x.HasExpandedBeforeClamp)
+            {
+                ed.WriteMessage(
+                    $"\n  padding 적용 전/후 bounds (before clamp) = " +
+                    $"Min=({x.ExpandedBeforeClamp.MinPoint.X:F2},{x.ExpandedBeforeClamp.MinPoint.Y:F2}) " +
+                    $"Max=({x.ExpandedBeforeClamp.MaxPoint.X:F2},{x.ExpandedBeforeClamp.MaxPoint.Y:F2})");
+            }
+            else
+            {
+                ed.WriteMessage("\n  padding 적용 전/후 bounds (before clamp) = <none>");
+            }
+
+            if (x.HasInnerSceneBounds)
+            {
+                ed.WriteMessage(
+                    $"\n  padding 적용 후 bounds (after clamp) = " +
+                    $"Min=({x.InnerSceneBounds.MinPoint.X:F2},{x.InnerSceneBounds.MinPoint.Y:F2}) " +
+                    $"Max=({x.InnerSceneBounds.MaxPoint.X:F2},{x.InnerSceneBounds.MaxPoint.Y:F2})");
+            }
+            else
+            {
+                ed.WriteMessage("\n  padding 적용 후 bounds (after clamp) = <none>");
+            }
+
+            ed.WriteMessage(
+                $"\n  clamp 여부 = {(x.ClampApplied ? "Y" : "N")}");
+
+            ed.WriteMessage(
+                $"\n  export 파일명 = {x.ExportFilePath}");
+
+            ed.WriteMessage(
+                $"\n  export roots = {x.ExportRoots.Count}, export ids = {x.ExportIds.Count}");
+        }
+
+
+        [CommandMethod("FLUX_EXPORT_CELL_INNER_SCENE")]
+        public static void FluxExportCellInnerScene()
+        {
+            var doc = Application.DocumentManager.MdiActiveDocument;
+            var db = doc.Database;
+            var ed = doc.Editor;
+
+            if (_cachedGridXs == null || _cachedGridYs == null ||
+                _cachedGridXs.Count < 2 || _cachedGridYs.Count < 2)
+            {
+                ed.WriteMessage("\n[FluxCAD] Cached grid가 없습니다. 먼저 FLUX_DEBUG_GRID_CELLS를 실행하세요.");
+                return;
+            }
+
+            int rows = _cachedGridYs.Count - 1;
+            int cols = _cachedGridXs.Count - 1;
+
+            var rowOpt = new PromptIntegerOptions($"\nrow 입력 (0 ~ {rows - 1})")
+            {
+                AllowNegative = false,
+                AllowZero = true,
+                AllowNone = false,
+                DefaultValue = 1
+            };
+            var rowRes = ed.GetInteger(rowOpt);
+            if (rowRes.Status != PromptStatus.OK) return;
+
+            var colOpt = new PromptIntegerOptions($"\ncol 입력 (0 ~ {cols - 1})")
+            {
+                AllowNegative = false,
+                AllowZero = true,
+                AllowNone = false,
+                DefaultValue = 1
+            };
+            var colRes = ed.GetInteger(colOpt);
+            if (colRes.Status != PromptStatus.OK) return;
+
+            int r = rowRes.Value;
+            int c = colRes.Value;
+
+            if (r < 0 || r >= rows || c < 0 || c >= cols)
+            {
+                ed.WriteMessage("\n[FluxCAD] row/col 범위가 잘못되었습니다.");
+                return;
+            }
+
+            double x1 = _cachedGridXs[c];
+            double x2 = _cachedGridXs[c + 1];
+
+            double yTop = _cachedGridYs[_cachedGridYs.Count - 1 - r];
+            double yBottom = _cachedGridYs[_cachedGridYs.Count - 2 - r];
+
+            var cellBounds = new Extents3d(
+                new Point3d(Math.Min(x1, x2), Math.Min(yBottom, yTop), 0),
+                new Point3d(Math.Max(x1, x2), Math.Max(yBottom, yTop), 0));
+
+            var gridBounds = new Extents3d(
+                new Point3d(_cachedGridXs.First(), _cachedGridYs.First(), 0),
+                new Point3d(_cachedGridXs.Last(), _cachedGridYs.Last(), 0));
+
+            using (var tr = db.TransactionManager.StartTransaction())
+            {
+                var roots = CollectRootUnitsInBounds(db, tr, gridBounds);
+
+                var local = CellLocalCollector.CollectHandles(
+                    roots,
+                    cellBounds,
+                    x => x.Bounds,
+                    x => GetRootHandle(x),
+                    x => x.IsPartition,
+                    x => x.IsBlockReference
+                );
+
+                WriteCellLocalCollectSummary(ed, r, c, local);
+
+                if (local.Handles.Count == 0)
+                {
+                    ed.WriteMessage("\n[FluxCAD] local handles가 없습니다. export 중단.");
+                    tr.Commit();
+                    return;
+                }
+
+                var handleSet = new HashSet<string>(
+                    local.Handles.Where(h => !string.IsNullOrWhiteSpace(h)),
+                    StringComparer.OrdinalIgnoreCase);
+
+                var acceptedRoots = roots
+                    .Where(x => handleSet.Contains(GetRootHandle(x)))
+                    .OrderByDescending(x => x.Center.Y)
+                    .ThenBy(x => x.Center.X)
+                    .ToList();
+
+                if (acceptedRoots.Count == 0)
+                {
+                    ed.WriteMessage("\n[FluxCAD] accepted roots가 없습니다. export 중단.");
+                    tr.Commit();
+                    return;
+                }
+
+                if (!TryUnionBounds(acceptedRoots.Select(x => x.Bounds), out var acceptedUnion))
+                {
+                    ed.WriteMessage("\n[FluxCAD] accepted union 계산 실패. export 중단.");
+                    tr.Commit();
+                    return;
+                }
+
+                double cellW = WidthOf(cellBounds);
+                double cellH = HeightOf(cellBounds);
+
+                // row1 패턴 기준의 초기값
+                double padX = Math.Max(20.0, cellW * 0.015);
+                double padY = Math.Max(20.0, cellH * 0.040);
+
+                var expandedUnion = ExpandXY(acceptedUnion, padX, padY);
+                var innerSceneBounds = ClampExtentsTo(expandedUnion, cellBounds);
+
+                // innerScene 기준으로 한 번 더 좁혀서 export 대상 선정
+                var exportRoots = acceptedRoots
+                    .Where(x =>
+                        ContainsPoint(innerSceneBounds, x.Center) ||
+                        IntersectionAreaRatio(innerSceneBounds, x.Bounds) >= 0.25)
+                    .ToList();
+
+                if (exportRoots.Count == 0)
+                {
+                    ed.WriteMessage("\n[FluxCAD] inner scene 기준 export roots가 없습니다. export 중단.");
+                    tr.Commit();
+                    return;
+                }
+
+                var exportIds = new ObjectIdCollection();
+                var seenIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+                foreach (var root in exportRoots)
+                {
+                    string key = root.Id.ToString();
+                    if (seenIds.Add(key))
+                        exportIds.Add(root.Id);
+                }
+
+                string baseFolder = Path.GetDirectoryName(doc.Name) ?? Environment.CurrentDirectory;
+                string outFolder = Path.Combine(baseFolder, "FluxCellInnerScene");
+                Directory.CreateDirectory(outFolder);
+
+                string fileName = $"cell_r{r}_c{c}_inner.dwg";
+                string filePath = Path.Combine(outFolder, fileName);
+
+                using (Database newDb = new Database(true, true))
+                {
+                    using (Transaction trNew = newDb.TransactionManager.StartTransaction())
+                    {
+                        ObjectId newMsId = SymbolUtilityServices.GetBlockModelSpaceId(newDb);
+                        IdMapping map = new IdMapping();
+
+                        db.WblockCloneObjects(
+                            exportIds,
+                            newMsId,
+                            map,
+                            DuplicateRecordCloning.Ignore,
+                            false);
+
+                        trNew.Commit();
+                    }
+
+                    newDb.SaveAs(filePath, DwgVersion.Current);
+                }
+
+                ed.WriteMessage($"\n[FluxCAD] FLUX_EXPORT_CELL_INNER_SCENE 완료");
+                ed.WriteMessage($"\n[Cell] r={r} c={c}");
+                ed.WriteMessage(
+                    $"\n[CellBounds] Min=({cellBounds.MinPoint.X:F2},{cellBounds.MinPoint.Y:F2}) " +
+                    $"Max=({cellBounds.MaxPoint.X:F2},{cellBounds.MaxPoint.Y:F2}) " +
+                    $"W={WidthOf(cellBounds):F2} H={HeightOf(cellBounds):F2}");
+
+                ed.WriteMessage(
+                    $"\n[AcceptedUnion] Min=({acceptedUnion.MinPoint.X:F2},{acceptedUnion.MinPoint.Y:F2}) " +
+                    $"Max=({acceptedUnion.MaxPoint.X:F2},{acceptedUnion.MaxPoint.Y:F2}) " +
+                    $"W={WidthOf(acceptedUnion):F2} H={HeightOf(acceptedUnion):F2}");
+
+                ed.WriteMessage(
+                    $"\n[InnerSceneBounds] Min=({innerSceneBounds.MinPoint.X:F2},{innerSceneBounds.MinPoint.Y:F2}) " +
+                    $"Max=({innerSceneBounds.MaxPoint.X:F2},{innerSceneBounds.MaxPoint.Y:F2}) " +
+                    $"W={WidthOf(innerSceneBounds):F2} H={HeightOf(innerSceneBounds):F2}");
+
+                ed.WriteMessage($"\n[Pad] X={padX:F2} Y={padY:F2}");
+                ed.WriteMessage($"\n[AcceptedRoots] {acceptedRoots.Count}");
+                ed.WriteMessage($"\n[ExportRoots] {exportRoots.Count}");
+                ed.WriteMessage($"\n[ExportFile] {filePath}");
+
+                tr.Commit();
+            }
+        }
+
+        private static Extents3d ExpandXY(Extents3d ext, double gapX, double gapY)
+        {
+            return new Extents3d(
+                new Point3d(ext.MinPoint.X - gapX, ext.MinPoint.Y - gapY, ext.MinPoint.Z),
+                new Point3d(ext.MaxPoint.X + gapX, ext.MaxPoint.Y + gapY, ext.MaxPoint.Z));
+        }
+
+        private static Extents3d ClampExtentsTo(Extents3d src, Extents3d limit)
+        {
+            double minX = Math.Max(src.MinPoint.X, limit.MinPoint.X);
+            double minY = Math.Max(src.MinPoint.Y, limit.MinPoint.Y);
+            double maxX = Math.Min(src.MaxPoint.X, limit.MaxPoint.X);
+            double maxY = Math.Min(src.MaxPoint.Y, limit.MaxPoint.Y);
+
+            if (minX > maxX)
+            {
+                double cx = (limit.MinPoint.X + limit.MaxPoint.X) * 0.5;
+                minX = cx;
+                maxX = cx;
+            }
+
+            if (minY > maxY)
+            {
+                double cy = (limit.MinPoint.Y + limit.MaxPoint.Y) * 0.5;
+                minY = cy;
+                maxY = cy;
+            }
+
+            return new Extents3d(
+                new Point3d(minX, minY, 0),
+                new Point3d(maxX, maxY, 0));
+        }
+
+        [CommandMethod("FLUX_DEBUG_ACCEPTED_MARGIN_MAP")]
+        public static void FluxDebugAcceptedMarginMap()
+        {
+            var doc = Application.DocumentManager.MdiActiveDocument;
+            var db = doc.Database;
+            var ed = doc.Editor;
+
+            if (_cachedGridXs == null || _cachedGridYs == null ||
+                _cachedGridXs.Count < 2 || _cachedGridYs.Count < 2)
+            {
+                ed.WriteMessage("\n[FluxCAD] Cached grid가 없습니다. 먼저 FLUX_DEBUG_GRID_CELLS를 실행하세요.");
+                return;
+            }
+
+            int rows = _cachedGridYs.Count - 1;
+            int cols = _cachedGridXs.Count - 1;
+
+            var gridBounds = new Extents3d(
+                new Point3d(_cachedGridXs.First(), _cachedGridYs.First(), 0),
+                new Point3d(_cachedGridXs.Last(), _cachedGridYs.Last(), 0));
+
+            using (var tr = db.TransactionManager.StartTransaction())
+            {
+                var roots = CollectRootUnitsInBounds(db, tr, gridBounds);
+
+                ed.WriteMessage("\n================ ACCEPTED MARGIN MAP ================");
+                ed.WriteMessage($"\n[GridCount] Rows={rows} Cols={cols}");
+
+                for (int r = 0; r < rows; r++)
+                {
+                    ed.WriteMessage($"\n--- Row {r} ---");
+
+                    for (int c = 0; c < cols; c++)
+                    {
+                        double x1 = _cachedGridXs[c];
+                        double x2 = _cachedGridXs[c + 1];
+
+                        double yTop = _cachedGridYs[_cachedGridYs.Count - 1 - r];
+                        double yBottom = _cachedGridYs[_cachedGridYs.Count - 2 - r];
+
+                        var cellBounds = new Extents3d(
+                            new Point3d(Math.Min(x1, x2), Math.Min(yBottom, yTop), 0),
+                            new Point3d(Math.Max(x1, x2), Math.Max(yBottom, yTop), 0));
+
+                        double cellW = WidthOf(cellBounds);
+                        double cellH = HeightOf(cellBounds);
+
+                        var local = CellLocalCollector.CollectHandles(
+                            roots,
+                            cellBounds,
+                            x => x.Bounds,
+                            x => GetRootHandle(x),
+                            x => x.IsPartition,
+                            x => x.IsBlockReference
+                        );
+
+                        if (local.Handles.Count == 0)
+                        {
+                            ed.WriteMessage(
+                                $"\nCell({r},{c}) " +
+                                $"Accepted=0 EMPTY " +
+                                $"CellW={cellW:F2} CellH={cellH:F2}");
+                            continue;
+                        }
+
+                        var handleSet = new HashSet<string>(
+                            local.Handles.Where(h => !string.IsNullOrWhiteSpace(h)),
+                            StringComparer.OrdinalIgnoreCase);
+
+                        var acceptedRoots = roots
+                            .Where(x => handleSet.Contains(GetRootHandle(x)))
+                            .ToList();
+
+                        if (!TryUnionBounds(acceptedRoots.Select(x => x.Bounds), out var union))
+                        {
+                            ed.WriteMessage(
+                                $"\nCell({r},{c}) " +
+                                $"Accepted={acceptedRoots.Count} UNION_EMPTY " +
+                                $"CellW={cellW:F2} CellH={cellH:F2}");
+                            continue;
+                        }
+
+                        double unionW = WidthOf(union);
+                        double unionH = HeightOf(union);
+
+                        double marginL = union.MinPoint.X - cellBounds.MinPoint.X;
+                        double marginR = cellBounds.MaxPoint.X - union.MaxPoint.X;
+                        double marginB = union.MinPoint.Y - cellBounds.MinPoint.Y;
+                        double marginT = cellBounds.MaxPoint.Y - union.MaxPoint.Y;
+
+                        double fillW = cellW <= 1e-9 ? 0.0 : unionW / cellW;
+                        double fillH = cellH <= 1e-9 ? 0.0 : unionH / cellH;
+
+                        double cellCx = (cellBounds.MinPoint.X + cellBounds.MaxPoint.X) * 0.5;
+                        double cellCy = (cellBounds.MinPoint.Y + cellBounds.MaxPoint.Y) * 0.5;
+                        double unionCx = (union.MinPoint.X + union.MaxPoint.X) * 0.5;
+                        double unionCy = (union.MinPoint.Y + union.MaxPoint.Y) * 0.5;
+
+                        double offsetX = unionCx - cellCx;
+                        double offsetY = unionCy - cellCy;
+
+                        string marginSymX = GetSymmetryFlag(marginL, marginR);
+                        string marginSymY = GetSymmetryFlag(marginB, marginT);
+
+                        ed.WriteMessage(
+                            $"\nCell({r},{c}) " +
+                            $"Accepted={acceptedRoots.Count} " +
+                            $"UnionW={unionW:F2} UnionH={unionH:F2} " +
+                            $"FillW={fillW:F3} FillH={fillH:F3} " +
+                            $"MarginL={marginL:F2} MarginR={marginR:F2} " +
+                            $"MarginB={marginB:F2} MarginT={marginT:F2} " +
+                            $"OffsetX={offsetX:F2} OffsetY={offsetY:F2} " +
+                            $"SymX={marginSymX} SymY={marginSymY}");
+                    }
+                }
+
+                ed.WriteMessage("\n================ END ACCEPTED MARGIN MAP ================");
+                tr.Commit();
+            }
+        }
+
+        private static string GetSymmetryFlag(double a, double b)
+        {
+            double max = Math.Max(Math.Abs(a), Math.Abs(b));
+            if (max <= 1e-9)
+                return "ZERO";
+
+            double diff = Math.Abs(a - b);
+            double ratio = diff / max;
+
+            if (ratio <= 0.05) return "VERY_SYMMETRIC";
+            if (ratio <= 0.15) return "SYMMETRIC";
+            if (ratio <= 0.30) return "NEAR";
+            return "ASYMMETRIC";
+        }
+
+        [CommandMethod("FLUX_DEBUG_GRID_SIZE_MAP")]
+        public static void FluxDebugGridSizeMap()
+        {
+            var doc = Application.DocumentManager.MdiActiveDocument;
+            var ed = doc.Editor;
+
+            if (_cachedGridXs == null || _cachedGridYs == null ||
+                _cachedGridXs.Count < 2 || _cachedGridYs.Count < 2)
+            {
+                ed.WriteMessage("\n[FluxCAD] Cached grid가 없습니다. 먼저 FLUX_DEBUG_GRID_CELLS를 실행하세요.");
+                return;
+            }
+
+            const double cellInset = 5.0; // DetectGridCells와 맞춤
+
+            int rows = _cachedGridYs.Count - 1;
+            int cols = _cachedGridXs.Count - 1;
+
+            var rawColWidths = new List<double>();
+            for (int c = 0; c < cols; c++)
+                rawColWidths.Add(Math.Abs(_cachedGridXs[c + 1] - _cachedGridXs[c]));
+
+            var rawRowHeights = new List<double>();
+            for (int r = 0; r < rows; r++)
+            {
+                double yTop = _cachedGridYs[_cachedGridYs.Count - 1 - r];
+                double yBottom = _cachedGridYs[_cachedGridYs.Count - 2 - r];
+                rawRowHeights.Add(Math.Abs(yTop - yBottom));
+            }
+
+            double medianColW = MedianOf(rawColWidths);
+            double medianRowH = MedianOf(rawRowHeights);
+
+            ed.WriteMessage("\n================ GRID SIZE MAP ================");
+            ed.WriteMessage($"\n[GridCount] Rows={rows} Cols={cols}");
+            ed.WriteMessage($"\n[XCount] {_cachedGridXs.Count}  [YCount] {_cachedGridYs.Count}");
+            ed.WriteMessage($"\n[XLines] {PreviewDoubles(_cachedGridXs)}");
+            ed.WriteMessage($"\n[YLines] {PreviewDoubles(_cachedGridYs)}");
+
+            ed.WriteMessage($"\n[ColumnWidths]");
+            for (int c = 0; c < cols; c++)
+            {
+                string flag = SizeFlag(rawColWidths[c], medianColW);
+                ed.WriteMessage($"\n  Col {c}: W={rawColWidths[c]:F2} {flag}");
+            }
+
+            ed.WriteMessage($"\n[RowHeights]");
+            for (int r = 0; r < rows; r++)
+            {
+                string flag = SizeFlag(rawRowHeights[r], medianRowH);
+                ed.WriteMessage($"\n  Row {r}: H={rawRowHeights[r]:F2} {flag}");
+            }
+
+            ed.WriteMessage(
+                $"\n[Stats] MedianColW={medianColW:F2} MedianRowH={medianRowH:F2}");
+
+            ed.WriteMessage("\n[CellSizeMap]");
+            for (int r = 0; r < rows; r++)
+            {
+                ed.WriteMessage($"\n--- Row {r} ---");
+
+                for (int c = 0; c < cols; c++)
+                {
+                    var raw = GetCachedCellBoundsRaw(r, c);
+                    var inset = InsetExtents(raw, cellInset);
+
+                    double rawW = WidthOf(raw);
+                    double rawH = HeightOf(raw);
+                    double insetW = WidthOf(inset);
+                    double insetH = HeightOf(inset);
+
+                    string wFlag = SizeFlag(rawW, medianColW);
+                    string hFlag = SizeFlag(rawH, medianRowH);
+
+                    ed.WriteMessage(
+                        $"\nCell({r},{c}) " +
+                        $"RawW={rawW:F2} RawH={rawH:F2} " +
+                        $"InsetW={insetW:F2} InsetH={insetH:F2} " +
+                        $"Flags=[W:{wFlag}, H:{hFlag}] " +
+                        $"Min=({raw.MinPoint.X:F2},{raw.MinPoint.Y:F2}) " +
+                        $"Max=({raw.MaxPoint.X:F2},{raw.MaxPoint.Y:F2})");
+                }
+            }
+
+            ed.WriteMessage("\n================ END GRID SIZE MAP ================");
+        }
+
+        private static Extents3d GetCachedCellBoundsRaw(int visualRow, int col)
+        {
+            if (_cachedGridXs == null || _cachedGridYs == null)
+                throw new InvalidOperationException("Cached grid is null.");
+
+            int rows = _cachedGridYs.Count - 1;
+            int cols = _cachedGridXs.Count - 1;
+
+            if (visualRow < 0 || visualRow >= rows || col < 0 || col >= cols)
+                throw new ArgumentOutOfRangeException();
+
+            double x1 = _cachedGridXs[col];
+            double x2 = _cachedGridXs[col + 1];
+
+            double yTop = _cachedGridYs[_cachedGridYs.Count - 1 - visualRow];
+            double yBottom = _cachedGridYs[_cachedGridYs.Count - 2 - visualRow];
+
+            return new Extents3d(
+                new Point3d(Math.Min(x1, x2), Math.Min(yBottom, yTop), 0),
+                new Point3d(Math.Max(x1, x2), Math.Max(yBottom, yTop), 0));
+        }
+
+        private static Extents3d InsetExtents(Extents3d ext, double inset)
+        {
+            double minX = ext.MinPoint.X + inset;
+            double minY = ext.MinPoint.Y + inset;
+            double maxX = ext.MaxPoint.X - inset;
+            double maxY = ext.MaxPoint.Y - inset;
+
+            if (minX > maxX)
+            {
+                double cx = (ext.MinPoint.X + ext.MaxPoint.X) * 0.5;
+                minX = cx;
+                maxX = cx;
+            }
+
+            if (minY > maxY)
+            {
+                double cy = (ext.MinPoint.Y + ext.MaxPoint.Y) * 0.5;
+                minY = cy;
+                maxY = cy;
+            }
+
+            return new Extents3d(
+                new Point3d(minX, minY, ext.MinPoint.Z),
+                new Point3d(maxX, maxY, ext.MaxPoint.Z));
+        }
+
+        private static double MedianOf(IReadOnlyList<double> values)
+        {
+            if (values == null || values.Count == 0)
+                return 0.0;
+
+            var ordered = values.OrderBy(x => x).ToList();
+            int n = ordered.Count;
+
+            if (n % 2 == 1)
+                return ordered[n / 2];
+
+            return (ordered[n / 2 - 1] + ordered[n / 2]) * 0.5;
+        }
+
+        private static string SizeFlag(double value, double median)
+        {
+            if (median <= 1e-9)
+                return "N/A";
+
+            if (value >= median * 2.0)
+                return "VERY_BIG";
+
+            if (value >= median * 1.5)
+                return "BIG";
+
+            if (value <= median * 0.5)
+                return "VERY_SMALL";
+
+            if (value <= median * 0.75)
+                return "SMALL";
+
+            return "OK";
+        }
+
+        [CommandMethod("FLUX_DEBUG_GRID_CACHE")]
+        public static void FluxDebugGridCache()
+        {
+            var doc = Application.DocumentManager.MdiActiveDocument;
+            var ed = doc.Editor;
+
+            if (_cachedGridXs == null || _cachedGridYs == null ||
+                _cachedGridXs.Count < 2 || _cachedGridYs.Count < 2)
+            {
+                ed.WriteMessage("\n[FluxCAD] Cached grid가 없습니다. 먼저 FLUX_DEBUG_GRID_CELLS를 실행하세요.");
+                return;
+            }
+
+            int rows = _cachedGridYs.Count - 1;
+            int cols = _cachedGridXs.Count - 1;
+
+            ed.WriteMessage("\n================ GRID CACHE DEBUG ================");
+            ed.WriteMessage($"\n[XCount] {_cachedGridXs.Count}");
+            ed.WriteMessage($"\n[YCount] {_cachedGridYs.Count}");
+            ed.WriteMessage($"\n[Rows] {rows}");
+            ed.WriteMessage($"\n[Cols] {cols}");
+
+            ed.WriteMessage($"\n[XLines.Full]");
+            for (int i = 0; i < _cachedGridXs.Count; i++)
+            {
+                ed.WriteMessage($"\n  X[{i}] = {_cachedGridXs[i]:F2}");
+            }
+
+            ed.WriteMessage($"\n[YLines.Full]");
+            for (int i = 0; i < _cachedGridYs.Count; i++)
+            {
+                ed.WriteMessage($"\n  Y[{i}] = {_cachedGridYs[i]:F2}");
+            }
+
+            var xDiffs = BuildDiffs(_cachedGridXs);
+            var yDiffs = BuildDiffs(_cachedGridYs);
+
+            ed.WriteMessage($"\n[XDiffs]");
+            for (int i = 0; i < xDiffs.Count; i++)
+            {
+                ed.WriteMessage($"\n  DX[{i}] = X[{i + 1}] - X[{i}] = {xDiffs[i]:F2}");
+            }
+
+            ed.WriteMessage($"\n[YDiffs]");
+            for (int i = 0; i < yDiffs.Count; i++)
+            {
+                ed.WriteMessage($"\n  DY[{i}] = Y[{i + 1}] - Y[{i}] = {yDiffs[i]:F2}");
+            }
+
+            WriteDiffStats(ed, "X", xDiffs);
+            WriteDiffStats(ed, "Y", yDiffs);
+
+            ed.WriteMessage($"\n[VisualCellSizes]");
+            for (int r = 0; r < rows; r++)
+            {
+                for (int c = 0; c < cols; c++)
+                {
+                    var cell = GetCachedCellBounds(r, c);
+                    double w = WidthOf(cell);
+                    double h = HeightOf(cell);
+
+                    ed.WriteMessage(
+                        $"\n  Cell(r={r}, c={c}) " +
+                        $"W={w:F2} H={h:F2} " +
+                        $"Min=({cell.MinPoint.X:F2},{cell.MinPoint.Y:F2}) " +
+                        $"Max=({cell.MaxPoint.X:F2},{cell.MaxPoint.Y:F2})");
+                }
+            }
+
+            // 특정 셀 하나 더 자세히 보기
+            var rowOpt = new PromptIntegerOptions($"\n상세 확인 row 입력 (0 ~ {rows - 1})")
+            {
+                AllowNegative = false,
+                AllowZero = true,
+                AllowNone = true,
+                DefaultValue = 1,
+                UseDefaultValue = true
+            };
+            var rowRes = ed.GetInteger(rowOpt);
+            if (rowRes.Status == PromptStatus.Cancel)
+                return;
+
+            var colOpt = new PromptIntegerOptions($"\n상세 확인 col 입력 (0 ~ {cols - 1})")
+            {
+                AllowNegative = false,
+                AllowZero = true,
+                AllowNone = true,
+                DefaultValue = 1,
+                UseDefaultValue = true
+            };
+            var colRes = ed.GetInteger(colOpt);
+            if (colRes.Status == PromptStatus.Cancel)
+                return;
+
+            int rr = rowRes.Status == PromptStatus.OK ? rowRes.Value : 1;
+            int cc = colRes.Status == PromptStatus.OK ? colRes.Value : 1;
+
+            if (rr < 0 || rr >= rows || cc < 0 || cc >= cols)
+            {
+                ed.WriteMessage("\n[FluxCAD] row/col 범위가 잘못되었습니다.");
+                return;
+            }
+
+            double x1 = _cachedGridXs[cc];
+            double x2 = _cachedGridXs[cc + 1];
+            double yTop = _cachedGridYs[_cachedGridYs.Count - 1 - rr];
+            double yBottom = _cachedGridYs[_cachedGridYs.Count - 2 - rr];
+
+            var targetCell = GetCachedCellBounds(rr, cc);
+
+            ed.WriteMessage($"\n[TargetCell]");
+            ed.WriteMessage(
+                $"\n  r={rr} c={cc} " +
+                $"x1={x1:F2} x2={x2:F2} yBottom={yBottom:F2} yTop={yTop:F2}");
+
+            ed.WriteMessage(
+                $"\n  Bounds Min=({targetCell.MinPoint.X:F2},{targetCell.MinPoint.Y:F2}) " +
+                $"Max=({targetCell.MaxPoint.X:F2},{targetCell.MaxPoint.Y:F2}) " +
+                $"W={WidthOf(targetCell):F2} H={HeightOf(targetCell):F2}");
+
+            ed.WriteMessage("\n================ END GRID CACHE DEBUG ================");
+        }
+
+        private static List<double> BuildDiffs(IReadOnlyList<double> values)
+        {
+            var diffs = new List<double>();
+
+            if (values == null || values.Count < 2)
+                return diffs;
+
+            for (int i = 0; i < values.Count - 1; i++)
+                diffs.Add(values[i + 1] - values[i]);
+
+            return diffs;
+        }
+
+        private static void WriteDiffStats(Editor ed, string axisName, List<double> diffs)
+        {
+            if (diffs == null || diffs.Count == 0)
+            {
+                ed.WriteMessage($"\n[{axisName}DiffStats] <empty>");
+                return;
+            }
+
+            var ordered = diffs.OrderBy(x => x).ToList();
+            double min = ordered.First();
+            double max = ordered.Last();
+            double avg = ordered.Average();
+            double median = ordered.Count % 2 == 1
+                ? ordered[ordered.Count / 2]
+                : (ordered[ordered.Count / 2 - 1] + ordered[ordered.Count / 2]) * 0.5;
+
+            ed.WriteMessage(
+                $"\n[{axisName}DiffStats] " +
+                $"Count={ordered.Count} Min={min:F2} Max={max:F2} Avg={avg:F2} Median={median:F2}");
+        }
+
+        private static Extents3d GetCachedCellBounds(int visualRow, int col)
+        {
+            if (_cachedGridXs == null || _cachedGridYs == null)
+                throw new InvalidOperationException("Cached grid is null.");
+
+            int rows = _cachedGridYs.Count - 1;
+            int cols = _cachedGridXs.Count - 1;
+
+            if (visualRow < 0 || visualRow >= rows || col < 0 || col >= cols)
+                throw new ArgumentOutOfRangeException();
+
+            double x1 = _cachedGridXs[col];
+            double x2 = _cachedGridXs[col + 1];
+
+            double yTop = _cachedGridYs[_cachedGridYs.Count - 1 - visualRow];
+            double yBottom = _cachedGridYs[_cachedGridYs.Count - 2 - visualRow];
+
+            return new Extents3d(
+                new Point3d(Math.Min(x1, x2), Math.Min(yBottom, yTop), 0),
+                new Point3d(Math.Max(x1, x2), Math.Max(yBottom, yTop), 0));
+        }
 
         [CommandMethod("FLUX_DEBUG_CELL_BOUNDS")]
         public static void FluxDebugCellBounds()
