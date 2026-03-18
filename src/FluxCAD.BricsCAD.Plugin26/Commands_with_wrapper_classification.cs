@@ -609,6 +609,27 @@ namespace FluxCAD.BricsCAD.Plugin26
         private static List<double>? _cachedGridXs;
         private static List<double>? _cachedGridYs;
 
+
+        private enum WrapperRegionKind
+        {
+            MetaRegion,
+            ViewAnchor,
+            ViewAttached,
+            LooseGlobal
+        }
+
+        private sealed class ViewAnchorGroup
+        {
+            public int Index { get; set; }
+            public RootUnitInfo Anchor { get; set; } = null!;
+            public Extents3d Bounds { get; set; }
+            public List<RootUnitInfo> Members { get; } = new();
+            public int DimensionCount { get; set; }
+            public int TextCount { get; set; }
+            public int PrimitiveCount { get; set; }
+        }
+
+
         private sealed class WrapperExportBucket
         {
             public int Row { get; set; }
@@ -670,6 +691,135 @@ namespace FluxCAD.BricsCAD.Plugin26
             public WrapperSheetKind Kind { get; set; } = WrapperSheetKind.Unknown;
             public ConfidenceGrade Confidence { get; set; } = ConfidenceGrade.Low;
             public string ReasonSummary { get; set; } = "";
+
+            public List<string> QuantityEvidence { get; } = new();
+            public List<string> ThicknessEvidence { get; } = new();
+            public List<string> MaterialEvidence { get; } = new();
+            public List<string> NameEvidence { get; } = new();
+        }
+        private enum WrapperInternalStatus
+        {
+            NotAnalyzed,
+            SkippedNotProductionSheet,
+            SkippedNoBounds,
+            Analyzed
+        }
+
+        private enum WrapperRegionKind_old
+        {
+            Meta,
+            ViewAnchor,
+            ViewAttached,
+            Loose
+        }
+
+        private sealed class WrapperMemberAssignment
+        {
+            public RootUnitInfo Member { get; set; } = null!;
+            public string MemberHandle { get; set; } = "";
+            public WrapperRegionKind Region { get; set; }
+            public int? ViewIndex { get; set; }
+            public double Score { get; set; }
+            public string Reason { get; set; } = "";
+        }
+
+        private sealed class WrapperViewAnchorGroup
+        {
+            public int Index { get; set; }
+
+            public RootUnitInfo Anchor { get; set; } = null!;
+            public string AnchorHandle { get; set; } = "";
+            public string AnchorBlockName { get; set; } = "";
+
+            public Extents3d AnchorBounds { get; set; }
+            public Extents3d GroupBounds { get; set; }
+
+            public double AnchorScore { get; set; }
+            public string AnchorReason { get; set; } = "";
+
+            public List<RootUnitInfo> AttachedMembers { get; } = new();
+
+            public int TextCount { get; set; }
+            public int DimensionCount { get; set; }
+            public int PrimitiveCount { get; set; }
+            public int NestedBlockCount { get; set; }
+        }
+
+        private sealed class WrapperInternalStructure
+        {
+            public int Row { get; set; }
+            public int Col { get; set; }
+            public int WrapperIndex { get; set; }
+
+            public string WrapperHandle { get; set; } = "";
+            public string WrapperBlockName { get; set; } = "";
+
+            public WrapperSheetKind WrapperKind { get; set; } = WrapperSheetKind.Unknown;
+            public ConfidenceGrade WrapperConfidence { get; set; } = ConfidenceGrade.Low;
+
+            public WrapperInternalStatus Status { get; set; } = WrapperInternalStatus.NotAnalyzed;
+            public string StatusReason { get; set; } = "";
+
+            public Extents3d WrapperBounds { get; set; }
+            public Extents3d ContentBounds { get; set; }
+
+            public bool HasMetaBounds { get; set; }
+            public Extents3d MetaBounds { get; set; }
+
+            public List<RootUnitInfo> MetaMembers { get; } = new();
+            public List<WrapperViewAnchorGroup> Views { get; } = new();
+            public List<RootUnitInfo> LooseMembers { get; } = new();
+
+            public List<WrapperMemberAssignment> Assignments { get; } = new();
+
+            public int TotalMemberCount { get; set; }
+            public int MetaMemberCount { get; set; }
+            public int ViewAnchorCount { get; set; }
+            public int ViewAttachedCount { get; set; }
+            public int LooseMemberCount { get; set; }
+        }
+
+        private static WrapperInternalStructure AnalyzeWrapperInternalStructure(
+    WrapperExportBucket bucket,
+    WrapperSheetProfile profile)
+        {
+            var result = new WrapperInternalStructure
+            {
+                Row = bucket.Row,
+                Col = bucket.Col,
+                WrapperIndex = bucket.Index,
+                WrapperHandle = GetRootHandle(bucket.Wrapper),
+                WrapperBlockName = bucket.Wrapper.BlockName ?? string.Empty,
+                WrapperKind = profile.Kind,
+                WrapperConfidence = profile.Confidence,
+                WrapperBounds = bucket.Wrapper.Bounds,
+                ContentBounds = bucket.HasBounds ? bucket.Bounds : bucket.Wrapper.Bounds,
+                TotalMemberCount = bucket.Members.Count
+            };
+
+            if (!bucket.HasBounds)
+            {
+                result.Status = WrapperInternalStatus.SkippedNoBounds;
+                result.StatusReason = "bucket has no valid bounds";
+                return result;
+            }
+
+            if (profile.Kind != WrapperSheetKind.ProductionSheet)
+            {
+                result.Status = WrapperInternalStatus.SkippedNotProductionSheet;
+                result.StatusReason = $"wrapper kind is {profile.Kind}";
+                return result;
+            }
+
+            // Step 1. Meta bounds 계산
+            // Step 2. Meta 멤버 선분리
+            // Step 3. View anchor 후보 추출
+            // Step 4. 나머지 멤버 귀속
+            // Step 5. 카운트/그룹 bounds 정리
+
+            result.Status = WrapperInternalStatus.Analyzed;
+            result.StatusReason = "ok";
+            return result;
         }
 
         private static void DumpSpecificRootTraceInExport(
@@ -1687,7 +1837,9 @@ namespace FluxCAD.BricsCAD.Plugin26
 
                 if (text.Contains("수량", StringComparison.OrdinalIgnoreCase) ||
                     text.Contains("QTY", StringComparison.OrdinalIgnoreCase) ||
-                    Regex.IsMatch(text, @"\b\d+\s*(EA|PCS)\b"))
+                    Regex.IsMatch(text, @"\b\d+\s*(EA|PCS|SET)\b", RegexOptions.IgnoreCase) ||
+                    Regex.IsMatch(text, @"\b\d+\s*[*xX]\s*\d+\s*SET\b", RegexOptions.IgnoreCase) ||
+                    Regex.IsMatch(text, @"\b\d+\s*[*xX]\s*\d+\b", RegexOptions.IgnoreCase))
                 {
                     p.QuantityHintScore++;
                 }
@@ -1752,33 +1904,80 @@ namespace FluxCAD.BricsCAD.Plugin26
             int detailScore = 0;
             int metaScore = 0;
 
+            // -------------------------
+            // Production 가점
+            // -------------------------
             if (p.LineLikeCount >= 10) productionScore += 2;
-            if (p.DimensionCount >= 1) productionScore += 2;
-            if (p.TextCount >= 3) productionScore += 1;
+            if (p.DimensionCount >= 8) productionScore += 2;
+            if (p.TextCount >= 5) productionScore += 1;
             if (p.MetaRegionScore >= 1) productionScore += 2;
             if (p.GeometryScore >= 2) productionScore += 2;
             if (p.SizeScore >= 2) productionScore += 1;
 
-            if (p.LineLikeCount >= 5 && p.DimensionCount >= 2 && p.MetaRegionScore == 0)
-                detailScore += 3;
+            if (p.RepeatedTextScore >= 8) productionScore += 1;
+            if (p.RepeatedLayoutScore >= 2) productionScore += 1;
+            if (p.KeywordScore >= 1) productionScore += 1;
+
+            // Qty는 보조 힌트만
+            if (p.QuantityHintScore >= 1) productionScore += 0;
+
+            // -------------------------
+            // Detail 가점
+            // -------------------------
+            if (p.DimensionCount >= 4 && p.TextCount >= 3 && p.MetaRegionScore == 0)
+                detailScore += 2;
+
+            if (p.PrimitiveCount >= 10 && p.DimensionCount >= 4 && p.MetaRegionScore == 0)
+                detailScore += 2;
+
             if (p.GeometryScore >= 2 && p.SizeScore >= 1 && p.MetaRegionScore == 0)
                 detailScore += 2;
 
+            if (p.LineLikeCount >= 3)
+                detailScore += 1;
+
+            if (p.RepeatedTextScore >= 6 && p.MetaRegionScore == 0 && p.DimensionCount >= 6)
+                detailScore += 1;
+
+            // 작은 wrapper는 detail 쪽으로 기울이기
+            if (p.SizeScore <= 2 && p.MetaRegionScore == 0 && p.DimensionCount <= 12)
+                detailScore += 1;
+
+            // -------------------------
+            // Meta 가점
+            // -------------------------
             if (p.TextCount >= 8) metaScore += 2;
             if (p.KeywordScore >= 3) metaScore += 2;
             if (p.LineLikeCount <= 3 && p.DimensionCount == 0) metaScore += 2;
             if (p.MaterialHintScore + p.QuantityHintScore + p.ThicknessHintScore >= 2 && p.GeometryScore <= 1)
                 metaScore += 1;
 
-            if (productionScore >= 7 && productionScore >= metaScore)
+            // -------------------------
+            // Production 게이트
+            // -------------------------
+            bool hasProductionStructureSignal =
+                p.MetaRegionScore >= 1 ||
+                p.RepeatedLayoutScore >= 2 ||
+                p.RepeatedTextScore >= 8 ||
+                p.KeywordScore >= 1 ||
+                p.DimensionCount >= 20 ||
+                p.TextCount >= 8;
+
+            // -------------------------
+            // 최종 판정
+            // -------------------------
+            if (hasProductionStructureSignal &&
+                productionScore >= 7 &&
+                productionScore >= metaScore &&
+                productionScore >= detailScore)
             {
                 p.Kind = WrapperSheetKind.ProductionSheet;
                 p.Confidence = ConfidenceGrade.High;
-                p.ReasonSummary = "geometry/dimension/meta-region balanced";
+                p.ReasonSummary = "geometry/dimension with production structure signal";
                 return;
             }
 
-            if (metaScore >= 5 && metaScore > productionScore)
+            if (metaScore >= 5 && metaScore > productionScore && metaScore >= detailScore)
             {
                 p.Kind = WrapperSheetKind.MetaOnly;
                 p.Confidence = ConfidenceGrade.High;
@@ -1786,7 +1985,7 @@ namespace FluxCAD.BricsCAD.Plugin26
                 return;
             }
 
-            if (detailScore >= 4)
+            if (detailScore >= 5 && detailScore >= productionScore - 1)
             {
                 p.Kind = WrapperSheetKind.DetailOnly;
                 p.Confidence = ConfidenceGrade.Medium;
@@ -1794,11 +1993,27 @@ namespace FluxCAD.BricsCAD.Plugin26
                 return;
             }
 
-            if (productionScore >= 4 || metaScore >= 3 || detailScore >= 2)
+            if (hasProductionStructureSignal && productionScore >= 5)
             {
                 p.Kind = WrapperSheetKind.Mixed;
                 p.Confidence = ConfidenceGrade.Medium;
-                p.ReasonSummary = "mixed signals";
+                p.ReasonSummary = "mixed-lean-production";
+                return;
+            }
+
+            if (detailScore >= 3)
+            {
+                p.Kind = WrapperSheetKind.Mixed;
+                p.Confidence = ConfidenceGrade.Medium;
+                p.ReasonSummary = "mixed-lean-detail";
+                return;
+            }
+
+            if (metaScore >= 3)
+            {
+                p.Kind = WrapperSheetKind.Mixed;
+                p.Confidence = ConfidenceGrade.Medium;
+                p.ReasonSummary = "mixed-lean-meta";
                 return;
             }
 
