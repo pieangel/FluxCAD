@@ -610,6 +610,1102 @@ namespace FluxCAD.BricsCAD.Plugin26
         private static List<double>? _cachedGridYs;
 
 
+        [CommandMethod("FLUX_TRACE_ROOT_OWNER")]
+        public static void FluxTraceRootOwner()
+        {
+            var doc = Application.DocumentManager.MdiActiveDocument;
+            var db = doc.Database;
+            var ed = doc.Editor;
+
+            if (_cachedGridXs == null || _cachedGridYs == null ||
+                _cachedGridXs.Count < 2 || _cachedGridYs.Count < 2)
+            {
+                ed.WriteMessage("\n[FluxCAD] Cached grid가 없습니다. 먼저 FLUX_DEBUG_GRID_CELLS를 실행하세요.");
+                return;
+            }
+
+            int rows = _cachedGridYs.Count - 1;
+            int cols = _cachedGridXs.Count - 1;
+
+            var rowRes = ed.GetInteger(new PromptIntegerOptions($"\nrow 입력 (0 ~ {rows - 1})")
+            {
+                AllowNegative = false,
+                AllowZero = true,
+                AllowNone = false,
+                DefaultValue = 1
+            });
+            if (rowRes.Status != PromptStatus.OK) return;
+
+            var colRes = ed.GetInteger(new PromptIntegerOptions($"\ncol 입력 (0 ~ {cols - 1})")
+            {
+                AllowNegative = false,
+                AllowZero = true,
+                AllowNone = false,
+                DefaultValue = 1
+            });
+            if (colRes.Status != PromptStatus.OK) return;
+
+            var handleRes = ed.GetString(new PromptStringOptions("\n추적할 handle 입력")
+            {
+                AllowSpaces = false
+            });
+            if (handleRes.Status != PromptStatus.OK) return;
+
+            int r = rowRes.Value;
+            int c = colRes.Value;
+            string targetHandle = (handleRes.StringResult ?? "").Trim();
+
+            if (r < 0 || r >= rows || c < 0 || c >= cols || string.IsNullOrWhiteSpace(targetHandle))
+            {
+                ed.WriteMessage("\n[FluxCAD] 입력값이 잘못되었습니다.");
+                return;
+            }
+
+            var gridBounds = new Extents3d(
+                new Point3d(_cachedGridXs.First(), _cachedGridYs.First(), 0),
+                new Point3d(_cachedGridXs.Last(), _cachedGridYs.Last(), 0));
+
+            using (var tr = db.TransactionManager.StartTransaction())
+            {
+                var roots = CollectRootUnitsInBounds(db, tr, gridBounds);
+                var cell = AnalyzeCellInnerScene(roots, r, c);
+
+                ed.WriteMessage($"\n[TraceRootOwner] row={r} col={c} handle={targetHandle}");
+                ed.WriteMessage($"\n  CellStatus={cell.Status}");
+
+                var cellBounds = GetCachedCellBoundsRaw(r, c);
+                ed.WriteMessage(
+                    $"\n  CellBounds Min=({cellBounds.MinPoint.X:F2},{cellBounds.MinPoint.Y:F2}) " +
+                    $"Max=({cellBounds.MaxPoint.X:F2},{cellBounds.MaxPoint.Y:F2})");
+
+                RootUnitInfo? globalRoot = roots.FirstOrDefault(x =>
+                    string.Equals(GetRootHandle(x), targetHandle, StringComparison.OrdinalIgnoreCase));
+
+                RootUnitInfo? acceptedRoot = cell.AcceptedRoots.FirstOrDefault(x =>
+                    string.Equals(GetRootHandle(x), targetHandle, StringComparison.OrdinalIgnoreCase));
+
+                RootUnitInfo? exportRoot = cell.ExportRoots.FirstOrDefault(x =>
+                    string.Equals(GetRootHandle(x), targetHandle, StringComparison.OrdinalIgnoreCase));
+
+                var target = exportRoot ?? acceptedRoot ?? globalRoot;
+
+                ed.WriteMessage(
+                    $"\n  InGlobalRoots={(globalRoot != null ? "Y" : "N")} " +
+                    $"InAcceptedRoots={(acceptedRoot != null ? "Y" : "N")} " +
+                    $"InExportRoots={(exportRoot != null ? "Y" : "N")}");
+
+                if (target == null)
+                {
+                    ed.WriteMessage("\n  Target handle을 현재 수집된 roots에서 찾지 못했습니다.");
+                    tr.Commit();
+                    return;
+                }
+
+                ed.WriteMessage(
+                    $"\n  Target Type={target.TypeName} Block={target.BlockName ?? "-"} " +
+                    $"Center=({target.Center.X:F2},{target.Center.Y:F2}) W={target.Width:F2} H={target.Height:F2}");
+
+                ed.WriteMessage(
+                    $"\n  TargetBounds Min=({target.Bounds.MinPoint.X:F2},{target.Bounds.MinPoint.Y:F2}) " +
+                    $"Max=({target.Bounds.MaxPoint.X:F2},{target.Bounds.MaxPoint.Y:F2})");
+
+                var buckets = BuildWrapperExportBucketsForCell(roots, cell, r, c, out int unassignedCount);
+                var ownerMap = BuildRootOwnerMap(buckets);
+                var cellExportRootHandles = ExtractRootHandleSet(cell.ExportRoots);
+
+                ed.WriteMessage(
+                    $"\n  WrapperBuckets={buckets.Count} UnassignedCount={unassignedCount}");
+
+                if (ownerMap.TryGetValue(targetHandle, out var owner))
+                {
+                    ed.WriteMessage(
+                        $"\n  SelectedAnywhere=Y Owner=({BuildOwnerSummary(owner)})");
+                }
+                else
+                {
+                    ed.WriteMessage("\n  SelectedAnywhere=N Owner=<none>");
+                }
+
+                if (buckets.Count == 0)
+                {
+                    ed.WriteMessage("\n  bucket이 없습니다.");
+                    tr.Commit();
+                    return;
+                }
+
+                ed.WriteMessage("\n  [PerWrapperScore]");
+                foreach (var b in buckets)
+                {
+                    var w = b.Wrapper;
+
+                    bool centerIn = ContainsPoint(w.Bounds, target.Center);
+                    double overlap = IntersectionAreaRatio(w.Bounds, target.Bounds);
+
+                    double dx = target.Center.X - w.Center.X;
+                    double dy = target.Center.Y - w.Center.Y;
+                    double dist = Math.Sqrt(dx * dx + dy * dy);
+
+                    double diag = Math.Sqrt(w.Width * w.Width + w.Height * w.Height);
+                    if (diag < 1e-9)
+                        diag = 1.0;
+
+                    double distNorm = dist / diag;
+                    bool eligible = centerIn || overlap >= 0.20;
+
+                    double score = double.NegativeInfinity;
+                    if (eligible)
+                    {
+                        score = 0.0;
+                        score += overlap * 1000.0;
+
+                        if (centerIn)
+                            score += 100.0;
+
+                        score -= distNorm * 10.0;
+
+                        if (target.IsBlockReference)
+                            score += overlap * 100.0;
+                    }
+
+                    ed.WriteMessage(
+                        $"\n    [w{b.Index}] Handle={GetRootHandle(w)} Block={w.BlockName ?? "-"} " +
+                        $"CenterIn={(centerIn ? "Y" : "N")} Overlap={overlap:F4} " +
+                        $"DistNorm={distNorm:F4} Eligible={(eligible ? "Y" : "N")} " +
+                        $"Score={(double.IsNegativeInfinity(score) ? "-INF" : score.ToString("F4"))}");
+                }
+
+                ed.WriteMessage("\n  [PerWrapperAudit]");
+                foreach (var b in buckets)
+                {
+                    var selectedHandles = ExtractSelectedHandlesFromBucket(b);
+
+                    var audit = AuditSingleRootForWrapperBlockRef(
+                        tr,
+                        target,
+                        b.Wrapper.Bounds,
+                        cellExportRootHandles,
+                        selectedHandles,
+                        ownerMap);
+
+                    ed.WriteMessage($"\n    [w{b.Index}] " + FormatBlockRefAuditRow(audit));
+                }
+
+                tr.Commit();
+            }
+        }
+
+        private static List<WrapperCluster> BuildWrapperClustersForCell(
+    List<WrapperExportBucket> buckets)
+        {
+            var result = new List<WrapperCluster>();
+
+            if (buckets == null || buckets.Count == 0)
+                return result;
+
+            var items = buckets
+                .Where(b => b != null && b.Wrapper != null && b.HasBounds)
+                .Select(b => new
+                {
+                    Bucket = b,
+                    Profile = BuildWrapperSheetProfile(b)
+                })
+                .OrderBy(x => x.Bucket.Index)
+                .ToList();
+
+            if (items.Count == 0)
+                return result;
+
+            int n = items.Count;
+            var visited = new bool[n];
+            int clusterId = 1;
+
+            for (int i = 0; i < n; i++)
+            {
+                if (visited[i])
+                    continue;
+
+                var queue = new Queue<int>();
+                var group = new List<int>();
+
+                visited[i] = true;
+                queue.Enqueue(i);
+
+                while (queue.Count > 0)
+                {
+                    int cur = queue.Dequeue();
+                    group.Add(cur);
+
+                    for (int j = 0; j < n; j++)
+                    {
+                        if (visited[j])
+                            continue;
+
+                        if (CanBelongToSameWrapperCluster(
+                            items[cur].Bucket, items[cur].Profile,
+                            items[j].Bucket, items[j].Profile))
+                        {
+                            visited[j] = true;
+                            queue.Enqueue(j);
+                        }
+                    }
+                }
+
+                var cluster = new WrapperCluster
+                {
+                    Row = items[group[0]].Bucket.Row,
+                    Col = items[group[0]].Bucket.Col,
+                    ClusterId = clusterId++
+                };
+
+                foreach (int idx in group.OrderBy(x => items[x].Bucket.Index))
+                {
+                    var b = items[idx].Bucket;
+                    var p = items[idx].Profile;
+
+                    cluster.MemberBuckets.Add(b);
+                    cluster.MemberWrapperIndexes.Add(b.Index);
+                    cluster.MemberWrapperHandles.Add(GetRootHandle(b.Wrapper));
+                    cluster.MemberWrapperBlockNames.Add(b.Wrapper.BlockName ?? "");
+
+                    string blockName = b.Wrapper.BlockName ?? "";
+                    if (!string.IsNullOrWhiteSpace(blockName) &&
+                        !cluster.MainBlockNames.Contains(blockName, StringComparer.OrdinalIgnoreCase))
+                    {
+                        cluster.MainBlockNames.Add(blockName);
+                    }
+
+                    // 1차 구현에서는 비워 두거나 약한 힌트만 태운다.
+                    if (p.MetaRegionScore >= 2 &&
+                        !string.IsNullOrWhiteSpace(blockName) &&
+                        !cluster.TitleBlockNames.Contains(blockName, StringComparer.OrdinalIgnoreCase))
+                    {
+                        cluster.TitleBlockNames.Add(blockName);
+                    }
+
+                    if (blockName.IndexOf("PLI", StringComparison.OrdinalIgnoreCase) >= 0 &&
+                        !cluster.PliBlockNames.Contains(blockName, StringComparer.OrdinalIgnoreCase))
+                    {
+                        cluster.PliBlockNames.Add(blockName);
+                    }
+                }
+
+                if (TryUnionBucketBounds(cluster.MemberBuckets, out var union))
+                {
+                    cluster.HasBounds = true;
+                    cluster.UnionBounds = union;
+                }
+
+                var rep = cluster.MemberBuckets
+                    .Select(b => new
+                    {
+                        Bucket = b,
+                        Profile = items.First(x => x.Bucket.Index == b.Index).Profile,
+                        Area = AreaOf(b.Bounds)
+                    })
+                    .OrderByDescending(x => x.Profile.Kind == WrapperSheetKind.ProductionSheet ? 3 :
+                                            x.Profile.Kind == WrapperSheetKind.DetailOnly ? 2 :
+                                            x.Profile.Kind == WrapperSheetKind.Mixed ? 1 : 0)
+                    .ThenByDescending(x => x.Area)
+                    .ThenBy(x => x.Bucket.Index)
+                    .First();
+
+                cluster.RepresentativeWrapperIndex = rep.Bucket.Index;
+                cluster.RepresentativeWrapperHandle = GetRootHandle(rep.Bucket.Wrapper);
+                cluster.RepresentativeWrapperBlockName = rep.Bucket.Wrapper.BlockName ?? "";
+
+                result.Add(cluster);
+            }
+
+            return result;
+        }
+
+        private static bool CanBelongToSameWrapperCluster(
+            WrapperExportBucket a,
+            WrapperSheetProfile pa,
+            WrapperExportBucket b,
+            WrapperSheetProfile pb)
+        {
+            if (a == null || b == null || pa == null || pb == null)
+                return false;
+
+            if (!a.HasBounds || !b.HasBounds)
+                return false;
+
+            if (a.Index == b.Index)
+                return true;
+
+            // meta-only 는 1차에서는 detail cluster 대상에서 제외
+            if (pa.Kind == WrapperSheetKind.MetaOnly || pb.Kind == WrapperSheetKind.MetaOnly)
+                return false;
+
+            // family 유사성
+            if (!IsSimilarWrapperFamilyName(a.Wrapper.BlockName, b.Wrapper.BlockName))
+                return false;
+
+            // 세로로 어느 정도 같은 band 안에 있어야 함
+            double yOverlapRatio = GetYAxisOverlapRatio(a.Bounds, b.Bounds);
+            if (yOverlapRatio < 0.45)
+                return false;
+
+            // 가로 gap 이 너무 크면 다른 detail로 본다
+            double xGap = GetHorizontalGap(a.Bounds, b.Bounds);
+            double refWidth = Math.Max(1.0, Math.Min(WidthOf(a.Bounds), WidthOf(b.Bounds)));
+            double xGapThreshold = Math.Max(120.0, refWidth * 0.75);
+
+            if (xGap > xGapThreshold)
+                return false;
+
+            // 크기 차이가 너무 심하면 일단 보수적으로 제외
+            double ah = Math.Max(1.0, HeightOf(a.Bounds));
+            double bh = Math.Max(1.0, HeightOf(b.Bounds));
+            double hRatio = Math.Min(ah, bh) / Math.Max(ah, bh);
+
+            if (hRatio < 0.45)
+                return false;
+
+            return true;
+        }
+
+        private static bool IsSimilarWrapperFamilyName(string? a, string? b)
+        {
+            string sa = NormalizeWrapperFamilyName(a);
+            string sb = NormalizeWrapperFamilyName(b);
+
+            if (string.IsNullOrWhiteSpace(sa) || string.IsNullOrWhiteSpace(sb))
+                return false;
+
+            if (string.Equals(sa, sb, StringComparison.OrdinalIgnoreCase))
+                return true;
+
+            int lcp = CommonPrefixLength(sa, sb);
+            int minLen = Math.Min(sa.Length, sb.Length);
+
+            if (lcp >= 6 && (double)lcp / Math.Max(1, minLen) >= 0.60)
+                return true;
+
+            return false;
+        }
+
+        private static string NormalizeWrapperFamilyName(string? s)
+        {
+            if (string.IsNullOrWhiteSpace(s))
+                return "";
+
+            string x = s.Trim().ToUpperInvariant();
+            x = Regex.Replace(x, @"\s+", "");
+            return x;
+        }
+
+        private static int CommonPrefixLength(string a, string b)
+        {
+            int len = Math.Min(a.Length, b.Length);
+            int i = 0;
+
+            while (i < len && a[i] == b[i])
+                i++;
+
+            return i;
+        }
+
+        private static double GetYAxisOverlapRatio(Extents3d a, Extents3d b)
+        {
+            double iy = Math.Max(0.0,
+                Math.Min(a.MaxPoint.Y, b.MaxPoint.Y) -
+                Math.Max(a.MinPoint.Y, b.MinPoint.Y));
+
+            double denom = Math.Max(1e-9, Math.Min(HeightOf(a), HeightOf(b)));
+            return iy / denom;
+        }
+
+        private static double GetHorizontalGap(Extents3d a, Extents3d b)
+        {
+            if (a.MaxPoint.X < b.MinPoint.X)
+                return b.MinPoint.X - a.MaxPoint.X;
+
+            if (b.MaxPoint.X < a.MinPoint.X)
+                return a.MinPoint.X - b.MaxPoint.X;
+
+            return 0.0;
+        }
+
+        private static bool TryUnionBucketBounds(
+            IEnumerable<WrapperExportBucket> buckets,
+            out Extents3d union)
+        {
+            union = default;
+            bool hasAny = false;
+
+            if (buckets == null)
+                return false;
+
+            foreach (var b in buckets)
+            {
+                if (b == null || !b.HasBounds)
+                    continue;
+
+                if (!hasAny)
+                {
+                    union = b.Bounds;
+                    hasAny = true;
+                }
+                else
+                {
+                    union = new Extents3d(
+                        new Point3d(
+                            Math.Min(union.MinPoint.X, b.Bounds.MinPoint.X),
+                            Math.Min(union.MinPoint.Y, b.Bounds.MinPoint.Y),
+                            Math.Min(union.MinPoint.Z, b.Bounds.MinPoint.Z)),
+                        new Point3d(
+                            Math.Max(union.MaxPoint.X, b.Bounds.MaxPoint.X),
+                            Math.Max(union.MaxPoint.Y, b.Bounds.MaxPoint.Y),
+                            Math.Max(union.MaxPoint.Z, b.Bounds.MaxPoint.Z)));
+                }
+            }
+
+            return hasAny;
+        }
+
+        private static void WriteWrapperClusterLog(Editor ed, WrapperCluster c)
+        {
+            string members = string.Join(", ",
+                c.MemberWrapperIndexes.Select((idx, i) =>
+                    $"w{idx}:{(i < c.MemberWrapperHandles.Count ? c.MemberWrapperHandles[i] : "")}:{(i < c.MemberWrapperBlockNames.Count ? c.MemberWrapperBlockNames[i] : "")}"));
+
+            ed.WriteMessage(
+                $"\n    [Cluster {c.ClusterId}] " +
+                $"Wrappers={c.MemberBuckets.Count} " +
+                $"Rep=w{c.RepresentativeWrapperIndex}:{c.RepresentativeWrapperHandle}:{c.RepresentativeWrapperBlockName}");
+
+            if (c.HasBounds)
+            {
+                ed.WriteMessage(
+                    $"\n      UnionMin=({c.UnionBounds.MinPoint.X:F2},{c.UnionBounds.MinPoint.Y:F2}) " +
+                    $"UnionMax=({c.UnionBounds.MaxPoint.X:F2},{c.UnionBounds.MaxPoint.Y:F2}) " +
+                    $"W={WidthOf(c.UnionBounds):F2} H={HeightOf(c.UnionBounds):F2}");
+            }
+
+            ed.WriteMessage($"\n      Members={members}");
+
+            if (c.MainBlockNames.Count > 0)
+                ed.WriteMessage($"\n      MainBlocks={string.Join(", ", c.MainBlockNames)}");
+
+            if (c.TitleBlockNames.Count > 0)
+                ed.WriteMessage($"\n      TitleBlocks={string.Join(", ", c.TitleBlockNames)}");
+
+            if (c.PliBlockNames.Count > 0)
+                ed.WriteMessage($"\n      PliBlocks={string.Join(", ", c.PliBlockNames)}");
+        }
+        private sealed class RootOwnerInfo
+        {
+            public string RootHandle { get; set; } = "";
+
+            public List<int> OwnerWrapperIndexes { get; } = new();
+            public List<string> OwnerWrapperHandles { get; } = new();
+            public List<string> OwnerWrapperBlockNames { get; } = new();
+
+            public bool HasOwner => OwnerWrapperIndexes.Count > 0;
+
+            public int? PrimaryOwnerWrapperIndex =>
+                OwnerWrapperIndexes.Count > 0 ? OwnerWrapperIndexes[0] : null;
+
+            public string PrimaryOwnerWrapperHandle =>
+                OwnerWrapperHandles.Count > 0 ? OwnerWrapperHandles[0] : "";
+
+            public string PrimaryOwnerWrapperBlockName =>
+                OwnerWrapperBlockNames.Count > 0 ? OwnerWrapperBlockNames[0] : "";
+        }
+
+        private enum BlockRefAuditDecision
+        {
+            Accept,
+            Reject,
+            Skip
+        }
+
+        private enum BlockRefAuditReason
+        {
+            None,
+
+            // Skip
+            Skipped_NotBlockReference,
+
+            // Accept
+            Accepted_InsertPointInside,
+            Accepted_BlockExtentsIntersect,
+            Accepted_ChildUnionIntersect,
+
+            // Reject
+            Rejected_IsPartition,
+            Rejected_NotInCellExportRoots,
+            Rejected_NoEntity,
+            Rejected_NoBounds,
+            Rejected_BlockExtentsOutside,
+            Rejected_ChildUnionOutside,
+            Rejected_BlockReadException,
+            Rejected_ChildUnionException
+        }
+
+        private sealed class BlockRefAuditRow
+        {
+            public string Handle { get; set; } = "";
+            public string TypeName { get; set; } = "";
+            public string? BlockName { get; set; }
+            public string? Layer { get; set; }
+
+            public bool IsBlockReference { get; set; }
+            public bool IsPartition { get; set; }
+
+            public bool InCellExportRoots { get; set; }
+            public bool ActuallySelected { get; set; }
+
+            // 새로 추가
+            public bool SelectedAnywhere { get; set; }
+            public int? OwnerWrapperIndex { get; set; }
+            public string OwnerWrapperHandle { get; set; } = "";
+            public string OwnerWrapperBlockName { get; set; } = "";
+            public string OwnerSummary { get; set; } = "";
+
+            public Point3d? InsertPoint { get; set; }
+
+            public bool HasBounds { get; set; }
+            public Extents3d? Bounds { get; set; }
+
+            public bool InsertInsideWrapper { get; set; }
+            public bool BoundsIntersectWrapper { get; set; }
+            public double OverlapRatio { get; set; }
+
+            public bool ChildUnionAvailable { get; set; }
+            public Extents3d? ChildUnionBounds { get; set; }
+            public bool ChildUnionIntersectsWrapper { get; set; }
+
+            public BlockRefAuditDecision Decision { get; set; }
+            public BlockRefAuditReason Reason { get; set; }
+            public string Detail { get; set; } = "";
+        }
+
+        private static HashSet<string> ExtractRootHandleSet(IEnumerable<RootUnitInfo> roots)
+        {
+            var set = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+            if (roots == null)
+                return set;
+
+            foreach (var r in roots)
+            {
+                if (r == null)
+                    continue;
+
+                var h = GetRootHandle(r);
+                if (!string.IsNullOrWhiteSpace(h))
+                    set.Add(h);
+            }
+
+            return set;
+        }
+
+        private static HashSet<string> ExtractSelectedHandlesFromBucket(WrapperExportBucket bucket)
+        {
+            return ExtractRootHandleSet(bucket.Members);
+        }
+
+        private static Dictionary<string, RootOwnerInfo> BuildRootOwnerMap(
+            IEnumerable<WrapperExportBucket> buckets)
+        {
+            var map = new Dictionary<string, RootOwnerInfo>(StringComparer.OrdinalIgnoreCase);
+
+            if (buckets == null)
+                return map;
+
+            foreach (var bucket in buckets)
+            {
+                if (bucket == null)
+                    continue;
+
+                string ownerHandle = GetRootHandle(bucket.Wrapper);
+                string ownerBlock = bucket.Wrapper?.BlockName ?? "";
+
+                foreach (var m in bucket.Members)
+                {
+                    if (m == null)
+                        continue;
+
+                    string rootHandle = GetRootHandle(m);
+                    if (string.IsNullOrWhiteSpace(rootHandle))
+                        continue;
+
+                    if (!map.TryGetValue(rootHandle, out var info))
+                    {
+                        info = new RootOwnerInfo
+                        {
+                            RootHandle = rootHandle
+                        };
+                        map[rootHandle] = info;
+                    }
+
+                    if (!info.OwnerWrapperIndexes.Contains(bucket.Index))
+                        info.OwnerWrapperIndexes.Add(bucket.Index);
+
+                    if (!info.OwnerWrapperHandles.Contains(ownerHandle, StringComparer.OrdinalIgnoreCase))
+                        info.OwnerWrapperHandles.Add(ownerHandle);
+
+                    if (!info.OwnerWrapperBlockNames.Contains(ownerBlock, StringComparer.OrdinalIgnoreCase))
+                        info.OwnerWrapperBlockNames.Add(ownerBlock);
+                }
+            }
+
+            return map;
+        }
+
+        private static string BuildOwnerSummary(RootOwnerInfo? info)
+        {
+            if (info == null || !info.HasOwner)
+                return "";
+
+            var parts = new List<string>();
+
+            for (int i = 0; i < info.OwnerWrapperIndexes.Count; i++)
+            {
+                int idx = info.OwnerWrapperIndexes[i];
+                string h = i < info.OwnerWrapperHandles.Count ? info.OwnerWrapperHandles[i] : "";
+                string b = i < info.OwnerWrapperBlockNames.Count ? info.OwnerWrapperBlockNames[i] : "";
+
+                parts.Add($"w{idx}:{h}:{b}");
+            }
+
+            return string.Join(", ", parts);
+        }
+
+        private static bool TryGetRootBounds(RootUnitInfo root, out Extents3d bounds)
+        {
+            bounds = root.Bounds;
+            return true;
+        }
+
+        private static void DumpWrapperBlockRefAudit(
+        Editor ed,
+        Transaction tr,
+        int row,
+        int col,
+        int wrapperIndex,
+        Extents3d wrapperBounds,
+        IReadOnlyList<RootUnitInfo> roots,
+        ISet<string>? cellExportRootHandles,
+        ISet<string>? actuallySelectedHandles,
+        IReadOnlyDictionary<string, RootOwnerInfo>? ownerMap,
+        bool includeSkippedNonBlock = false)
+        {
+            var rows = new List<BlockRefAuditRow>();
+
+            foreach (var root in roots)
+            {
+                var audit = AuditSingleRootForWrapperBlockRef(
+                    tr,
+                    root,
+                    wrapperBounds,
+                    cellExportRootHandles,
+                    actuallySelectedHandles,
+                    ownerMap);
+
+                rows.Add(audit);
+            }
+
+            var blockRows = rows.Where(x => x.IsBlockReference).ToList();
+            var accepted = blockRows.Where(x => x.Decision == BlockRefAuditDecision.Accept).ToList();
+            var rejected = blockRows.Where(x => x.Decision == BlockRefAuditDecision.Reject).ToList();
+            var skipped = rows.Where(x => x.Decision == BlockRefAuditDecision.Skip).ToList();
+
+            var acceptedButNotSelected = blockRows
+                .Where(x => x.Decision == BlockRefAuditDecision.Accept && !x.ActuallySelected)
+                .ToList();
+
+            var rejectedButSelected = blockRows
+                .Where(x => x.Decision == BlockRefAuditDecision.Reject && x.ActuallySelected)
+                .ToList();
+
+            var selectedElsewhere = blockRows
+                .Where(x => !x.ActuallySelected && x.SelectedAnywhere)
+                .ToList();
+
+            ed.WriteMessage(
+                $"\n[WrapperBlockRefAudit r{row} c{col} w{wrapperIndex}] " +
+                $"Roots={roots.Count} BlockRefs={blockRows.Count} " +
+                $"Accepted={accepted.Count} Rejected={rejected.Count} Skipped={skipped.Count}");
+
+            ed.WriteMessage(
+                $"\n  WrapperBounds Min=({wrapperBounds.MinPoint.X:F2},{wrapperBounds.MinPoint.Y:F2}) " +
+                $"Max=({wrapperBounds.MaxPoint.X:F2},{wrapperBounds.MaxPoint.Y:F2})");
+
+            if (accepted.Count > 0)
+            {
+                ed.WriteMessage("\n  [Accepted BlockReferences]");
+                foreach (var a in accepted.OrderBy(x => x.Handle))
+                    ed.WriteMessage("\n    " + FormatBlockRefAuditRow(a));
+            }
+
+            if (rejected.Count > 0)
+            {
+                ed.WriteMessage("\n  [Rejected BlockReferences]");
+                foreach (var rj in rejected.OrderBy(x => x.Handle))
+                    ed.WriteMessage("\n    " + FormatBlockRefAuditRow(rj));
+            }
+
+            if (acceptedButNotSelected.Count > 0)
+            {
+                ed.WriteMessage("\n  [Mismatch: AcceptedByAudit But NOT ActuallySelected]");
+                foreach (var x in acceptedButNotSelected.OrderBy(x => x.Handle))
+                    ed.WriteMessage("\n    " + FormatBlockRefAuditRow(x));
+            }
+
+            if (rejectedButSelected.Count > 0)
+            {
+                ed.WriteMessage("\n  [Mismatch: RejectedByAudit But ActuallySelected]");
+                foreach (var x in rejectedButSelected.OrderBy(x => x.Handle))
+                    ed.WriteMessage("\n    " + FormatBlockRefAuditRow(x));
+            }
+
+            if (selectedElsewhere.Count > 0)
+            {
+                ed.WriteMessage("\n  [Selected Somewhere Else]");
+                foreach (var x in selectedElsewhere.OrderBy(x => x.Handle))
+                    ed.WriteMessage("\n    " + FormatBlockRefAuditRow(x));
+            }
+
+            if (includeSkippedNonBlock && skipped.Count > 0)
+            {
+                ed.WriteMessage("\n  [Skipped NonBlock Roots]");
+                foreach (var s in skipped.OrderBy(x => x.Handle))
+                    ed.WriteMessage("\n    " + FormatBlockRefAuditRow(s));
+            }
+        }
+
+        private static BlockRefAuditRow AuditSingleRootForWrapperBlockRef(
+    Transaction tr,
+    RootUnitInfo root,
+    Extents3d wrapperBounds,
+    ISet<string>? cellExportRootHandles,
+    ISet<string>? actuallySelectedHandles,
+    IReadOnlyDictionary<string, RootOwnerInfo>? ownerMap)
+        {
+            string rootHandle = GetRootHandle(root);
+
+            RootOwnerInfo? owner = null;
+            if (ownerMap != null)
+                ownerMap.TryGetValue(rootHandle, out owner);
+
+            var row = new BlockRefAuditRow
+            {
+                Handle = rootHandle,
+                TypeName = root.TypeName ?? "",
+                BlockName = root.BlockName,
+                IsBlockReference = root.IsBlockReference,
+                IsPartition = root.IsPartition,
+
+                InCellExportRoots = cellExportRootHandles != null &&
+                                    cellExportRootHandles.Contains(rootHandle),
+
+                ActuallySelected = actuallySelectedHandles != null &&
+                                   actuallySelectedHandles.Contains(rootHandle),
+
+                SelectedAnywhere = owner != null && owner.HasOwner,
+                OwnerWrapperIndex = owner?.PrimaryOwnerWrapperIndex,
+                OwnerWrapperHandle = owner?.PrimaryOwnerWrapperHandle ?? "",
+                OwnerWrapperBlockName = owner?.PrimaryOwnerWrapperBlockName ?? "",
+                OwnerSummary = BuildOwnerSummary(owner)
+            };
+
+            if (TryGetRootBounds(root, out var rootBounds))
+            {
+                row.HasBounds = true;
+                row.Bounds = rootBounds;
+                row.BoundsIntersectWrapper = Intersects2D(rootBounds, wrapperBounds);
+                row.OverlapRatio = GetOverlapRatio2D(rootBounds, wrapperBounds);
+            }
+
+
+            if (!root.IsBlockReference)
+            {
+                row.Decision = BlockRefAuditDecision.Skip;
+                row.Reason = BlockRefAuditReason.Skipped_NotBlockReference;
+                row.Detail = "root is not BlockReference";
+                return row;
+            }
+
+            if (root.IsPartition)
+            {
+                row.Decision = BlockRefAuditDecision.Reject;
+                row.Reason = BlockRefAuditReason.Rejected_IsPartition;
+                row.Detail = "root is marked as partition";
+                return row;
+            }
+
+            Entity? ent = null;
+            BlockReference? br = null;
+
+            try
+            {
+                ent = tr.GetObject(root.Id, OpenMode.ForRead, false) as Entity;
+                br = ent as BlockReference;
+            }
+            catch (Teigha.Runtime.Exception ex)
+            {
+                row.Decision = BlockRefAuditDecision.Reject;
+                row.Reason = BlockRefAuditReason.Rejected_BlockReadException;
+                row.Detail = ex.GetType().Name + ": " + ex.Message;
+                return row;
+            }
+
+            if (ent == null || br == null)
+            {
+                row.Decision = BlockRefAuditDecision.Reject;
+                row.Reason = BlockRefAuditReason.Rejected_NoEntity;
+                row.Detail = "entity open failed or not a BlockReference";
+                return row;
+            }
+
+            row.Layer = ent.Layer;
+            row.InsertPoint = br.Position;
+            row.InsertInsideWrapper = ContainsPoint2D(wrapperBounds, br.Position);
+
+            if (row.InsertInsideWrapper)
+            {
+                row.Decision = BlockRefAuditDecision.Accept;
+                row.Reason = BlockRefAuditReason.Accepted_InsertPointInside;
+                row.Detail = "block insert point inside wrapper";
+                return row;
+            }
+
+            if (row.HasBounds && row.BoundsIntersectWrapper)
+            {
+                row.Decision = BlockRefAuditDecision.Accept;
+                row.Reason = BlockRefAuditReason.Accepted_BlockExtentsIntersect;
+                row.Detail = $"block extents intersect wrapper (overlap={row.OverlapRatio:F3})";
+                return row;
+            }
+
+            if (!row.HasBounds)
+            {
+                if (TryGetEntityExtentsSafe(ent, out var entExt, out var extDetail))
+                {
+                    row.HasBounds = true;
+                    row.Bounds = entExt;
+                    row.BoundsIntersectWrapper = Intersects2D(entExt, wrapperBounds);
+                    row.OverlapRatio = GetOverlapRatio2D(entExt, wrapperBounds);
+
+                    if (row.BoundsIntersectWrapper)
+                    {
+                        row.Decision = BlockRefAuditDecision.Accept;
+                        row.Reason = BlockRefAuditReason.Accepted_BlockExtentsIntersect;
+                        row.Detail = $"entity extents intersect wrapper (overlap={row.OverlapRatio:F3})";
+                        return row;
+                    }
+                }
+                else
+                {
+                    row.Detail = extDetail;
+                }
+            }
+
+            try
+            {
+                if (TryGetBlockChildUnionExtents(br, tr, out var childUnion, out var childCount))
+                {
+                    row.ChildUnionAvailable = true;
+                    row.ChildUnionBounds = childUnion;
+                    row.ChildUnionIntersectsWrapper = Intersects2D(childUnion, wrapperBounds);
+
+                    if (row.ChildUnionIntersectsWrapper)
+                    {
+                        row.Decision = BlockRefAuditDecision.Accept;
+                        row.Reason = BlockRefAuditReason.Accepted_ChildUnionIntersect;
+                        row.Detail = $"child union intersects wrapper (children={childCount})";
+                        return row;
+                    }
+
+                    row.Decision = BlockRefAuditDecision.Reject;
+                    row.Reason = BlockRefAuditReason.Rejected_ChildUnionOutside;
+                    row.Detail = $"insert outside, block extents outside, child union outside (children={childCount})";
+                    return row;
+                }
+
+                row.Decision = BlockRefAuditDecision.Reject;
+                row.Reason = row.HasBounds
+                    ? BlockRefAuditReason.Rejected_BlockExtentsOutside
+                    : BlockRefAuditReason.Rejected_NoBounds;
+
+                row.Detail = row.HasBounds
+                    ? "insert outside and block extents outside; child union unavailable"
+                    : "no root/entity extents and child union unavailable";
+
+                return row;
+            }
+            catch (Teigha.Runtime.Exception ex)
+            {
+                row.Decision = BlockRefAuditDecision.Reject;
+                row.Reason = BlockRefAuditReason.Rejected_ChildUnionException;
+                row.Detail = ex.GetType().Name + ": " + ex.Message;
+                return row;
+            }
+        }
+
+        private static string FormatBlockRefAuditRow(BlockRefAuditRow x)
+        {
+            string insert = x.InsertPoint.HasValue
+                ? $"Ins=({x.InsertPoint.Value.X:F2},{x.InsertPoint.Value.Y:F2})"
+                : "Ins=<none>";
+
+            string bounds = x.Bounds.HasValue
+                ? $"B=({x.Bounds.Value.MinPoint.X:F2},{x.Bounds.Value.MinPoint.Y:F2})-({x.Bounds.Value.MaxPoint.X:F2},{x.Bounds.Value.MaxPoint.Y:F2})"
+                : "B=<none>";
+
+            string child = x.ChildUnionBounds.HasValue
+                ? $"ChildB=({x.ChildUnionBounds.Value.MinPoint.X:F2},{x.ChildUnionBounds.Value.MinPoint.Y:F2})-({x.ChildUnionBounds.Value.MaxPoint.X:F2},{x.ChildUnionBounds.Value.MaxPoint.Y:F2})"
+                : "ChildB=<none>";
+
+            string owner =
+                x.SelectedAnywhere
+                ? $"Owner=({x.OwnerSummary})"
+                : "Owner=<none>";
+
+            return
+                $"Handle={x.Handle} Type={x.TypeName} Block={x.BlockName ?? "-"} Layer={x.Layer ?? "-"} " +
+                $"InCellExportRoots={(x.InCellExportRoots ? "Y" : "N")} " +
+                $"ActualSelected={(x.ActuallySelected ? "Y" : "N")} " +
+                $"SelectedAnywhere={(x.SelectedAnywhere ? "Y" : "N")} " +
+                $"Decision={x.Decision} Reason={x.Reason} " +
+                $"InsertInside={(x.InsertInsideWrapper ? "Y" : "N")} " +
+                $"BoundsIntersect={(x.BoundsIntersectWrapper ? "Y" : "N")} " +
+                $"Overlap={x.OverlapRatio:F3} " +
+                $"ChildIntersect={(x.ChildUnionIntersectsWrapper ? "Y" : "N")} " +
+                $"{owner} " +
+                $"{insert} {bounds} {child} Detail={x.Detail}";
+        }
+
+        private static bool TryGetRootBounds_old(RootUnitInfo root, out Extents3d bounds)
+        {
+            // 현재 프로젝트의 실제 구조에 맞춤: RootUnitInfo는 Bounds를 가지고 있음
+            bounds = root.Bounds;
+            return true;
+        }
+
+        private static HashSet<string> ExtractRootHandleSet_old(IEnumerable<RootUnitInfo> roots)
+        {
+            var set = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+            if (roots == null)
+                return set;
+
+            foreach (var r in roots)
+            {
+                if (r == null)
+                    continue;
+
+                var h = GetRootHandle(r);
+                if (!string.IsNullOrWhiteSpace(h))
+                    set.Add(h);
+            }
+
+            return set;
+        }
+
+        private static HashSet<string> ExtractSelectedHandlesFromBucket_old(WrapperExportBucket bucket)
+        {
+            return ExtractRootHandleSet(bucket.Members);
+        }
+
+        private static bool TryGetEntityExtentsSafe(Entity ent, out Extents3d ext, out string detail)
+        {
+            try
+            {
+                ext = ent.GeometricExtents;
+                detail = "OK";
+                return true;
+            }
+            catch (Teigha.Runtime.Exception ex)
+            {
+                ext = default;
+                detail = ex.GetType().Name + ": " + ex.Message;
+                return false;
+            }
+        }
+
+        private static bool TryGetBlockChildUnionExtents(
+            BlockReference br,
+            Transaction tr,
+            out Extents3d union,
+            out int childCount)
+        {
+            union = default;
+            childCount = 0;
+            bool hasAny = false;
+
+            var btr = (BlockTableRecord)tr.GetObject(br.BlockTableRecord, OpenMode.ForRead);
+
+            foreach (ObjectId childId in btr)
+            {
+                var child = tr.GetObject(childId, OpenMode.ForRead, false) as Entity;
+                if (child == null) continue;
+                if (child.IsErased) continue;
+
+                if (child is AttributeDefinition ad && ad.Invisible)
+                    continue;
+
+                if (!TryGetEntityExtentsSafe(child, out var childExt, out _))
+                    continue;
+
+                childExt.TransformBy(br.BlockTransform);
+
+                if (!hasAny)
+                {
+                    union = childExt;
+                    hasAny = true;
+                }
+                else
+                {
+                    union.AddExtents(childExt);
+                }
+
+                childCount++;
+            }
+
+            return hasAny;
+        }
+
+        private static bool ContainsPoint2D(Extents3d b, Point3d p)
+        {
+            return p.X >= b.MinPoint.X && p.X <= b.MaxPoint.X &&
+                   p.Y >= b.MinPoint.Y && p.Y <= b.MaxPoint.Y;
+        }
+
+        private static bool Intersects2D(Extents3d a, Extents3d b)
+        {
+            if (a.MaxPoint.X < b.MinPoint.X) return false;
+            if (a.MinPoint.X > b.MaxPoint.X) return false;
+            if (a.MaxPoint.Y < b.MinPoint.Y) return false;
+            if (a.MinPoint.Y > b.MaxPoint.Y) return false;
+            return true;
+        }
+
+        private static double GetOverlapRatio2D(Extents3d source, Extents3d clip)
+        {
+            double ix0 = Math.Max(source.MinPoint.X, clip.MinPoint.X);
+            double iy0 = Math.Max(source.MinPoint.Y, clip.MinPoint.Y);
+            double ix1 = Math.Min(source.MaxPoint.X, clip.MaxPoint.X);
+            double iy1 = Math.Min(source.MaxPoint.Y, clip.MaxPoint.Y);
+
+            double iw = Math.Max(0.0, ix1 - ix0);
+            double ih = Math.Max(0.0, iy1 - iy0);
+            double interArea = iw * ih;
+
+            double sw = Math.Max(0.0, source.MaxPoint.X - source.MinPoint.X);
+            double sh = Math.Max(0.0, source.MaxPoint.Y - source.MinPoint.Y);
+            double sourceArea = sw * sh;
+
+            if (sourceArea <= 1e-9)
+                return 0.0;
+
+            return interArea / sourceArea;
+        }
+
         private enum WrapperRegionKind
         {
             MetaRegion,
@@ -644,6 +1740,29 @@ namespace FluxCAD.BricsCAD.Plugin26
 
             public int ValidIdCount =>
                 Members.Count(x => x != null && !x.Id.IsNull && x.Id.IsValid);
+        }
+
+        private sealed class WrapperCluster
+        {
+            public int Row { get; set; }
+            public int Col { get; set; }
+            public int ClusterId { get; set; }
+
+            public List<WrapperExportBucket> MemberBuckets { get; } = new();
+            public List<int> MemberWrapperIndexes { get; } = new();
+            public List<string> MemberWrapperHandles { get; } = new();
+            public List<string> MemberWrapperBlockNames { get; } = new();
+
+            public bool HasBounds { get; set; }
+            public Extents3d UnionBounds { get; set; }
+
+            public int RepresentativeWrapperIndex { get; set; }
+            public string RepresentativeWrapperHandle { get; set; } = "";
+            public string RepresentativeWrapperBlockName { get; set; } = "";
+
+            public List<string> MainBlockNames { get; } = new();
+            public List<string> TitleBlockNames { get; } = new();
+            public List<string> PliBlockNames { get; } = new();
         }
 
         private enum WrapperSheetKind
@@ -1029,10 +2148,19 @@ namespace FluxCAD.BricsCAD.Plugin26
                         c,
                         out int unassignedCount);
 
+                    var clusters = BuildWrapperClustersForCell(buckets);
+
+                    var ownerMap = BuildRootOwnerMap(buckets);
+                    var cellExportRootHandles = ExtractRootHandleSet(cell.ExportRoots);
+
                     ed.WriteMessage(
                         $"\n  exportRoots={cell.ExportRoots.Count} " +
                         $"wrapperBuckets={buckets.Count} " +
+                        $"wrapperClusters={clusters.Count} " +
                         $"unassigned={unassignedCount}");
+
+                    foreach (var cluster in clusters)
+                        WriteWrapperClusterLog(ed, cluster);
 
                     if (buckets.Count == 0)
                     {
@@ -1048,6 +2176,7 @@ namespace FluxCAD.BricsCAD.Plugin26
 
                     foreach (var bucket in buckets)
                     {
+                        var selectedHandles = ExtractSelectedHandlesFromBucket(bucket);
                         var profile = BuildWrapperSheetProfile(bucket);
                         WriteWrapperSheetProfileLog(ed, profile);
 
@@ -1073,6 +2202,28 @@ namespace FluxCAD.BricsCAD.Plugin26
 
                         // 여기에 추가
                         DumpSpecificRootTraceInExport(ed, r, c, bucket, buckets);
+
+                        // r1,c8만 보고 싶으면 이렇게 제한
+                        // r1,c8만 audit
+                        if (r == 1 && c == 8)
+                        {
+                            var auditRoots = cell.AcceptedRoots.Count > 0
+                                ? (IReadOnlyList<RootUnitInfo>)cell.AcceptedRoots
+                                : cell.ExportRoots;
+
+                            DumpWrapperBlockRefAudit(
+                                ed,
+                                tr,
+                                r,
+                                c,
+                                bucket.Index,
+                                bucket.Wrapper.Bounds,
+                                auditRoots,
+                                cellExportRootHandles,
+                                selectedHandles,
+                                ownerMap,
+                                includeSkippedNonBlock: false);
+                        }
 
                         string blockName = SanitizeFileNamePart(bucket.Wrapper.BlockName);
                         if (string.IsNullOrWhiteSpace(blockName))
@@ -1237,6 +2388,8 @@ namespace FluxCAD.BricsCAD.Plugin26
             int col,
             out int unassignedCount)
         {
+            
+
             unassignedCount = 0;
 
             if (cell == null || cell.Status != "READY")
@@ -1265,6 +2418,8 @@ namespace FluxCAD.BricsCAD.Plugin26
                     Wrapper = w
                 })
                 .ToList();
+
+            
 
             foreach (var root in cell.ExportRoots)
             {
@@ -5540,12 +6695,27 @@ namespace FluxCAD.BricsCAD.Plugin26
             return hasAny;
         }
 
-        private static string GetRootHandle(RootUnitInfo r)
+        private static string GetRootHandle_old(RootUnitInfo r)
         {
             if (!string.IsNullOrWhiteSpace(r.HandleText))
                 return r.HandleText;
 
             return r.Id.ToString();
+        }
+
+        private static string GetRootHandle(RootUnitInfo r)
+        {
+            if (!string.IsNullOrWhiteSpace(r.HandleText))
+                return r.HandleText;
+
+            try
+            {
+                return r.Id.Handle.ToString();
+            }
+            catch
+            {
+                return r.Id.ToString();
+            }
         }
 
         [CommandMethod("FLUX_DEBUG_CELL_ROOT_RC_NEW")]
