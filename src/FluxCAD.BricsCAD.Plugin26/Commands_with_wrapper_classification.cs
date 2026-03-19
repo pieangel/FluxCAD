@@ -170,6 +170,8 @@ namespace FluxCAD.BricsCAD.Plugin26
         public string? TextContent { get; set; }
         public string? NormalizedText { get; set; }
         public string? DimensionText { get; set; }
+
+        // 추가
         public bool HasInsertPoint { get; set; }
         public Point3d InsertPoint { get; set; }
 
@@ -189,7 +191,7 @@ namespace FluxCAD.BricsCAD.Plugin26
             TypeName.IndexOf("Dimension", StringComparison.OrdinalIgnoreCase) >= 0;
 
         public bool IsPartition =>
-        Role == RootRole.Partition;
+            Role == RootRole.Partition;
     }
 
     internal sealed class PrimitiveCluster
@@ -224,6 +226,7 @@ namespace FluxCAD.BricsCAD.Plugin26
 
         public int TotalAccepted => AcceptedBlocks + AcceptedPrimitives;
     }
+
 
     public static class CellLocalCollector
     {
@@ -322,6 +325,7 @@ namespace FluxCAD.BricsCAD.Plugin26
             double minOverlapRatio,
             Point3d? insertPoint)
         {
+            // 가장 중요: block insert point가 cell 안이면 local로 인정
             if (insertPoint.HasValue && ContainsPoint2D(cellExt, insertPoint.Value))
                 return true;
 
@@ -5559,8 +5563,10 @@ namespace FluxCAD.BricsCAD.Plugin26
 
             var exportRoots = acceptedRoots
                 .Where(x =>
+                    // blockreference는 insert point inside면 우선 살린다
+                    (x.IsBlockReference && x.HasInsertPoint && ContainsPoint(innerSceneBounds, x.InsertPoint)) ||
                     ContainsPoint(innerSceneBounds, x.Center) ||
-                    IntersectionAreaRatio(innerSceneBounds, x.Bounds) >= 0.25)
+                    IntersectionAreaRatio(innerSceneBounds, x.Bounds) >= 0.20)
                 .ToList();
 
             result.ExportRoots.AddRange(exportRoots);
@@ -7477,6 +7483,7 @@ namespace FluxCAD.BricsCAD.Plugin26
                 string? blockName = null;
                 bool hasInsertPoint = false;
                 Point3d insertPoint = default;
+
                 if (ent is BlockReference br)
                 {
                     blockName = br.Name;
@@ -7511,6 +7518,8 @@ namespace FluxCAD.BricsCAD.Plugin26
                     TextContent = string.IsNullOrWhiteSpace(textContent) ? null : textContent,
                     NormalizedText = string.IsNullOrWhiteSpace(normalizedText) ? null : normalizedText,
                     DimensionText = string.IsNullOrWhiteSpace(dimensionText) ? null : dimensionText,
+
+                    // 추가
                     HasInsertPoint = hasInsertPoint,
                     InsertPoint = insertPoint
                 });
