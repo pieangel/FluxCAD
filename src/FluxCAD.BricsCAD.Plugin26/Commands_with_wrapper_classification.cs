@@ -170,6 +170,8 @@ namespace FluxCAD.BricsCAD.Plugin26
         public string? TextContent { get; set; }
         public string? NormalizedText { get; set; }
         public string? DimensionText { get; set; }
+        public bool HasInsertPoint { get; set; }
+        public Point3d InsertPoint { get; set; }
 
         public bool IsBlockReference =>
             string.Equals(TypeName, "BlockReference", StringComparison.OrdinalIgnoreCase);
@@ -232,6 +234,8 @@ namespace FluxCAD.BricsCAD.Plugin26
             Func<T, string?> getHandle,
             Func<T, bool> isPartition,
             Func<T, bool> isBlockLike,
+            Func<T, bool>? hasInsertPoint = null,
+            Func<T, Point3d>? getInsertPoint = null,
             double blockMaxWidthRatio = 0.95,
             double blockMaxHeightRatio = 0.95,
             double blockMinOverlapRatio = 0.25,
@@ -263,7 +267,11 @@ namespace FluxCAD.BricsCAD.Plugin26
                         continue;
                     }
 
-                    if (!IsLocalToCell(ext, cellExt, blockMinOverlapRatio))
+                    Point3d? insertPoint = null;
+                    if (hasInsertPoint != null && getInsertPoint != null && hasInsertPoint(root))
+                        insertPoint = getInsertPoint(root);
+
+                    if (!IsLocalBlockToCell(ext, cellExt, blockMinOverlapRatio, insertPoint))
                     {
                         result.RejectedNonLocal++;
                         continue;
@@ -306,6 +314,18 @@ namespace FluxCAD.BricsCAD.Plugin26
             double cellH = GetHeight(cellExt);
 
             return rootW > cellW * maxWidthRatio || rootH > cellH * maxHeightRatio;
+        }
+
+        private static bool IsLocalBlockToCell(
+            Extents3d rootExt,
+            Extents3d cellExt,
+            double minOverlapRatio,
+            Point3d? insertPoint)
+        {
+            if (insertPoint.HasValue && ContainsPoint2D(cellExt, insertPoint.Value))
+                return true;
+
+            return IsLocalToCell(rootExt, cellExt, minOverlapRatio);
         }
 
         private static bool IsLocalToCell(
@@ -560,7 +580,7 @@ namespace FluxCAD.BricsCAD.Plugin26
         public double Score { get; set; }
 
 
-        
+
     }
 
     internal sealed class SheetOwnershipResulta_old
@@ -599,7 +619,7 @@ namespace FluxCAD.BricsCAD.Plugin26
         public double MaxH => All.Count == 0 ? 0.0 : All.Max(x => x.Height);
     }
 
-    
+
 
     public class Commands
     {
@@ -608,7 +628,6 @@ namespace FluxCAD.BricsCAD.Plugin26
         private const string FluxCadRegAppName = "FLUXCAD";
         private static List<double>? _cachedGridXs;
         private static List<double>? _cachedGridYs;
-
 
         [CommandMethod("FLUX_TRACE_ROOT_OWNER")]
         public static void FluxTraceRootOwner()
@@ -713,13 +732,11 @@ namespace FluxCAD.BricsCAD.Plugin26
                 var ownerMap = BuildRootOwnerMap(buckets);
                 var cellExportRootHandles = ExtractRootHandleSet(cell.ExportRoots);
 
-                ed.WriteMessage(
-                    $"\n  WrapperBuckets={buckets.Count} UnassignedCount={unassignedCount}");
+                ed.WriteMessage($"\n  WrapperBuckets={buckets.Count} UnassignedCount={unassignedCount}");
 
                 if (ownerMap.TryGetValue(targetHandle, out var owner))
                 {
-                    ed.WriteMessage(
-                        $"\n  SelectedAnywhere=Y Owner=({BuildOwnerSummary(owner)})");
+                    ed.WriteMessage($"\n  SelectedAnywhere=Y Owner=({BuildOwnerSummary(owner)})");
                 }
                 else
                 {
@@ -2388,7 +2405,7 @@ namespace FluxCAD.BricsCAD.Plugin26
             int col,
             out int unassignedCount)
         {
-            
+
 
             unassignedCount = 0;
 
@@ -2419,7 +2436,7 @@ namespace FluxCAD.BricsCAD.Plugin26
                 })
                 .ToList();
 
-            
+
 
             foreach (var root in cell.ExportRoots)
             {
@@ -4059,10 +4076,10 @@ namespace FluxCAD.BricsCAD.Plugin26
             }
         }
 
-//         private static double AspectOf(RootUnitInfo x)
-//         {
-//             return x.Height <= 1e-9 ? 0.0 : x.Width / x.Height;
-//         }
+        //         private static double AspectOf(RootUnitInfo x)
+        //         {
+        //             return x.Height <= 1e-9 ? 0.0 : x.Width / x.Height;
+        //         }
 
         private static bool IsSheetLikeWrapperFamily(
             WrapperFamilyCandidate family,
@@ -4987,7 +5004,7 @@ namespace FluxCAD.BricsCAD.Plugin26
             }
         }
 
-        
+
 
         [CommandMethod("FLUX_EXPORT_ROW_INNER_SCENES")]
         public static void FluxExportRowInnerScenes()
@@ -5481,7 +5498,9 @@ namespace FluxCAD.BricsCAD.Plugin26
                 x => x.Bounds,
                 x => GetRootHandle(x),
                 x => x.IsPartition,
-                x => x.IsBlockReference
+                x => x.IsBlockReference,
+                x => x.HasInsertPoint,
+                x => x.InsertPoint
             );
 
             result.LocalCollect = local;
@@ -7260,7 +7279,7 @@ namespace FluxCAD.BricsCAD.Plugin26
                             verdict = "REJECT";
                             why = "block not local enough";
                         }
-                        
+
                     }
                     else
                     {
@@ -7456,8 +7475,14 @@ namespace FluxCAD.BricsCAD.Plugin26
                 var role = ClassifyRootRole(ent, ext, analysisBounds, out reason);
 
                 string? blockName = null;
+                bool hasInsertPoint = false;
+                Point3d insertPoint = default;
                 if (ent is BlockReference br)
+                {
                     blockName = br.Name;
+                    hasInsertPoint = true;
+                    insertPoint = br.Position;
+                }
 
                 string textContent =
                     (ent is DBText || ent is MText)
@@ -7485,7 +7510,9 @@ namespace FluxCAD.BricsCAD.Plugin26
                     Reason = reason,
                     TextContent = string.IsNullOrWhiteSpace(textContent) ? null : textContent,
                     NormalizedText = string.IsNullOrWhiteSpace(normalizedText) ? null : normalizedText,
-                    DimensionText = string.IsNullOrWhiteSpace(dimensionText) ? null : dimensionText
+                    DimensionText = string.IsNullOrWhiteSpace(dimensionText) ? null : dimensionText,
+                    HasInsertPoint = hasInsertPoint,
+                    InsertPoint = insertPoint
                 });
             }
 
@@ -7740,8 +7767,14 @@ namespace FluxCAD.BricsCAD.Plugin26
                 var role = ClassifyRootRole(ent, ext, worldBounds, out reason);
 
                 string? blockName = null;
+                bool hasInsertPoint = false;
+                Point3d insertPoint = default;
                 if (ent is BlockReference br)
+                {
                     blockName = br.Name;
+                    hasInsertPoint = true;
+                    insertPoint = br.Position;
+                }
 
                 result.Add(new RootUnitInfo
                 {
@@ -7753,7 +7786,9 @@ namespace FluxCAD.BricsCAD.Plugin26
                     Width = WidthOf(ext),
                     Height = HeightOf(ext),
                     Role = role,
-                    Reason = reason
+                    Reason = reason,
+                    HasInsertPoint = hasInsertPoint,
+                    InsertPoint = insertPoint
                 });
             }
 
@@ -7939,7 +7974,7 @@ namespace FluxCAD.BricsCAD.Plugin26
                         $"debug_scene_local_r{row}_c{col}_{DateTime.Now:yyyyMMdd_HHmmss}.dwg");
 
                     // 이미 만들어 둔 함수 호출
-                    ExportLocalCellScene(ed,db, scene, row, col, filePath);
+                    ExportLocalCellScene(ed, db, scene, row, col, filePath);
 
                     ed.WriteMessage($"\n[FluxCAD] LOCAL scene exported: {filePath}");
 
@@ -8307,7 +8342,7 @@ namespace FluxCAD.BricsCAD.Plugin26
             outDb.SaveAs(filePath, DwgVersion.Current);
         }
 
-        private  static void AppendLocalFrame_old(
+        private static void AppendLocalFrame_old(
     BlockTableRecord ms,
     Transaction tr,
     Extents3d bounds,
@@ -8329,7 +8364,7 @@ namespace FluxCAD.BricsCAD.Plugin26
             tr.AddNewlyCreatedDBObject(pl, true);
         }
 
-        private static  void AppendCellLabel_old(
+        private static void AppendCellLabel_old(
             BlockTableRecord ms,
             Transaction tr,
             Extents3d bounds,
@@ -8390,7 +8425,7 @@ namespace FluxCAD.BricsCAD.Plugin26
             tr.AddNewlyCreatedDBObject(v, true);
         }
 
-        private  void EnsureLayer(Database db, Transaction tr, string layerName)
+        private void EnsureLayer(Database db, Transaction tr, string layerName)
         {
             var lt = (LayerTable)tr.GetObject(db.LayerTableId, OpenMode.ForRead);
 
@@ -8896,9 +8931,9 @@ namespace FluxCAD.BricsCAD.Plugin26
             return scene;
         }
 
-       
 
-        
+
+
 
         private List<FlattenedCellEntity> FilterCellEntitiesStrict(
     DetectedCell cell,
@@ -9832,7 +9867,7 @@ namespace FluxCAD.BricsCAD.Plugin26
             }
         }
 
-        
+
 
         // 임시 stub
         private List<double> GetRecoveredGridXs()
@@ -10270,7 +10305,7 @@ namespace FluxCAD.BricsCAD.Plugin26
                             $"\n  [MV {i + 1}] X={a.Coord:F2}, Segments={a.SegmentCount}, TotalSpan={a.TotalSpan:F2}, MaxSpan={a.MaxSpan:F2}");
                     }
 
-                    
+
                     tr.Commit();
                 }
             }
@@ -10331,7 +10366,7 @@ namespace FluxCAD.BricsCAD.Plugin26
             merged.Add(new GridInterval1D(curA, curB));
             return merged;
         }
-    
+
 
         [CommandMethod("FLUX_DEBUG_REGION_TREE")]
         public void FluxDebugRegionTree()
@@ -14314,7 +14349,7 @@ namespace FluxCAD.BricsCAD.Plugin26
                     if (line == null)
                         continue;
 
-                    
+
 
                     var dx = Math.Abs(line.StartPoint.X - line.EndPoint.X);
                     var dy = Math.Abs(line.StartPoint.Y - line.EndPoint.Y);
@@ -14956,22 +14991,22 @@ namespace FluxCAD.BricsCAD.Plugin26
                     ObjectIdCollection ids =
                         CollectEntitiesInside(sourceDb, tr, sheet.ext);
 
-//                     IdMapping map = new IdMapping();
-// 
-//                     sourceDb.DeepCloneObjects(
-//                         ids,
-//                         newMs.ObjectId,
-//                         map,
-//                         false);
+                    //                     IdMapping map = new IdMapping();
+                    // 
+                    //                     sourceDb.DeepCloneObjects(
+                    //                         ids,
+                    //                         newMs.ObjectId,
+                    //                         map,
+                    //                         false);
 
-//                     IdMapping map = new IdMapping();
-// 
-//                     sourceDb.WblockCloneObjects(
-//                         ids,
-//                         newMs.ObjectId,
-//                         map,
-//                         DuplicateRecordCloning.Ignore,
-//                         false);
+                    //                     IdMapping map = new IdMapping();
+                    // 
+                    //                     sourceDb.WblockCloneObjects(
+                    //                         ids,
+                    //                         newMs.ObjectId,
+                    //                         map,
+                    //                         DuplicateRecordCloning.Ignore,
+                    //                         false);
 
 
                     IdMapping map = new IdMapping();
@@ -15994,7 +16029,7 @@ namespace FluxCAD.BricsCAD.Plugin26
             }
         }
 
-        
+
         private const string FluxRegApp = "FLUXCAD_COPY";
 
         private void EnsureRegApp(Database db, Transaction tr)
@@ -16564,7 +16599,7 @@ namespace FluxCAD.BricsCAD.Plugin26
             }
             DebugEntityStatistics(_flattened);
             DebugSpatialDistribution(_flattened);
-            DebugCenterClusters(_flattened);    
+            DebugCenterClusters(_flattened);
             Application.ShowAlertDialog(
                 $"Flatten 완료: {_flattened.Count} entities");
         }
@@ -17159,7 +17194,7 @@ namespace FluxCAD.BricsCAD.Plugin26
             ed.WriteMessage($"\n[완료] 전체 이미지 생성 시도 완료: {path}");
         }
 
-        
+
 
         [CommandMethod("FLUX_EXPORT_FULL")]
         public void FluxExportFull()
@@ -17607,7 +17642,7 @@ namespace FluxCAD.BricsCAD.Plugin26
                 ed.WriteMessage($"\n[Error] 어댑터 실행 중 오류 발생: {ex.Message}");
             }
         }
-        
+
         [CommandMethod("RUN_EXTRACTOR")]
         public void RunExtractorCommand()
         {
