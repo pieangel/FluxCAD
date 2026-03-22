@@ -161,7 +161,11 @@ namespace FluxCAD.BricsCAD.Plugin26
         public string HandleText { get; set; } = "";
         public string TypeName { get; set; } = "";
         public string? BlockName { get; set; }
+
+        public Extents3d RawBounds { get; set; }
         public Extents3d Bounds { get; set; }
+        public string BoundsKind { get; set; } = "";
+
         public Point3d Center { get; set; }
         public double Width { get; set; }
         public double Height { get; set; }
@@ -171,7 +175,6 @@ namespace FluxCAD.BricsCAD.Plugin26
         public string? NormalizedText { get; set; }
         public string? DimensionText { get; set; }
 
-        // 추가
         public bool HasInsertPoint { get; set; }
         public Point3d InsertPoint { get; set; }
 
@@ -230,6 +233,7 @@ namespace FluxCAD.BricsCAD.Plugin26
 
     public static class CellLocalCollector
     {
+        // PATCH: 4) CellLocalCollector 순서 수정
         public static CellLocalCollectResult CollectHandles<T>(
             IEnumerable<T> roots,
             Extents3d cellExt,
@@ -251,7 +255,16 @@ namespace FluxCAD.BricsCAD.Plugin26
             {
                 var ext = getBounds(root);
 
-                if (!Intersects2D(cellExt, ext))
+                bool isBlock = isBlockLike(root);
+                Point3d? insertPoint = null;
+
+                if (isBlock && hasInsertPoint != null && getInsertPoint != null && hasInsertPoint(root))
+                    insertPoint = getInsertPoint(root);
+
+                bool coarseHit = Intersects2D(cellExt, ext)
+                              || (insertPoint.HasValue && ContainsPoint2D(cellExt, insertPoint.Value));
+
+                if (!coarseHit)
                     continue;
 
                 if (isPartition(root))
@@ -260,21 +273,25 @@ namespace FluxCAD.BricsCAD.Plugin26
                     continue;
                 }
 
-                bool isBlock = isBlockLike(root);
-
                 if (isBlock)
                 {
+                    if (insertPoint.HasValue && ContainsPoint2D(cellExt, insertPoint.Value))
+                    {
+                        var rootHandle = getHandle(root);
+                        if (!string.IsNullOrWhiteSpace(rootHandle) && seen.Add(rootHandle))
+                            result.Handles.Add(rootHandle);
+
+                        result.AcceptedBlocks++;
+                        continue;
+                    }
+
                     if (IsBlockTooLargeForLocalCell(ext, cellExt, blockMaxWidthRatio, blockMaxHeightRatio))
                     {
                         result.RejectedTooLargeBlocks++;
                         continue;
                     }
 
-                    Point3d? insertPoint = null;
-                    if (hasInsertPoint != null && getInsertPoint != null && hasInsertPoint(root))
-                        insertPoint = getInsertPoint(root);
-
-                    if (!IsLocalBlockToCell(ext, cellExt, blockMinOverlapRatio, insertPoint))
+                    if (!IsLocalToCell(ext, cellExt, blockMinOverlapRatio))
                     {
                         result.RejectedNonLocal++;
                         continue;
@@ -288,6 +305,9 @@ namespace FluxCAD.BricsCAD.Plugin26
                 }
                 else
                 {
+                    if (!Intersects2D(cellExt, ext))
+                        continue;
+
                     if (!IsLocalToCell(ext, cellExt, primitiveMinOverlapRatio))
                     {
                         result.RejectedNonLocal++;
@@ -632,6 +652,333 @@ namespace FluxCAD.BricsCAD.Plugin26
         private const string FluxCadRegAppName = "FLUXCAD";
         private static List<double>? _cachedGridXs;
         private static List<double>? _cachedGridYs;
+
+        [CommandMethod("FLUX_DEBUG_BLOCKREF_EXTENTS")]
+        public static void FluxDebugBlockRefExtents()
+        {
+            var doc = Application.DocumentManager.MdiActiveDocument;
+            var db = doc.Database;
+            var ed = doc.Editor;
+
+            var handleRes = ed.GetString(new PromptStringOptions("\n추적할 blockreference handle 입력")
+            {
+                AllowSpaces = false
+            });
+            if (handleRes.Status != PromptStatus.OK) return;
+
+            string handleText = (handleRes.StringResult ?? "").Trim();
+            if (string.IsNullOrWhiteSpace(handleText))
+            {
+                ed.WriteMessage("\n[FluxCAD] handle이 비어 있습니다.");
+                return;
+            }
+
+            if (!long.TryParse(handleText, NumberStyles.HexNumber, CultureInfo.InvariantCulture, out long handleValue))
+            {
+                ed.WriteMessage("\n[FluxCAD] handle 형식이 잘못되었습니다.");
+                return;
+            }
+
+            using (var tr = db.TransactionManager.StartTransaction())
+            {
+                ObjectId id;
+                try
+                {
+                    id = db.GetObjectId(false, new Handle(handleValue), 0);
+                }
+                catch
+                {
+                    ed.WriteMessage($"\n[FluxCAD] handle={handleText} 를 찾지 못했습니다.");
+                    return;
+                }
+
+                var br = tr.GetObject(id, OpenMode.ForRead) as BlockReference;
+                if (br == null)
+                {
+                    ed.WriteMessage($"\n[FluxCAD] handle={handleText} 는 BlockReference가 아닙니다.");
+                    return;
+                }
+
+                ed.WriteMessage($"\n[BlockRefDebug] Handle={handleText} Block={br.Name}");
+                ed.WriteMessage($"\n  Insert=({br.Position.X:F2},{br.Position.Y:F2},{br.Position.Z:F2})");
+
+                try
+                {
+                    var ext = br.GeometricExtents;
+                    ed.WriteMessage(
+                        $"\n  BlockExtents Min=({ext.MinPoint.X:F2},{ext.MinPoint.Y:F2}) Max=({ext.MaxPoint.X:F2},{ext.MaxPoint.Y:F2}) " +
+                        $"W={(ext.MaxPoint.X - ext.MinPoint.X):F2} H={(ext.MaxPoint.Y - ext.MinPoint.Y):F2}");
+                }
+                catch
+                {
+                    ed.WriteMessage("\n  BlockExtents=<unavailable>");
+                }
+
+                var btr = (BlockTableRecord)tr.GetObject(br.BlockTableRecord, OpenMode.ForRead);
+
+                var childInfos = new List<(string Handle, string Type, Extents3d Ext, Point3d Center)>();
+
+                foreach (ObjectId childId in btr)
+                {
+                    if (!(tr.GetObject(childId, OpenMode.ForRead) is Entity child))
+                        continue;
+
+                    try
+                    {
+                        var childExt = child.GeometricExtents;
+
+                        // block reference transform 반영
+                        var transformed = new Extents3d(
+                            childExt.MinPoint.TransformBy(br.BlockTransform),
+                            childExt.MaxPoint.TransformBy(br.BlockTransform));
+
+                        var min = transformed.MinPoint;
+                        var max = transformed.MaxPoint;
+
+                        var norm = new Extents3d(
+                            new Point3d(Math.Min(min.X, max.X), Math.Min(min.Y, max.Y), 0),
+                            new Point3d(Math.Max(min.X, max.X), Math.Max(min.Y, max.Y), 0));
+
+                        var center = new Point3d(
+                            (norm.MinPoint.X + norm.MaxPoint.X) * 0.5,
+                            (norm.MinPoint.Y + norm.MaxPoint.Y) * 0.5,
+                            0);
+
+                        childInfos.Add((child.Handle.ToString(), child.GetType().Name, norm, center));
+                    }
+                    catch
+                    {
+                        // extents 없는 child는 스킵
+                    }
+                }
+
+                ed.WriteMessage($"\n  ChildCount(with extents)={childInfos.Count}");
+
+                if (childInfos.Count == 0)
+                {
+                    tr.Commit();
+                    return;
+                }
+
+                var minYChild = childInfos.OrderBy(x => x.Ext.MinPoint.Y).First();
+                var maxYChild = childInfos.OrderByDescending(x => x.Ext.MaxPoint.Y).First();
+                var minXChild = childInfos.OrderBy(x => x.Ext.MinPoint.X).First();
+                var maxXChild = childInfos.OrderByDescending(x => x.Ext.MaxPoint.X).First();
+
+                void WriteChild(string title, (string Handle, string Type, Extents3d Ext, Point3d Center) c)
+                {
+                    ed.WriteMessage(
+                        $"\n  [{title}] Handle={c.Handle} Type={c.Type} " +
+                        $"Min=({c.Ext.MinPoint.X:F2},{c.Ext.MinPoint.Y:F2}) " +
+                        $"Max=({c.Ext.MaxPoint.X:F2},{c.Ext.MaxPoint.Y:F2}) " +
+                        $"W={(c.Ext.MaxPoint.X - c.Ext.MinPoint.X):F2} " +
+                        $"H={(c.Ext.MaxPoint.Y - c.Ext.MinPoint.Y):F2}");
+                }
+
+                WriteChild("MinY offender", minYChild);
+                WriteChild("MaxY offender", maxYChild);
+                WriteChild("MinX offender", minXChild);
+                WriteChild("MaxX offender", maxXChild);
+
+                ed.WriteMessage("\n  [Top 10 lowest MinY children]");
+                int idx = 1;
+                foreach (var c in childInfos.OrderBy(x => x.Ext.MinPoint.Y).Take(10))
+                {
+                    ed.WriteMessage(
+                        $"\n    [{idx++}] Handle={c.Handle} Type={c.Type} " +
+                        $"Min=({c.Ext.MinPoint.X:F2},{c.Ext.MinPoint.Y:F2}) " +
+                        $"Max=({c.Ext.MaxPoint.X:F2},{c.Ext.MaxPoint.Y:F2})");
+                }
+
+                tr.Commit();
+            }
+        }
+
+
+        // PATCH: 2) filtered extents helper 추가
+        private static bool ShouldIgnoreForVisualBounds(Entity ent)
+        {
+            if (ent == null)
+                return true;
+
+            if (ent.IsErased)
+                return true;
+
+            if (ent is DBPoint)
+                return true;
+
+            if (ent is Xline || ent is Ray)
+                return true;
+
+            if (ent is AttributeDefinition ad && ad.Invisible)
+                return true;
+
+            return false;
+        }
+
+        private static Extents3d TransformExtents(Extents3d ext, Matrix3d xf)
+        {
+            ext.TransformBy(xf);
+            return ext;
+        }
+
+        private static bool TryGetEffectiveEntityExtents(
+            Entity ent,
+            Transaction tr,
+            out Extents3d effective,
+            out Extents3d raw,
+            out string kind)
+        {
+            effective = default;
+            raw = default;
+            kind = "";
+
+            bool hasRaw = TryGetEntityExtentsSafe(ent, out raw, out _);
+
+            if (ent is not BlockReference br)
+            {
+                if (!hasRaw)
+                    return false;
+
+                effective = raw;
+                kind = "Raw";
+                return true;
+            }
+
+            if (TryGetFilteredBlockChildUnionExtents(br, tr, out var filtered, out int usedCount, out int ignoredCount))
+            {
+                effective = filtered;
+                kind = $"FilteredBlockChildren used={usedCount} ignored={ignoredCount}";
+                return true;
+            }
+
+            if (hasRaw)
+            {
+                effective = raw;
+                kind = "FallbackRawBlock";
+                return true;
+            }
+
+            return false;
+        }
+
+        private static bool TryGetFilteredBlockChildUnionExtents(
+            BlockReference br,
+            Transaction tr,
+            out Extents3d union,
+            out int childCount,
+            out int ignoredCount)
+        {
+            union = default;
+            childCount = 0;
+            ignoredCount = 0;
+
+            if (!TryGetFilteredBlockChildUnionExtentsLocal(
+                br,
+                tr,
+                out var localUnion,
+                ref childCount,
+                ref ignoredCount,
+                new HashSet<ObjectId>(),
+                0,
+                12))
+            {
+                return false;
+            }
+
+            union = TransformExtents(localUnion, br.BlockTransform);
+            return true;
+        }
+
+        private static bool TryGetFilteredBlockChildUnionExtentsLocal(
+            BlockReference br,
+            Transaction tr,
+            out Extents3d union,
+            ref int childCount,
+            ref int ignoredCount,
+            HashSet<ObjectId> visitedBlockDefs,
+            int depth,
+            int maxDepth)
+        {
+            union = default;
+            bool hasAny = false;
+
+            if (depth > maxDepth)
+                return false;
+
+            ObjectId btrId = br.BlockTableRecord;
+            if (!visitedBlockDefs.Add(btrId))
+                return false;
+
+            try
+            {
+                var btr = (BlockTableRecord)tr.GetObject(btrId, OpenMode.ForRead);
+
+                foreach (ObjectId childId in btr)
+                {
+                    var child = tr.GetObject(childId, OpenMode.ForRead, false) as Entity;
+                    if (child == null)
+                        continue;
+
+                    if (ShouldIgnoreForVisualBounds(child))
+                    {
+                        ignoredCount++;
+                        continue;
+                    }
+
+                    Extents3d childExtLocal = default;
+                    bool childAccepted = false;
+
+                    if (child is BlockReference nestedBr)
+                    {
+                        if (TryGetFilteredBlockChildUnionExtentsLocal(
+                            nestedBr,
+                            tr,
+                            out var nestedLocal,
+                            ref childCount,
+                            ref ignoredCount,
+                            visitedBlockDefs,
+                            depth + 1,
+                            maxDepth))
+                        {
+                            childExtLocal = TransformExtents(nestedLocal, nestedBr.BlockTransform);
+                            childAccepted = true;
+                        }
+                        else if (TryGetEntityExtentsSafe(nestedBr, out var nestedRaw, out _))
+                        {
+                            childExtLocal = nestedRaw;
+                            childAccepted = true;
+                        }
+                    }
+                    else if (TryGetEntityExtentsSafe(child, out var rawChild, out _))
+                    {
+                        childExtLocal = rawChild;
+                        childAccepted = true;
+                    }
+
+                    if (!childAccepted)
+                        continue;
+
+                    if (!hasAny)
+                    {
+                        union = childExtLocal;
+                        hasAny = true;
+                    }
+                    else
+                    {
+                        union.AddExtents(childExtLocal);
+                    }
+
+                    childCount++;
+                }
+
+                return hasAny;
+            }
+            finally
+            {
+                visitedBlockDefs.Remove(btrId);
+            }
+        }
 
         [CommandMethod("FLUX_TRACE_ROOT_OWNER")]
         public static void FluxTraceRootOwner()
@@ -1528,7 +1875,7 @@ namespace FluxCAD.BricsCAD.Plugin26
 
             try
             {
-                if (TryGetBlockChildUnionExtents(br, tr, out var childUnion, out var childCount))
+                if (TryGetFilteredBlockChildUnionExtents(br, tr, out var childUnion, out int usedCount, out int ignoredCount))
                 {
                     row.ChildUnionAvailable = true;
                     row.ChildUnionBounds = childUnion;
@@ -1538,13 +1885,13 @@ namespace FluxCAD.BricsCAD.Plugin26
                     {
                         row.Decision = BlockRefAuditDecision.Accept;
                         row.Reason = BlockRefAuditReason.Accepted_ChildUnionIntersect;
-                        row.Detail = $"child union intersects wrapper (children={childCount})";
+                        row.Detail = $"child union intersects wrapper (used={usedCount}, ignored={ignoredCount})";
                         return row;
                     }
 
                     row.Decision = BlockRefAuditDecision.Reject;
                     row.Reason = BlockRefAuditReason.Rejected_ChildUnionOutside;
-                    row.Detail = $"insert outside, block extents outside, child union outside (children={childCount})";
+                    row.Detail = $"insert outside, block extents outside, child union outside (used={usedCount}, ignored={ignoredCount})";
                     return row;
                 }
 
@@ -1554,8 +1901,8 @@ namespace FluxCAD.BricsCAD.Plugin26
                     : BlockRefAuditReason.Rejected_NoBounds;
 
                 row.Detail = row.HasBounds
-                    ? "insert outside and block extents outside; child union unavailable"
-                    : "no root/entity extents and child union unavailable";
+                    ? "insert outside and block extents outside; filtered child union unavailable"
+                    : "no root/entity extents and filtered child union unavailable";
 
                 return row;
             }
@@ -3678,7 +4025,9 @@ namespace FluxCAD.BricsCAD.Plugin26
                         x => x.Bounds,
                         x => GetRootHandle(x),
                         x => x.IsPartition,
-                        x => x.IsBlockReference
+                        x => x.IsBlockReference,
+                        x => x.HasInsertPoint,
+                        x => x.InsertPoint
                     );
 
                     var strictHandleSet = new HashSet<string>(
@@ -4193,7 +4542,9 @@ namespace FluxCAD.BricsCAD.Plugin26
                         x => x.Bounds,
                         x => GetRootHandle(x),
                         x => x.IsPartition,
-                        x => x.IsBlockReference
+                        x => x.IsBlockReference,
+                        x => x.HasInsertPoint,
+                        x => x.InsertPoint
                     );
 
                     var strictHandleSet = new HashSet<string>(
@@ -4555,7 +4906,9 @@ namespace FluxCAD.BricsCAD.Plugin26
                         x => x.Bounds,
                         x => GetRootHandle(x),
                         x => x.IsPartition,
-                        x => x.IsBlockReference
+                        x => x.IsBlockReference,
+                        x => x.HasInsertPoint,
+                        x => x.InsertPoint
                     );
 
                     var handleSet = new HashSet<string>(
@@ -4780,7 +5133,9 @@ namespace FluxCAD.BricsCAD.Plugin26
                         x => x.Bounds,
                         x => GetRootHandle(x),
                         x => x.IsPartition,
-                        x => x.IsBlockReference
+                        x => x.IsBlockReference,
+                        x => x.HasInsertPoint,
+                        x => x.InsertPoint
                     );
 
                     var handleSet = new HashSet<string>(
@@ -5779,7 +6134,9 @@ namespace FluxCAD.BricsCAD.Plugin26
                     x => x.Bounds,
                     x => GetRootHandle(x),
                     x => x.IsPartition,
-                    x => x.IsBlockReference
+                    x => x.IsBlockReference,
+                    x => x.HasInsertPoint,
+                    x => x.InsertPoint
                 );
 
                 WriteCellLocalCollectSummary(ed, r, c, local);
@@ -5828,8 +6185,9 @@ namespace FluxCAD.BricsCAD.Plugin26
                 // innerScene 기준으로 한 번 더 좁혀서 export 대상 선정
                 var exportRoots = acceptedRoots
                     .Where(x =>
+                        (x.IsBlockReference && x.HasInsertPoint && ContainsPoint(innerSceneBounds, x.InsertPoint)) ||
                         ContainsPoint(innerSceneBounds, x.Center) ||
-                        IntersectionAreaRatio(innerSceneBounds, x.Bounds) >= 0.25)
+                        IntersectionAreaRatio(innerSceneBounds, x.Bounds) >= 0.20)
                     .ToList();
 
                 if (exportRoots.Count == 0)
@@ -5988,7 +6346,9 @@ namespace FluxCAD.BricsCAD.Plugin26
                             x => x.Bounds,
                             x => GetRootHandle(x),
                             x => x.IsPartition,
-                            x => x.IsBlockReference
+                            x => x.IsBlockReference,
+                            x => x.HasInsertPoint,
+                            x => x.InsertPoint
                         );
 
                         if (local.Handles.Count == 0)
@@ -6615,7 +6975,9 @@ namespace FluxCAD.BricsCAD.Plugin26
                     x => x.Bounds,
                     x => GetRootHandle(x),
                     x => x.IsPartition,
-                    x => x.IsBlockReference
+                    x => x.IsBlockReference,
+                    x => x.HasInsertPoint,
+                    x => x.InsertPoint
                 );
 
                 WriteCellLocalCollectSummary(ed, r, c, local);
@@ -6916,9 +7278,11 @@ namespace FluxCAD.BricsCAD.Plugin26
                     roots,
                     cellBounds,
                     r => r.Bounds,                 // RootUnitInfo의 bounds
-                    r => r.Id.ToString(),                 // RootUnitInfo의 handle 문자열
-                    r => r.IsPartition,            // partition 판정
-                    r => r.IsBlockReference             // block 여부
+                    r => GetRootHandle(r),        // RootUnitInfo의 handle 문자열
+                    r => r.IsPartition,           // partition 판정
+                    r => r.IsBlockReference,      // block 여부
+                    r => r.HasInsertPoint,
+                    r => r.InsertPoint
                 );
 
                 WriteCellLocalCollectSummary(ed, r, 1, local);
@@ -7454,10 +7818,11 @@ namespace FluxCAD.BricsCAD.Plugin26
             }
         }
 
+        // PATCH: 3) CollectRootUnitsInBounds 교체
         private static List<RootUnitInfo> CollectRootUnitsInBounds(
-    Database db,
-    Transaction tr,
-    Extents3d analysisBounds)
+            Database db,
+            Transaction tr,
+            Extents3d analysisBounds)
         {
             var result = new List<RootUnitInfo>();
 
@@ -7470,26 +7835,30 @@ namespace FluxCAD.BricsCAD.Plugin26
                 if (!(tr.GetObject(id, OpenMode.ForRead) is Entity ent))
                     continue;
 
-                if (!TryGetEntityExtents(ent, out var ext))
-                    continue;
-
-                // 분석 대상 영역 바깥은 제외
-                if (!Intersects(ext, analysisBounds) && !ContainsPoint(analysisBounds, CenterOf(ext)))
-                    continue;
-
-                string reason;
-                var role = ClassifyRootRole(ent, ext, analysisBounds, out reason);
-
                 string? blockName = null;
                 bool hasInsertPoint = false;
                 Point3d insertPoint = default;
 
-                if (ent is BlockReference br)
+                if (ent is BlockReference br0)
                 {
-                    blockName = br.Name;
+                    blockName = br0.Name;
                     hasInsertPoint = true;
-                    insertPoint = br.Position;
+                    insertPoint = br0.Position;
                 }
+
+                if (!TryGetEffectiveEntityExtents(ent, tr, out var effExt, out var rawExt, out var boundsKind))
+                    continue;
+
+                bool intersectsAnalysis =
+                    Intersects(effExt, analysisBounds) ||
+                    ContainsPoint(analysisBounds, CenterOf(effExt)) ||
+                    (hasInsertPoint && ContainsPoint(analysisBounds, insertPoint));
+
+                if (!intersectsAnalysis)
+                    continue;
+
+                string reason;
+                var role = ClassifyRootRole(ent, effExt, analysisBounds, out reason);
 
                 string textContent =
                     (ent is DBText || ent is MText)
@@ -7509,17 +7878,17 @@ namespace FluxCAD.BricsCAD.Plugin26
                     HandleText = ent.Handle.ToString(),
                     TypeName = ent.GetType().Name,
                     BlockName = blockName,
-                    Bounds = ext,
-                    Center = CenterOf(ext),
-                    Width = WidthOf(ext),
-                    Height = HeightOf(ext),
+                    RawBounds = rawExt,
+                    Bounds = effExt,
+                    BoundsKind = boundsKind,
+                    Center = CenterOf(effExt),
+                    Width = WidthOf(effExt),
+                    Height = HeightOf(effExt),
                     Role = role,
-                    Reason = reason,
+                    Reason = string.IsNullOrWhiteSpace(boundsKind) ? reason : $"{reason} | {boundsKind}",
                     TextContent = string.IsNullOrWhiteSpace(textContent) ? null : textContent,
                     NormalizedText = string.IsNullOrWhiteSpace(normalizedText) ? null : normalizedText,
                     DimensionText = string.IsNullOrWhiteSpace(dimensionText) ? null : dimensionText,
-
-                    // 추가
                     HasInsertPoint = hasInsertPoint,
                     InsertPoint = insertPoint
                 });
