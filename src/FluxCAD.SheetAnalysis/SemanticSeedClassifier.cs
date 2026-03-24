@@ -1,18 +1,49 @@
-﻿using System;
-using System.Collections.Generic;
-using System.Linq;
-using System.Text;
-using System.Threading.Tasks;
+﻿using FluxCAD.SheetAnalysis;
 
-namespace FluxCAD.SheetAnalysis
+internal static class SemanticSeedClassifier
 {
-    internal static class SemanticSeedClassifier_old
+    public static SemanticSeedKind Classify(SheetEntity e)
     {
-        public static SemanticSeedKind Classify(SheetEntity e)
-        {
-            // text / dim / leader => AttachLater
-            // 실제 형상 => CoreGeometry
+        var kindName = e.Kind.ToString();
+
+        // attach later
+        if (IsTextLike(kindName) || IsDimensionLike(kindName) || IsLeaderLike(kindName))
+            return SemanticSeedKind.AttachLater;
+
+        // core geometry
+        if (IsGeometryLike(kindName))
             return SemanticSeedKind.CoreGeometry;
-        }
+
+        // 기본값은 안전하게 AttachLater
+        return SemanticSeedKind.AttachLater;
+    }
+
+    private static bool IsTextLike(string kindName)
+    {
+        return kindName.Contains("Text", StringComparison.OrdinalIgnoreCase)
+            || kindName.Contains("Attribute", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static bool IsDimensionLike(string kindName)
+    {
+        return kindName.Contains("Dimension", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static bool IsLeaderLike(string kindName)
+    {
+        return kindName.Contains("Leader", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static bool IsGeometryLike(string kindName)
+    {
+        return kindName.Equals("Line", StringComparison.OrdinalIgnoreCase)
+            || kindName.Equals("Arc", StringComparison.OrdinalIgnoreCase)
+            || kindName.Equals("Circle", StringComparison.OrdinalIgnoreCase)
+            || kindName.Equals("Ellipse", StringComparison.OrdinalIgnoreCase)
+            || kindName.Equals("Polyline", StringComparison.OrdinalIgnoreCase)
+            || kindName.Equals("LwPolyline", StringComparison.OrdinalIgnoreCase)
+            || kindName.Equals("Spline", StringComparison.OrdinalIgnoreCase)
+            || kindName.Equals("Hatch", StringComparison.OrdinalIgnoreCase)
+            || kindName.Equals("Region", StringComparison.OrdinalIgnoreCase);
     }
 }
