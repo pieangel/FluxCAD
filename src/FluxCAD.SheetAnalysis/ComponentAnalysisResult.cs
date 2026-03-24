@@ -5,7 +5,7 @@ namespace FluxCAD.SheetAnalysis
 {
     public sealed class ComponentAnalysisResult
     {
-        public SemanticComponent Component { get; set; }
+        public SemanticComponent? Component { get; set; }
 
         public ComponentRole FinalRole { get; set; } = ComponentRole.Unknown;
 

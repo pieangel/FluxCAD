@@ -1,49 +1,51 @@
-﻿using FluxCAD.SheetAnalysis;
-
-internal static class SemanticSeedClassifier
+﻿namespace FluxCAD.SheetAnalysis
 {
-    public static SemanticSeedKind Classify(SheetEntity e)
+    internal static class SemanticSeedClassifier
     {
-        var kindName = e.Kind.ToString();
+        public static SemanticSeedKind Classify(SheetEntity e)
+        {
+            if (IsTextLike(e) || IsDimensionLike(e) || IsLeaderLike(e))
+                return SemanticSeedKind.AttachLater;
 
-        // attach later
-        if (IsTextLike(kindName) || IsDimensionLike(kindName) || IsLeaderLike(kindName))
+            if (IsGeometryLike(e))
+                return SemanticSeedKind.CoreGeometry;
+
             return SemanticSeedKind.AttachLater;
+        }
 
-        // core geometry
-        if (IsGeometryLike(kindName))
-            return SemanticSeedKind.CoreGeometry;
+        public static bool IsTextLike(SheetEntity e)
+        {
+            var name = e.Kind.ToString();
 
-        // 기본값은 안전하게 AttachLater
-        return SemanticSeedKind.AttachLater;
-    }
+            return name.Contains("Text", StringComparison.OrdinalIgnoreCase)
+                || name.Contains("Attribute", StringComparison.OrdinalIgnoreCase);
+        }
 
-    private static bool IsTextLike(string kindName)
-    {
-        return kindName.Contains("Text", StringComparison.OrdinalIgnoreCase)
-            || kindName.Contains("Attribute", StringComparison.OrdinalIgnoreCase);
-    }
+        public static bool IsDimensionLike(SheetEntity e)
+        {
+            var name = e.Kind.ToString();
+            return name.Contains("Dimension", StringComparison.OrdinalIgnoreCase);
+        }
 
-    private static bool IsDimensionLike(string kindName)
-    {
-        return kindName.Contains("Dimension", StringComparison.OrdinalIgnoreCase);
-    }
+        public static bool IsLeaderLike(SheetEntity e)
+        {
+            var name = e.Kind.ToString();
+            return name.Contains("Leader", StringComparison.OrdinalIgnoreCase);
+        }
 
-    private static bool IsLeaderLike(string kindName)
-    {
-        return kindName.Contains("Leader", StringComparison.OrdinalIgnoreCase);
-    }
+        public static bool IsGeometryLike(SheetEntity e)
+        {
+            var name = e.Kind.ToString();
 
-    private static bool IsGeometryLike(string kindName)
-    {
-        return kindName.Equals("Line", StringComparison.OrdinalIgnoreCase)
-            || kindName.Equals("Arc", StringComparison.OrdinalIgnoreCase)
-            || kindName.Equals("Circle", StringComparison.OrdinalIgnoreCase)
-            || kindName.Equals("Ellipse", StringComparison.OrdinalIgnoreCase)
-            || kindName.Equals("Polyline", StringComparison.OrdinalIgnoreCase)
-            || kindName.Equals("LwPolyline", StringComparison.OrdinalIgnoreCase)
-            || kindName.Equals("Spline", StringComparison.OrdinalIgnoreCase)
-            || kindName.Equals("Hatch", StringComparison.OrdinalIgnoreCase)
-            || kindName.Equals("Region", StringComparison.OrdinalIgnoreCase);
+            return name.Equals("Line", StringComparison.OrdinalIgnoreCase)
+                || name.Equals("Arc", StringComparison.OrdinalIgnoreCase)
+                || name.Equals("Circle", StringComparison.OrdinalIgnoreCase)
+                || name.Equals("Ellipse", StringComparison.OrdinalIgnoreCase)
+                || name.Equals("Polyline", StringComparison.OrdinalIgnoreCase)
+                || name.Equals("LwPolyline", StringComparison.OrdinalIgnoreCase)
+                || name.Equals("Spline", StringComparison.OrdinalIgnoreCase)
+                || name.Equals("Hatch", StringComparison.OrdinalIgnoreCase)
+                || name.Equals("Region", StringComparison.OrdinalIgnoreCase);
+        }
     }
 }

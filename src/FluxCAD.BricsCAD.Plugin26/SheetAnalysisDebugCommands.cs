@@ -13,6 +13,455 @@ namespace FluxCAD.BricsCAD.Plugin26
 {
     public sealed class SheetAnalysisDebugCommands
     {
+        [CommandMethod("FLUX_DEBUG_SHEET_ENTITY_ROLES")]
+        public void FluxDebugSheetEntityRoles()
+        {
+            var doc = Application.DocumentManager.MdiActiveDocument;
+            if (doc == null)
+                return;
+
+            var db = doc.Database;
+            var ed = doc.Editor;
+
+            try
+            {
+                var sheetFilePath = db.Filename;
+                if (string.IsNullOrWhiteSpace(sheetFilePath))
+                {
+                    ed.WriteMessage("\n[FluxCAD] 저장된 DWG 파일이 아닙니다.");
+                    return;
+                }
+
+                IEntitySnapshotBuilder snapshotBuilder = new SimpleSheetFileSnapshotBuilder();
+                var entities = snapshotBuilder.Build(sheetFilePath);
+
+                if (entities == null || entities.Count == 0)
+                {
+                    ed.WriteMessage("\n[FluxCAD] snapshot이 비어 있습니다.");
+                    return;
+                }
+
+                ed.WriteMessage("\n[FluxCAD] ===== Sheet Entity Role Debug =====");
+                ed.WriteMessage($"\n[FluxCAD] File={sheetFilePath}");
+                ed.WriteMessage($"\n[FluxCAD] Entities.Total={entities.Count}");
+
+                // 1) EntityType 기준 집계
+                var byEntityType = entities
+                    .GroupBy(GetEntityTypeName)
+                    .OrderByDescending(g => g.Count())
+                    .ThenBy(g => g.Key)
+                    .ToList();
+
+                ed.WriteMessage("\n[FluxCAD] ----- By EntityType -----");
+                foreach (var g in byEntityType)
+                {
+                    ed.WriteMessage($"\n[Type] {g.Key} = {g.Count()}");
+                }
+
+                // 2) Role 기준 집계
+                var byRole = entities
+                    .GroupBy(e => SheetEntityRoleClassifier.GetRole(e))
+                    .OrderByDescending(g => g.Count())
+                    .ThenBy(g => g.Key.ToString())
+                    .ToList();
+
+                ed.WriteMessage("\n[FluxCAD] ----- By Role -----");
+                foreach (var g in byRole)
+                {
+                    ed.WriteMessage($"\n[Role] {g.Key} = {g.Count()}");
+                }
+
+                // 3) 핵심 수치
+                var geometryEntities = entities
+                    .Where(SheetEntityRoleClassifier.IsCoreGeometry)
+                    .ToList();
+
+                var textEntities = entities
+                    .Where(e => SheetEntityRoleClassifier.GetRole(e) == SheetEntityRole.Text)
+                    .ToList();
+
+                var dimensionEntities = entities
+                    .Where(e => SheetEntityRoleClassifier.GetRole(e) == SheetEntityRole.Dimension)
+                    .ToList();
+
+                var leaderEntities = entities
+                    .Where(e => SheetEntityRoleClassifier.GetRole(e) == SheetEntityRole.Leader)
+                    .ToList();
+
+                var blockContainerEntities = entities
+                    .Where(e => SheetEntityRoleClassifier.GetRole(e) == SheetEntityRole.BlockContainer)
+                    .ToList();
+
+                var unknownEntities = entities
+                    .Where(e => SheetEntityRoleClassifier.GetRole(e) == SheetEntityRole.Unknown)
+                    .ToList();
+
+                ed.WriteMessage("\n[FluxCAD] ----- Core Counts -----");
+                ed.WriteMessage($"\n[FluxCAD] Geometry={geometryEntities.Count}");
+                ed.WriteMessage($"\n[FluxCAD] Text={textEntities.Count}");
+                ed.WriteMessage($"\n[FluxCAD] Dimension={dimensionEntities.Count}");
+                ed.WriteMessage($"\n[FluxCAD] Leader={leaderEntities.Count}");
+                ed.WriteMessage($"\n[FluxCAD] BlockContainer={blockContainerEntities.Count}");
+                ed.WriteMessage($"\n[FluxCAD] Unknown={unknownEntities.Count}");
+
+                // 4) Role x Type 교차 집계
+                var roleTypeRows = entities
+                    .GroupBy(e => new
+                    {
+                        Role = SheetEntityRoleClassifier.GetRole(e),
+                        Type = GetEntityTypeName(e)
+                    })
+                    .Select(g => new
+                    {
+                        g.Key.Role,
+                        g.Key.Type,
+                        Count = g.Count()
+                    })
+                    .OrderByDescending(x => x.Count)
+                    .ThenBy(x => x.Role.ToString())
+                    .ThenBy(x => x.Type)
+                    .ToList();
+
+                ed.WriteMessage("\n[FluxCAD] ----- Role x Type -----");
+                foreach (var row in roleTypeRows)
+                {
+                    ed.WriteMessage($"\n[RoleType] Role={row.Role}, Type={row.Type}, Count={row.Count}");
+                }
+
+                // 5) Geometry 샘플
+                ed.WriteMessage("\n[FluxCAD] ----- Geometry Samples -----");
+                foreach (var e in geometryEntities.Take(20))
+                {
+                    ed.WriteMessage(
+                        $"\n[Geom] Type={GetEntityTypeName(e)}, " +
+                        $"Role={SheetEntityRoleClassifier.GetRole(e)}, " +
+                        $"Layer={Safe(e.Layer)}, " +
+                        $"Block={Safe(e.BlockName)}, " +
+                        $"Handle={Safe(e.Handle)}, " +
+                        $"Bounds={FormatBounds(e.Bounds)}");
+                }
+
+                // 6) BlockContainer 샘플
+                ed.WriteMessage("\n[FluxCAD] ----- BlockContainer Samples -----");
+                foreach (var e in blockContainerEntities.Take(20))
+                {
+                    ed.WriteMessage(
+                        $"\n[Block] Type={GetEntityTypeName(e)}, " +
+                        $"Role={SheetEntityRoleClassifier.GetRole(e)}, " +
+                        $"Layer={Safe(e.Layer)}, " +
+                        $"Block={Safe(e.BlockName)}, " +
+                        $"Handle={Safe(e.Handle)}, " +
+                        $"Bounds={FormatBounds(e.Bounds)}");
+                }
+
+                // 7) Unknown 샘플
+                ed.WriteMessage("\n[FluxCAD] ----- Unknown Samples -----");
+                foreach (var e in unknownEntities.Take(20))
+                {
+                    ed.WriteMessage(
+                        $"\n[Unknown] Type={GetEntityTypeName(e)}, " +
+                        $"Kind={Safe(e.Kind.ToString())}, " +
+                        $"Layer={Safe(e.Layer)}, " +
+                        $"Block={Safe(e.BlockName)}, " +
+                        $"Handle={Safe(e.Handle)}, " +
+                        $"Text={TrimText(e.Text)}");
+                }
+
+                // 8) Text / Dimension 샘플
+                ed.WriteMessage("\n[FluxCAD] ----- Annotation Samples -----");
+                foreach (var e in entities
+                    .Where(x =>
+                        SheetEntityRoleClassifier.GetRole(x) == SheetEntityRole.Text ||
+                        SheetEntityRoleClassifier.GetRole(x) == SheetEntityRole.Dimension ||
+                        SheetEntityRoleClassifier.GetRole(x) == SheetEntityRole.Leader)
+                    .Take(20))
+                {
+                    ed.WriteMessage(
+                        $"\n[Anno] Type={GetEntityTypeName(e)}, " +
+                        $"Role={SheetEntityRoleClassifier.GetRole(e)}, " +
+                        $"Layer={Safe(e.Layer)}, " +
+                        $"Block={Safe(e.BlockName)}, " +
+                        $"Handle={Safe(e.Handle)}, " +
+                        $"Text={TrimText(e.Text)}");
+                }
+
+                // 9) 최종 판정
+                ed.WriteMessage("\n[FluxCAD] ----- Interpretation -----");
+
+                if (geometryEntities.Count <= 3 && blockContainerEntities.Count >= 3)
+                {
+                    ed.WriteMessage("\n[FluxCAD] 판정: geometry leaf가 거의 없고 block container가 많이 보입니다. block 내부 전개 부족 가능성이 큽니다.");
+                }
+                else if (geometryEntities.Count <= 3)
+                {
+                    ed.WriteMessage("\n[FluxCAD] 판정: geometry seed가 거의 없습니다. role 분류 또는 snapshot 추출 범위를 먼저 의심해야 합니다.");
+                }
+                else if (unknownEntities.Count >= entities.Count / 2)
+                {
+                    ed.WriteMessage("\n[FluxCAD] 판정: Unknown 비율이 높습니다. EntityType/Role 매핑 보강이 필요합니다.");
+                }
+                else
+                {
+                    ed.WriteMessage("\n[FluxCAD] 판정: geometry / annotation 분리는 어느 정도 들어오고 있습니다. 다음은 cluster 단계 점검이 가능합니다.");
+                }
+            }
+            catch (System.Exception ex)
+            {
+                ed.WriteMessage($"\n[FluxCAD] ERROR: {ex.Message}");
+                ed.WriteMessage($"\n{ex.StackTrace}");
+            }
+        }
+
+        private static string GetEntityTypeName(SheetEntity e)
+        {
+            if (!string.IsNullOrWhiteSpace(e.EntityType))
+                return e.EntityType!;
+
+            if (e.Kind != null)
+                return e.Kind.ToString() ?? "(null)";
+
+            return "(null)";
+        }
+
+        private static string Safe_old(string? value)
+        {
+            return string.IsNullOrWhiteSpace(value) ? "-" : value;
+        }
+
+        private static string TrimText(string? value)
+        {
+            if (string.IsNullOrWhiteSpace(value))
+                return "-";
+
+            var text = value.Replace("\r", " ").Replace("\n", " ").Trim();
+            return text.Length <= 60 ? text : text.Substring(0, 60) + "...";
+        }
+
+        private static string FormatBounds(Bounds2D b)
+        {
+            return $"({b.MinX:F2},{b.MinY:F2})-({b.MaxX:F2},{b.MaxY:F2})";
+        }
+
+        [CommandMethod("FLUX_DEBUG_GEOMETRY_CLUSTERS")]
+        public void FluxDebugGeometryClusters()
+        {
+            var doc = Application.DocumentManager.MdiActiveDocument;
+            if (doc == null)
+                return;
+
+            var db = doc.Database;
+            var ed = doc.Editor;
+
+            try
+            {
+                var sheetFilePath = db.Filename;
+                if (string.IsNullOrWhiteSpace(sheetFilePath))
+                {
+                    ed.WriteMessage("\n[FluxCAD] 저장된 DWG 파일이 아닙니다.");
+                    return;
+                }
+
+                IEntitySnapshotBuilder snapshotBuilder = new SimpleSheetFileSnapshotBuilder();
+                var entities = snapshotBuilder.Build(sheetFilePath);
+
+                if (entities == null || entities.Count == 0)
+                {
+                    ed.WriteMessage("\n[FluxCAD] snapshot이 비어 있습니다.");
+                    return;
+                }
+
+                var sheetBounds = Bounds2DHelper.FromEntities(entities);
+
+                var builder = new GeometryClusterBuilder();
+                var options = new StructuredComponentBuildOptions();
+
+                var clusters = builder.Build(entities, sheetBounds, options)
+                               ?? Array.Empty<GeometryCluster>();
+
+                ed.WriteMessage($"\n[FluxCAD] Clusters.Count={clusters.Count}");
+
+                for (int i = 0; i < clusters.Count; i++)
+                {
+                    var c = clusters[i];
+                    var gb = c.GeometryBounds;
+                    var tb = c.TotalBounds;
+
+                    ed.WriteMessage(
+                        $"\n[Cluster {i + 1}] " +
+                        $"GeometryMembers={c.GeometryEntities.Count}, " +
+                        $"Text={c.AttachedTextEntities.Count}, " +
+                        $"Dim={c.AttachedDimensionEntities.Count}, " +
+                        $"GeoBounds=({gb.MinX:0.##},{gb.MinY:0.##})-({gb.MaxX:0.##},{gb.MaxY:0.##}), " +
+                        $"TotalBounds=({tb.MinX:0.##},{tb.MinY:0.##})-({tb.MaxX:0.##},{tb.MaxY:0.##})");
+                }
+
+                var clusterList = clusters.ToList();
+                var geometryClusters = clusterList
+                    .Where(x => x.GeometryCount > 0)
+                    .ToList();
+
+                var orphanClusters = clusterList
+                    .Where(x => x.GeometryCount <= 0)
+                    .ToList();
+
+                var totalGeometryCount = geometryClusters.Sum(x => x.GeometryCount);
+                var largestGeometryCluster = geometryClusters
+                    .OrderByDescending(x => x.GeometryCount)
+                    .FirstOrDefault();
+
+                var largestGeometryCount = largestGeometryCluster?.GeometryCount ?? 0;
+                var giantRatio = totalGeometryCount == 0
+                    ? 0.0
+                    : (double)largestGeometryCount / totalGeometryCount;
+
+                ed.WriteMessage("\n[FluxCAD] ===== Geometry Cluster Debug =====");
+                ed.WriteMessage($"\n[FluxCAD] File={sheetFilePath}");
+                ed.WriteMessage($"\n[FluxCAD] Entities.Total={entities.Count}");
+                ed.WriteMessage($"\n[FluxCAD] Clusters.Total={clusterList.Count}");
+                ed.WriteMessage($"\n[FluxCAD] Clusters.Geometry={geometryClusters.Count}");
+                ed.WriteMessage($"\n[FluxCAD] Clusters.Orphan={orphanClusters.Count}");
+                ed.WriteMessage($"\n[FluxCAD] GeometryEntities.Total={totalGeometryCount}");
+                ed.WriteMessage($"\n[FluxCAD] LargestGeometryCluster.Count={largestGeometryCount}");
+                ed.WriteMessage($"\n[FluxCAD] LargestGeometryCluster.Ratio={giantRatio:P1}");
+
+                if (geometryClusters.Count == 0)
+                {
+                    ed.WriteMessage("\n[FluxCAD] geometry cluster가 없습니다.");
+                    return;
+                }
+
+                var ranked = geometryClusters
+                    .Select((cluster, index) => new ClusterDebugInfo
+                    {
+                        Index = index,
+                        GeometryCount = cluster.GeometryCount,
+                        TextCount = SafeCount(cluster.AttachedTextEntities),
+                        AuxCount = SafeCount(cluster.AttachedDimensionEntities),
+                        Cluster = cluster
+                    })
+                    .OrderByDescending(x => x.GeometryCount)
+                    .ThenByDescending(x => x.TextCount)
+                    .ThenByDescending(x => x.AuxCount)
+                    .Take(15)
+                    .ToList();
+
+                ed.WriteMessage("\n[FluxCAD] ----- Top Geometry Clusters -----");
+                foreach (var item in ranked)
+                {
+                    var auxToGeo = item.GeometryCount == 0
+                        ? 0.0
+                        : (double)(item.TextCount + item.AuxCount) / item.GeometryCount;
+
+                    ed.WriteMessage(
+                        $"\n[Cluster {item.Index}] " +
+                        $"G={item.GeometryCount}, " +
+                        $"T={item.TextCount}, " +
+                        $"A={item.AuxCount}, " +
+                        $"Aux/Geo={auxToGeo:F2}");
+                }
+
+                var suspicious = geometryClusters
+                    .Select((cluster, index) => new ClusterDebugInfo
+                    {
+                        Index = index,
+                        GeometryCount = cluster.GeometryCount,
+                        TextCount = SafeCount(cluster.AttachedTextEntities),
+                        AuxCount = SafeCount(cluster.AttachedDimensionEntities),
+                        Cluster = cluster
+                    })
+                    .Where(x => x.GeometryCount > 0 && (x.TextCount + x.AuxCount) >= x.GeometryCount * 2)
+                    .OrderByDescending(x => x.TextCount + x.AuxCount)
+                    .Take(10)
+                    .ToList();
+
+                ed.WriteMessage("\n[FluxCAD] ----- Suspicious Attachment-Heavy Clusters -----");
+                if (suspicious.Count == 0)
+                {
+                    ed.WriteMessage("\n[FluxCAD] suspicious cluster 없음");
+                }
+                else
+                {
+                    foreach (var item in suspicious)
+                    {
+                        ed.WriteMessage(
+                            $"\n[Suspect {item.Index}] " +
+                            $"G={item.GeometryCount}, " +
+                            $"T={item.TextCount}, " +
+                            $"A={item.AuxCount}");
+                    }
+                }
+
+                var orphanTop = orphanClusters
+                    .Select((cluster, index) => new
+                    {
+                        Index = index,
+                        TextCount = SafeCount(cluster.AttachedTextEntities),
+                        AuxCount = SafeCount(cluster.AttachedDimensionEntities)
+                    })
+                    .OrderByDescending(x => x.TextCount + x.AuxCount)
+                    .Take(10)
+                    .ToList();
+
+                ed.WriteMessage("\n[FluxCAD] ----- Top Orphan Clusters -----");
+                if (orphanTop.Count == 0)
+                {
+                    ed.WriteMessage("\n[FluxCAD] orphan cluster 없음");
+                }
+                else
+                {
+                    foreach (var item in orphanTop)
+                    {
+                        ed.WriteMessage(
+                            $"\n[Orphan {item.Index}] " +
+                            $"T={item.TextCount}, " +
+                            $"A={item.AuxCount}");
+                    }
+                }
+
+                if (totalGeometryCount <= 3)
+                {
+                    ed.WriteMessage("\n[FluxCAD] 판정: geometry seed가 거의 비어 있습니다. cluster 과대병합보다 snapshot / role 분류 문제를 먼저 의심해야 합니다.");
+                }
+                else if (giantRatio >= 0.60)
+                {
+                    ed.WriteMessage("\n[FluxCAD] 판정: giant component가 남아 있을 가능성이 큽니다.");
+                }
+                else if (giantRatio >= 0.35)
+                {
+                    ed.WriteMessage("\n[FluxCAD] 판정: 과대병합이 일부 남아 있을 수 있습니다.");
+                }
+                else
+                {
+                    ed.WriteMessage("\n[FluxCAD] 판정: giant component는 1차적으로 상당히 완화된 것으로 보입니다.");
+                }
+            }
+            catch (System.Exception ex)
+            {
+                ed.WriteMessage($"\n[FluxCAD] ERROR: {ex.Message}");
+                ed.WriteMessage($"\n{ex.StackTrace}");
+            }
+        }
+
+        private static int SafeCount<T>(IEnumerable<T>? source)
+        {
+            if (source == null)
+                return 0;
+
+            if (source is ICollection<T> collection)
+                return collection.Count;
+
+            return source.Count();
+        }
+
+        private sealed class ClusterDebugInfo
+        {
+            public int Index { get; set; }
+            public int GeometryCount { get; set; }
+            public int TextCount { get; set; }
+            public int AuxCount { get; set; }
+            public GeometryCluster? Cluster { get; set; }
+        }
+
         [CommandMethod("FLUX_DEBUG_SINGLE_SHEET_ROLES")]
         public void FluxDebugSingleSheetRoles()
         {
@@ -524,12 +973,12 @@ namespace FluxCAD.BricsCAD.Plugin26
             return Math.Sqrt(dx * dx + dy * dy);
         }
 
-        private sealed class UnionFind
+        private sealed class UnionFind_old
         {
             private readonly int[] _parent;
             private readonly int[] _rank;
 
-            public UnionFind(int n)
+            public UnionFind_old(int n)
             {
                 _parent = new int[n];
                 _rank = new int[n];

@@ -26,6 +26,16 @@ namespace FluxCAD.SheetAnalysis
         public double ScaleX { get; set; } = 1.0;
         public double ScaleY { get; set; } = 1.0;
 
+        public string EntityType { get; set; } = "";
+        public IReadOnlyList<string> BlockPath { get; set; } = Array.Empty<string>();
+        public int Depth { get; set; }
+        public SheetEntitySourceKind SourceKind { get; set; }
+        public SheetEntityRole Role { get; set; }
+
+        //public string? BlockPath { get; set; }
+        //public int Depth { get; set; }
+        public string? SnapshotKey { get; set; }
+
         public bool IsVisible { get; set; } = true;
         public bool IsBlockReference => Kind == SheetEntityKind.BlockReference;
         public bool IsTextLike_old =>

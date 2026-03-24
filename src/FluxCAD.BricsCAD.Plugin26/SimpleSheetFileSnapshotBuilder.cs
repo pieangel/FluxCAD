@@ -1,7 +1,6 @@
 ﻿using FluxCAD.SheetAnalysis;
 using System;
 using System.Collections.Generic;
-using System.Globalization;
 using Teigha.DatabaseServices;
 using Teigha.Geometry;
 
@@ -31,6 +30,9 @@ namespace FluxCAD.BricsCAD.Plugin26
                     var msId = SymbolUtilityServices.GetBlockModelSpaceId(db);
                     var ms = (BlockTableRecord)tr.GetObject(msId, OpenMode.ForRead);
 
+                    var transformsToWcs = Array.Empty<Matrix3d>();
+                    var blockStack = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
                     foreach (ObjectId id in ms)
                     {
                         if (!id.IsValid || id.IsErased)
@@ -40,7 +42,15 @@ namespace FluxCAD.BricsCAD.Plugin26
                         if (ent == null)
                             continue;
 
-                        result.Add(BuildSheetEntity(ent, tr));
+                        ExpandEntityRecursive(
+                            ent,
+                            tr,
+                            result,
+                            transformsToWcs,
+                            blockPath: null,
+                            ownerBlockName: null,
+                            depth: 0,
+                            blockStack: blockStack);
                     }
 
                     tr.Commit();
@@ -50,58 +60,218 @@ namespace FluxCAD.BricsCAD.Plugin26
             return result;
         }
 
-        private static SheetEntity BuildSheetEntity(Entity ent, Transaction tr)
+        private static void ExpandEntityRecursive(
+            Entity ent,
+            Transaction tr,
+            List<SheetEntity> result,
+            IReadOnlyList<Matrix3d> transformsToWcs,
+            string? blockPath,
+            string? ownerBlockName,
+            int depth,
+            HashSet<string> blockStack)
         {
-            var kind = ResolveKind(ent);
+            if (ent == null || ent.IsErased)
+                return;
 
-            var bounds = TryGetBounds(ent, out var b)
-                ? b
-                : new Bounds2D(0, 0, 0, 0);
-
-            var anchor = TryGetAnchor(ent, out var a)
-                ? a
-                : bounds.Center;
-
-            string? text = ExtractText(ent);
-            string? normalized = NormalizeText(text);
-
-            double rotationDeg = TryGetRotationDeg(ent);
-            double textHeight = TryGetTextHeight(ent);
-            double scaleX = 1.0;
-            double scaleY = 1.0;
-            string? blockName = null;
-
-            if (ent is BlockReference br)
+            if (ent is not BlockReference br)
             {
-                scaleX = SafeNonZero(br.ScaleFactors.X);
-                scaleY = SafeNonZero(br.ScaleFactors.Y);
+                var sheetEntity = BuildLeafSheetEntity(
+                    ent,
+                    transformsToWcs,
+                    ownerBlockName,
+                    blockPath,
+                    depth);
 
-                try
-                {
-                    var btr = (BlockTableRecord)tr.GetObject(br.BlockTableRecord, OpenMode.ForRead);
-                    blockName = btr?.Name;
-                }
-                catch
-                {
-                    blockName = null;
-                }
+                if (sheetEntity != null)
+                    result.Add(sheetEntity);
+
+                return;
             }
 
-            return new SheetEntity
+            var currentBlockName = TryGetBlockName(br, tr);
+            var nextBlockPath = AppendBlockPath(blockPath, br, currentBlockName);
+
+            // AttributeReference는 block definition 안이 아니라 insert instance 쪽에 존재하므로 별도 처리
+            foreach (ObjectId attrId in br.AttributeCollection)
             {
-                Handle = ent.Handle.ToString(),
-                Kind = kind,
-                Layer = ent.Layer ?? "",
-                BlockName = blockName,
-                Bounds = bounds,
-                Anchor = anchor,
-                Text = text,
-                TextNormalized = normalized,
-                RotationDeg = rotationDeg,
-                TextHeight = textHeight,
-                ScaleX = scaleX,
-                ScaleY = scaleY,
-                IsVisible = !ent.IsErased
+                if (!attrId.IsValid || attrId.IsErased)
+                    continue;
+
+                var attr = tr.GetObject(attrId, OpenMode.ForRead) as AttributeReference;
+                if (attr == null)
+                    continue;
+
+                var attrEntity = BuildLeafSheetEntity(
+                    attr,
+                    transformsToWcs,
+                    currentBlockName,
+                    nextBlockPath,
+                    depth + 1);
+
+                if (attrEntity != null)
+                    result.Add(attrEntity);
+            }
+
+            BlockTableRecord? btr = null;
+            try
+            {
+                btr = (BlockTableRecord)tr.GetObject(br.BlockTableRecord, OpenMode.ForRead);
+            }
+            catch
+            {
+                return;
+            }
+
+            if (btr == null)
+                return;
+
+            var recursionKey = GetRecursionKey(btr, currentBlockName);
+            if (!blockStack.Add(recursionKey))
+                return;
+
+            try
+            {
+                var childTransformsToWcs = PrependTransform(transformsToWcs, br.BlockTransform);
+
+                foreach (ObjectId childId in btr)
+                {
+                    if (!childId.IsValid || childId.IsErased)
+                        continue;
+
+                    var child = tr.GetObject(childId, OpenMode.ForRead) as Entity;
+                    if (child == null)
+                        continue;
+
+                    ExpandEntityRecursive(
+                        child,
+                        tr,
+                        result,
+                        childTransformsToWcs,
+                        nextBlockPath,
+                        currentBlockName,
+                        depth + 1,
+                        blockStack);
+                }
+            }
+            finally
+            {
+                blockStack.Remove(recursionKey);
+            }
+        }
+
+        private static SheetEntity? BuildLeafSheetEntity(
+            Entity sourceEnt,
+            IReadOnlyList<Matrix3d> transformsToWcs,
+            string? ownerBlockName,
+            string? blockPath,
+            int depth)
+        {
+            Entity? wcsEnt = null;
+
+            try
+            {
+                wcsEnt = (Entity)sourceEnt.Clone();
+
+                ApplyTransforms(wcsEnt, transformsToWcs);
+
+                var kind = ResolveKind(wcsEnt);
+                var role = ResolveRole(wcsEnt);
+
+                var bounds = TryGetBounds(wcsEnt, out var b)
+                    ? b
+                    : new Bounds2D(0, 0, 0, 0);
+
+                var anchor = TryGetAnchor(wcsEnt, out var a)
+                    ? a
+                    : bounds.Center;
+
+                string? text = ExtractText(wcsEnt);
+                string? normalized = NormalizeText(text);
+                double rotationDeg = TryGetRotationDeg(wcsEnt);
+                double textHeight = TryGetTextHeight(wcsEnt);
+                double scaleX = 1.0;
+                double scaleY = 1.0;
+
+                if (wcsEnt is BlockReference wcsBr)
+                {
+                    scaleX = SafeNonZero(wcsBr.ScaleFactors.X);
+                    scaleY = SafeNonZero(wcsBr.ScaleFactors.Y);
+                }
+
+                var sheetEntity = new SheetEntity
+                {
+                    Handle = sourceEnt.Handle.ToString(),
+                    Kind = kind,
+                    Layer = sourceEnt.Layer ?? string.Empty,
+                    BlockName = ownerBlockName,
+                    Bounds = bounds,
+                    Anchor = anchor,
+                    Role = role,
+                    Text = text,
+                    TextNormalized = normalized,
+                    RotationDeg = rotationDeg,
+                    TextHeight = textHeight,
+                    ScaleX = scaleX,
+                    ScaleY = scaleY,
+                    IsVisible = !sourceEnt.IsErased
+                };
+
+                // SheetEntity에 해당 속성이 있으면 기록
+                TrySetOptionalProperty(sheetEntity, "BlockPath", blockPath);
+                TrySetOptionalProperty(sheetEntity, "Depth", depth);
+
+                return sheetEntity;
+            }
+            catch
+            {
+                return null;
+            }
+            finally
+            {
+                wcsEnt?.Dispose();
+            }
+        }
+
+        private static void ApplyTransforms(Entity ent, IReadOnlyList<Matrix3d> transformsToWcs)
+        {
+            if (transformsToWcs == null)
+                return;
+
+            for (int i = 0; i < transformsToWcs.Count; i++)
+            {
+                ent.TransformBy(transformsToWcs[i]);
+            }
+        }
+
+        // 현재 block의 transform을 맨 앞에 넣는다.
+        // leaf에 적용할 때는 [inner, outer, outerouter...] 순서로 TransformBy 된다.
+        private static IReadOnlyList<Matrix3d> PrependTransform(
+            IReadOnlyList<Matrix3d> transformsToWcs,
+            Matrix3d currentBlockTransform)
+        {
+            var list = new List<Matrix3d>((transformsToWcs?.Count ?? 0) + 1)
+            {
+                currentBlockTransform
+            };
+
+            if (transformsToWcs != null)
+            {
+                for (int i = 0; i < transformsToWcs.Count; i++)
+                    list.Add(transformsToWcs[i]);
+            }
+
+            return list;
+        }
+
+        private static SheetEntityRole ResolveRole(Entity ent)
+        {
+            return ent switch
+            {
+                Line or Polyline or Arc or Circle or Ellipse or Hatch or Solid => SheetEntityRole.Geometry,
+                AttributeReference or DBText or MText => SheetEntityRole.Text,
+                Leader => SheetEntityRole.Leader,
+                Dimension => SheetEntityRole.Dimension,
+                _ => SheetEntityRoleClassifier.Classify(ent.GetType().Name)
             };
         }
 
@@ -246,6 +416,7 @@ namespace FluxCAD.BricsCAD.Plugin26
             {
                 return ent switch
                 {
+                    AttributeReference ar => RadToDeg(ar.Rotation),
                     DBText t => RadToDeg(t.Rotation),
                     MText mt => RadToDeg(mt.Rotation),
                     BlockReference br => RadToDeg(br.Rotation),
@@ -273,6 +444,50 @@ namespace FluxCAD.BricsCAD.Plugin26
             catch
             {
                 return 0.0;
+            }
+        }
+
+        private static string? TryGetBlockName(BlockReference br, Transaction tr)
+        {
+            try
+            {
+                var btr = (BlockTableRecord)tr.GetObject(br.BlockTableRecord, OpenMode.ForRead);
+                return btr?.Name;
+            }
+            catch
+            {
+                return null;
+            }
+        }
+
+        private static string AppendBlockPath(string? currentPath, BlockReference br, string? blockName)
+        {
+            var segment = string.IsNullOrWhiteSpace(blockName)
+                ? br.Handle.ToString()
+                : blockName + ":" + br.Handle.ToString();
+
+            return string.IsNullOrWhiteSpace(currentPath)
+                ? segment
+                : currentPath + "/" + segment;
+        }
+
+        private static string GetRecursionKey(BlockTableRecord btr, string? blockName)
+        {
+            return btr.Handle.ToString() + "|" + (blockName ?? string.Empty);
+        }
+
+        private static void TrySetOptionalProperty(SheetEntity entity, string propertyName, object? value)
+        {
+            try
+            {
+                var prop = entity.GetType().GetProperty(propertyName);
+                if (prop == null || !prop.CanWrite)
+                    return;
+
+                prop.SetValue(entity, value, null);
+            }
+            catch
+            {
             }
         }
 

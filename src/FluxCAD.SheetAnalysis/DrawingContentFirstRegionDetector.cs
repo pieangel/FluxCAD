@@ -1,4 +1,5 @@
-﻿using System;
+﻿
+using System;
 using System.Collections.Generic;
 using System.Linq;
 
@@ -108,6 +109,17 @@ namespace FluxCAD.SheetAnalysis
             return regions;
         }
 
+        private readonly StructuredComponentBuildOptions _clusterBuildOptions =
+            new StructuredComponentBuildOptions
+            {
+                GeometryMergeDistance = 6.0,
+                GeometryInflate = 1.0,
+                TextAttachDistance = 80.0,
+                DimensionAttachDistance = 120.0,
+                KeepOrphans = true
+            };
+
+
         private DrawingContentDetectionResult DetectDrawingContent(
             IReadOnlyList<SheetEntity> entities,
             Bounds2D sheetBounds)
@@ -117,19 +129,38 @@ namespace FluxCAD.SheetAnalysis
                 SheetBounds = sheetBounds
             };
 
-            var clusters = _clusterBuilder.Build(entities, _clusterOptions);
+            var builder = new GeometryClusterBuilder();
+
+            var clusters = builder.Build(
+                entities,
+                sheetBounds,
+                new StructuredComponentBuildOptions());
+
             result.GeometryClusters.AddRange(clusters);
 
-            if (clusters.Count == 0)
+            var geometryClusters = clusters
+                .Where(x => x.GeometryCount > 0)
+                .ToList();
+
+            if (geometryClusters.Count == 0)
             {
                 result.Reasons.Add("no geometry clusters found");
+                result.HasDrawingContent = false;
                 return result;
             }
 
-            var candidates = _viewCandidateBuilder.Build(clusters, sheetBounds, _viewCandidateOptions);
+            var candidates = _viewCandidateBuilder.Build(
+                geometryClusters,
+                sheetBounds,
+                _viewCandidateOptions);
+
             result.ViewCandidates.AddRange(candidates);
 
-            var packs = _viewPackScorer.BuildPacks(candidates, sheetBounds, _viewPackOptions);
+            var packs = _viewPackScorer.BuildPacks(
+                candidates,
+                sheetBounds,
+                _viewPackOptions);
+
             result.ViewPacks.AddRange(packs);
 
             var bestPack = packs
@@ -141,27 +172,18 @@ namespace FluxCAD.SheetAnalysis
             if (bestPack != null)
             {
                 result.BestPack = bestPack;
+                result.ContentRegionBounds = bestPack.Bounds;
+
+                // ViewPackCandidate에는 GeometryBounds가 없으므로
+                // 현재는 pack bounds를 그대로 사용
+                result.GeometryRegionBounds = bestPack.Bounds;
+
                 result.HasDrawingContent = true;
-
-                var geometryBounds = Bounds2DHelper.Union(
-                    bestPack.Views.Select(x => x.GeometryBounds));
-
-                var contentBounds = Bounds2DHelper.Union(
-                    bestPack.Views.Select(x => x.Bounds));
-
-                result.GeometryRegionBounds = Bounds2DHelper.Inflate(geometryBounds, 2.0);
-                result.ContentRegionBounds = Bounds2DHelper.Inflate(contentBounds, 6.0);
-
-                result.Reasons.Add($"selected best pack: {bestPack.PackId}");
-                result.Reasons.Add($"pack score={bestPack.Score:0.###}");
-                result.Reasons.Add($"pack view count={bestPack.ViewCount}");
-                result.Reasons.AddRange(bestPack.Reasons);
-
+                result.Reasons.Add("selected best scored pack");
                 return result;
             }
 
             var bestSingle = candidates
-                .Where(x => x.IsViewCandidate)
                 .OrderByDescending(x => x.Score)
                 .ThenByDescending(x => x.GeometryCount)
                 .FirstOrDefault();
@@ -169,19 +191,15 @@ namespace FluxCAD.SheetAnalysis
             if (bestSingle != null)
             {
                 result.BestSingleView = bestSingle;
+                result.ContentRegionBounds = bestSingle.Bounds;
+                result.GeometryRegionBounds = bestSingle.GeometryBounds;
                 result.HasDrawingContent = true;
-
-                result.GeometryRegionBounds = Bounds2DHelper.Inflate(bestSingle.GeometryBounds, 2.0);
-                result.ContentRegionBounds = Bounds2DHelper.Inflate(bestSingle.Bounds, 6.0);
-
-                result.Reasons.Add($"fallback to single strong view candidate: {bestSingle.CandidateId}");
-                result.Reasons.Add($"candidate score={bestSingle.Score:0.###}");
-                result.Reasons.AddRange(bestSingle.Reasons);
-
+                result.Reasons.Add("selected best single candidate");
                 return result;
             }
 
-            result.Reasons.Add("clusters exist, but no view pack or single view passed acceptance");
+            result.HasDrawingContent = false;
+            result.Reasons.Add("no viable view candidates");
             return result;
         }
 
