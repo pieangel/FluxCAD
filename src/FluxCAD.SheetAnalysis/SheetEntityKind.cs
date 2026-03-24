@@ -23,7 +23,10 @@ namespace FluxCAD.SheetAnalysis
         Hatch,
         Solid,
         Point,
-        InsertAttribute
+        InsertAttribute,
+
+        Spline,
+        Region
     }
 
 }

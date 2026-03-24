@@ -18,5 +18,9 @@ namespace FluxCAD.SheetAnalysis
 
         public bool Intersects(Bounds2D other)
             => !(other.MaxX < MinX || other.MinX > MaxX || other.MaxY < MinY || other.MinY > MaxY);
+
+        public static Bounds2D Empty => new(0, 0, 0, 0);
+
+        public bool IsEmpty => Width <= 0 || Height <= 0;
     }
 }

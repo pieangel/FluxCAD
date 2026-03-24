@@ -28,6 +28,11 @@ namespace FluxCAD.SheetAnalysis
 
         public bool IsVisible { get; set; } = true;
         public bool IsBlockReference => Kind == SheetEntityKind.BlockReference;
+        public bool IsTextLike_old =>
+            Kind == SheetEntityKind.Text ||
+            Kind == SheetEntityKind.MText ||
+            Kind == SheetEntityKind.InsertAttribute;
+
         public bool IsTextLike =>
             Kind == SheetEntityKind.Text ||
             Kind == SheetEntityKind.MText ||
@@ -44,6 +49,8 @@ namespace FluxCAD.SheetAnalysis
             Kind == SheetEntityKind.Ellipse ||
             Kind == SheetEntityKind.Hatch ||
             Kind == SheetEntityKind.Solid ||
-            Kind == SheetEntityKind.BlockReference;
+            Kind == SheetEntityKind.Point ||
+            Kind == SheetEntityKind.Spline ||
+            Kind == SheetEntityKind.Region;
     }
 }
