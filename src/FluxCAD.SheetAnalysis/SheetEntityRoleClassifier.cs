@@ -179,7 +179,7 @@ namespace FluxCAD.SheetAnalysis
             if (!string.IsNullOrWhiteSpace(e.EntityType))
                 return e.EntityType!;
 
-            if (e.Kind != null)
+            if (e.Kind == SheetEntityKind.Text)
                 return e.Kind.ToString();
 
             return string.Empty;
