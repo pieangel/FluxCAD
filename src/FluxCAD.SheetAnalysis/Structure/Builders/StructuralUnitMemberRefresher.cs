@@ -36,7 +36,15 @@ namespace FluxCAD.SheetAnalysis.Structure.Builders
                 return;
 
             if (unit.Members.Count == 0)
+            {
+                unit.Bounds = Bounds2D.Empty;
+                unit.RepresentativePoint = new Point2D(0, 0);
+                unit.CommonBlockPath = Array.Empty<string>();
+                unit.Depth = 0;
+                unit.SourceBlockName = null;
+                unit.Composition = _compositionBuilder(Array.Empty<SheetEntity>());
                 return;
+            }
 
             var bounds = Bounds2DHelper.FromEntities(unit.Members);
             var commonPath = FindCommonBlockPath(unit.Members);

@@ -75,13 +75,8 @@ namespace FluxCAD.SheetAnalysis.Structure.Classifiers
 
         private static bool IsStrongOwner(StructuralUnit unit)
         {
-            if (unit.Kind == StructuralUnitKind.SheetRoot)
-                return false;
-
-            if (unit.Kind == StructuralUnitKind.LoosePrimitiveGroup)
-                return false;
-
-            return true;
+            return unit.Kind == StructuralUnitKind.Branch
+                || unit.Kind == StructuralUnitKind.BlockFamily;
         }
 
         private static int GetOwnerPriority(StructuralUnit unit)
