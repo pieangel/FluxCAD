@@ -11,9 +11,9 @@ namespace FluxCAD.SheetAnalysis.Structure.Builders
         private readonly StructuralRoleClassifier _roleClassifier = new();
 
         public SheetStructuralModel Build(
-            IReadOnlyList<SheetEntity> entities,
-            Bounds2D sheetBounds,
-            StructuralBuildOptions? options = null)
+    IReadOnlyList<SheetEntity> entities,
+    Bounds2D sheetBounds,
+    StructuralBuildOptions? options = null)
         {
             options ??= new StructuralBuildOptions();
 
@@ -38,7 +38,50 @@ namespace FluxCAD.SheetAnalysis.Structure.Builders
             BuildLoosePrimitiveUnits(filtered, model, options);
             BuildBlockFamilyUnits(filtered, model, options);
 
+            PostProcessUnits(model);
+
             return model;
+        }
+
+        private void PostProcessUnits(SheetStructuralModel model)
+        {
+            var resolver = new StructuralOwnershipResolver();
+            resolver.ResolveInPlace(model.Units);
+
+            model.Units.RemoveAll(x =>
+                x.Kind == StructuralUnitKind.LoosePrimitiveGroup &&
+                x.Members.Count == 0);
+
+            var refresher = new StructuralUnitMemberRefresher(
+                members => PrimitiveCompositionProfile.FromEntities(members));
+
+            refresher.RefreshAll(model.Units);
+
+            foreach (var unit in model.Units)
+            {
+                if (unit.Kind == StructuralUnitKind.SheetRoot)
+                    continue;
+
+                var groupingReason = GetGroupingReason(unit.Kind);
+
+                unit.RoleHint = _roleClassifier.Classify(unit);
+
+                if (!string.IsNullOrWhiteSpace(groupingReason))
+                {
+                    unit.Reasons.Add(groupingReason);
+                }
+            }
+        }
+
+        private static string GetGroupingReason(StructuralUnitKind kind)
+        {
+            return kind switch
+            {
+                StructuralUnitKind.Branch => "grouped by exact block path",
+                StructuralUnitKind.BlockFamily => "grouped by leaf block family",
+                StructuralUnitKind.LoosePrimitiveGroup => "grouped as loose primitive set",
+                _ => string.Empty
+            };
         }
 
         private void BuildBranchUnits(

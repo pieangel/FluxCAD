@@ -7,36 +7,14 @@ namespace FluxCAD.SheetAnalysis.Structure.Classifiers
 {
     public sealed class StructuralOwnershipResolver
     {
-        public IReadOnlyList<StructuralUnit> Resolve(IEnumerable<StructuralUnit> units)
+        public void ResolveInPlace(IList<StructuralUnit> units)
         {
             if (units == null)
                 throw new ArgumentNullException(nameof(units));
 
-            var list = units.ToList();
+            var ownerByHandle = BuildOwnerRegistry(units);
 
-            // 1. strong owner registry
-            // LoosePrimitiveGroup이 아닌 unit들이 먼저 handle을 소유합니다.
-            var ownerByHandle = new Dictionary<string, StructuralUnit>(StringComparer.OrdinalIgnoreCase);
-
-            foreach (var unit in list)
-            {
-                if (!ParticipatesAsStrongOwner(unit))
-                    continue;
-
-                foreach (var member in unit.Members)
-                {
-                    if (string.IsNullOrWhiteSpace(member.Handle))
-                        continue;
-
-                    if (!ownerByHandle.ContainsKey(member.Handle))
-                    {
-                        ownerByHandle[member.Handle] = unit;
-                    }
-                }
-            }
-
-            // 2. loose units에서 이미 strong owner가 가진 member 제거
-            foreach (var unit in list)
+            foreach (var unit in units)
             {
                 if (unit.Kind != StructuralUnitKind.LoosePrimitiveGroup)
                     continue;
@@ -49,12 +27,21 @@ namespace FluxCAD.SheetAnalysis.Structure.Classifiers
                     return ownerByHandle.ContainsKey(member.Handle);
                 });
 
-                // 여기서는 Role/Reason은 잠시 지워 두는 편이 안전합니다.
+                // resolver 뒤에 다시 classify 하므로 초기화
                 unit.RoleHint = StructuralRoleHint.Unknown;
                 unit.Reasons.Clear();
             }
+        }
 
-            // 3. 빈 loose unit 제거
+        public IReadOnlyList<StructuralUnit> Resolve(IEnumerable<StructuralUnit> units)
+        {
+            if (units == null)
+                throw new ArgumentNullException(nameof(units));
+
+            var list = units.ToList();
+
+            ResolveInPlace(list);
+
             list = list
                 .Where(u => u.Kind != StructuralUnitKind.LoosePrimitiveGroup || u.Members.Count > 0)
                 .ToList();
@@ -62,7 +49,31 @@ namespace FluxCAD.SheetAnalysis.Structure.Classifiers
             return list;
         }
 
-        private static bool ParticipatesAsStrongOwner(StructuralUnit unit)
+        private static Dictionary<string, StructuralUnit> BuildOwnerRegistry(IEnumerable<StructuralUnit> units)
+        {
+            var ownerByHandle = new Dictionary<string, StructuralUnit>(StringComparer.OrdinalIgnoreCase);
+
+            foreach (var owner in units
+                         .Where(IsStrongOwner)
+                         .OrderByDescending(GetOwnerPriority)
+                         .ThenByDescending(x => x.MemberCount))
+            {
+                foreach (var member in owner.Members)
+                {
+                    if (string.IsNullOrWhiteSpace(member.Handle))
+                        continue;
+
+                    if (!ownerByHandle.ContainsKey(member.Handle))
+                    {
+                        ownerByHandle[member.Handle] = owner;
+                    }
+                }
+            }
+
+            return ownerByHandle;
+        }
+
+        private static bool IsStrongOwner(StructuralUnit unit)
         {
             if (unit.Kind == StructuralUnitKind.SheetRoot)
                 return false;
@@ -71,6 +82,16 @@ namespace FluxCAD.SheetAnalysis.Structure.Classifiers
                 return false;
 
             return true;
+        }
+
+        private static int GetOwnerPriority(StructuralUnit unit)
+        {
+            return unit.Kind switch
+            {
+                StructuralUnitKind.Branch => 300,
+                StructuralUnitKind.BlockFamily => 200,
+                _ => 100
+            };
         }
     }
 }

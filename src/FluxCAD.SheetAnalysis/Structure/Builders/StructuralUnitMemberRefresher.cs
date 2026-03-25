@@ -38,15 +38,20 @@ namespace FluxCAD.SheetAnalysis.Structure.Builders
             if (unit.Members.Count == 0)
                 return;
 
-            unit.Bounds = Bounds2DHelper.FromEntities(unit.Members);
-            unit.RepresentativePoint = SelectRepresentativePoint(unit.Members);
-            unit.Depth = unit.Members.Count == 0 ? 0 : unit.Members.Min(x => x.Depth);
-            unit.CommonBlockPath = BuildCommonBlockPath(unit.Members);
-            unit.SourceBlockName = SelectSourceBlockName(unit);
+            var bounds = Bounds2DHelper.FromEntities(unit.Members);
+            var commonPath = FindCommonBlockPath(unit.Members);
+
+            unit.Bounds = bounds;
+            unit.RepresentativePoint = SelectRepresentativePoint(unit.Members, bounds);
+            unit.CommonBlockPath = commonPath;
+            unit.Depth = commonPath.Count;
+            unit.SourceBlockName = SelectSourceBlockName(unit.Members);
             unit.Composition = _compositionBuilder(unit.Members);
         }
 
-        private static Point2D SelectRepresentativePoint(IReadOnlyList<SheetEntity> members)
+        private static Point2D SelectRepresentativePoint(
+            IReadOnlyList<SheetEntity> members,
+            Bounds2D bounds)
         {
             var textLike = members.FirstOrDefault(x => x.IsTextLike);
             if (textLike != null)
@@ -56,52 +61,55 @@ namespace FluxCAD.SheetAnalysis.Structure.Builders
             if (dimLike != null)
                 return dimLike.Anchor;
 
-            return members[0].Anchor;
+            return bounds.Center;
         }
 
-        private static IReadOnlyList<string> BuildCommonBlockPath(IReadOnlyList<SheetEntity> members)
+        private static IReadOnlyList<string> FindCommonBlockPath(IReadOnlyList<SheetEntity> members)
         {
             if (members.Count == 0)
                 return Array.Empty<string>();
 
-            var seed = (members[0].BlockPath ?? Array.Empty<string>()).ToList();
+            var first = members[0].BlockPath?.ToArray() ?? Array.Empty<string>();
+            int max = first.Length;
 
             for (int i = 1; i < members.Count; i++)
             {
-                var path = members[i].BlockPath ?? Array.Empty<string>();
-                int common = 0;
-                int max = Math.Min(seed.Count, path.Count);
+                var path = members[i].BlockPath?.ToArray() ?? Array.Empty<string>();
+                max = Math.Min(max, path.Length);
 
-                while (common < max &&
-                       string.Equals(seed[common], path[common], StringComparison.OrdinalIgnoreCase))
-                {
-                    common++;
-                }
+                int j = 0;
+                while (j < max && string.Equals(first[j], path[j], StringComparison.Ordinal))
+                    j++;
 
-                if (common < seed.Count)
-                {
-                    seed.RemoveRange(common, seed.Count - common);
-                }
-
-                if (seed.Count == 0)
-                    break;
+                max = j;
             }
 
-            return seed;
+            if (max <= 0)
+                return Array.Empty<string>();
+
+            return first.Take(max).ToArray();
         }
 
-        private static string? SelectSourceBlockName(StructuralUnit unit)
+        private static string? SelectSourceBlockName(IReadOnlyList<SheetEntity> members)
         {
-            if (!string.IsNullOrWhiteSpace(unit.SourceBlockName))
-                return unit.SourceBlockName;
+            return members
+                .Select(GetLeafBlockName)
+                .Where(x => !string.IsNullOrWhiteSpace(x))
+                .GroupBy(x => x)
+                .OrderByDescending(g => g.Count())
+                .Select(g => g.Key)
+                .FirstOrDefault();
+        }
 
-            var fromPath = unit.CommonBlockPath.LastOrDefault();
-            if (!string.IsNullOrWhiteSpace(fromPath))
-                return fromPath;
+        private static string? GetLeafBlockName(SheetEntity entity)
+        {
+            if (!string.IsNullOrWhiteSpace(entity.BlockName))
+                return entity.BlockName;
 
-            return unit.Members
-                .Select(x => x.BlockName)
-                .FirstOrDefault(x => !string.IsNullOrWhiteSpace(x));
+            if (entity.BlockPath != null && entity.BlockPath.Count > 0)
+                return entity.BlockPath[entity.BlockPath.Count - 1];
+
+            return null;
         }
     }
 }
