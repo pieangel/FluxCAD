@@ -21,10 +21,20 @@ namespace FluxCAD.SheetAnalysis.Structure.Builders
             return model;
         }
 
+        public SheetStructuralModel Build_old1(
+    IReadOnlyList<SheetEntity> entities,
+    Bounds2D sheetBounds,
+    StructuralBuildOptions? options = null)
+        {
+            var model = BuildRaw(entities, sheetBounds, options);
+            RunPostProcessForDebug(model);
+            return model;
+        }
+
         public SheetStructuralModel BuildRaw(
-            IReadOnlyList<SheetEntity> entities,
-            Bounds2D sheetBounds,
-            StructuralBuildOptions? options = null)
+    IReadOnlyList<SheetEntity> entities,
+    Bounds2D sheetBounds,
+    StructuralBuildOptions? options = null)
         {
             options ??= new StructuralBuildOptions();
 
@@ -61,7 +71,47 @@ namespace FluxCAD.SheetAnalysis.Structure.Builders
             PostProcessUnits(model);
         }
 
-        public SheetStructuralModel Build_old(
+        public SheetStructuralModel BuildRaw_old(
+            IReadOnlyList<SheetEntity> entities,
+            Bounds2D sheetBounds,
+            StructuralBuildOptions? options = null)
+        {
+            options ??= new StructuralBuildOptions();
+
+            var filtered = entities
+                .Where(x => !options.IgnoreInvisibleEntities || x.IsVisible)
+                .ToList();
+
+            var model = new SheetStructuralModel
+            {
+                SheetBounds = sheetBounds
+            };
+
+            model.RootUnit.Bounds = sheetBounds;
+            model.RootUnit.RepresentativePoint = sheetBounds.Center;
+            model.RootUnit.Composition = PrimitiveCompositionProfile.FromEntities(filtered);
+            model.RootUnit.RoleHint = StructuralRoleHint.MixedCarrier;
+            model.RootUnit.Reasons.Clear();
+            model.RootUnit.Reasons.Add("root unit for entire sheet");
+
+            model.Units.Add(model.RootUnit);
+
+            BuildBranchUnits(filtered, model, options);
+            BuildLoosePrimitiveUnits(filtered, model, options);
+            BuildBlockFamilyUnits(filtered, model, options);
+
+            return model;
+        }
+
+        public void RunPostProcessForDebug_old(SheetStructuralModel model)
+        {
+            if (model == null)
+                throw new ArgumentNullException(nameof(model));
+
+            PostProcessUnits(model);
+        }
+
+        public SheetStructuralModel Build_old2(
     IReadOnlyList<SheetEntity> entities,
     Bounds2D sheetBounds,
     StructuralBuildOptions? options = null)
