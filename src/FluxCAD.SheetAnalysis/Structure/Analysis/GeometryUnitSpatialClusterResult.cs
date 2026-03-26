@@ -1,6 +1,5 @@
 ﻿using System.Collections.Generic;
-using FluxCAD.SheetAnalysis;                    // 추가
-using FluxCAD.SheetAnalysis.Structure.Models;
+using FluxCAD.SheetAnalysis;
 
 namespace FluxCAD.SheetAnalysis.Structure.Analysis
 {
@@ -10,7 +9,11 @@ namespace FluxCAD.SheetAnalysis.Structure.Analysis
         public string? TargetGroupKey { get; set; }
 
         public int TotalMembers { get; set; }
+
+        public int RawGeometrySeedCount { get; set; }
         public int GeometrySeedCount { get; set; }
+        public int FilteredOutGeometrySeedCount { get; set; }
+
         public int TextCandidateCount { get; set; }
 
         public double ConnectGap { get; set; }

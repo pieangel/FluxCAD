@@ -1,6 +1,5 @@
 ﻿using System.Linq;
 using System.Text;
-using FluxCAD.SheetAnalysis;
 using FluxCAD.SheetAnalysis.Structure.Analysis;
 using FluxCAD.SheetAnalysis.Structure.Models;
 
@@ -18,7 +17,9 @@ namespace FluxCAD.SheetAnalysis.Structure.Reporting
             sb.AppendLine($"  TargetUnitId={result.TargetUnitId}");
             sb.AppendLine($"  TargetGroupKey={result.TargetGroupKey}");
             sb.AppendLine($"  TotalMembers={result.TotalMembers}");
+            sb.AppendLine($"  RawGeometrySeedCount={result.RawGeometrySeedCount}");
             sb.AppendLine($"  GeometrySeedCount={result.GeometrySeedCount}");
+            sb.AppendLine($"  FilteredOutGeometrySeedCount={result.FilteredOutGeometrySeedCount}");
             sb.AppendLine($"  TextCandidateCount={result.TextCandidateCount}");
             sb.AppendLine($"  ConnectGap={result.ConnectGap:F2}");
             sb.AppendLine($"  TextAttachMargin={result.TextAttachMargin:F2}");

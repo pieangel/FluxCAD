@@ -1,6 +1,5 @@
 ﻿using System.Collections.Generic;
-using FluxCAD.SheetAnalysis;                    // 추가
-using FluxCAD.SheetAnalysis.Structure.Models;
+using FluxCAD.SheetAnalysis;
 
 namespace FluxCAD.SheetAnalysis.Structure.Analysis
 {

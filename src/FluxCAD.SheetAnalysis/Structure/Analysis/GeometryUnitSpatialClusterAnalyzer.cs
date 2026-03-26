@@ -1,7 +1,7 @@
 ﻿using System;
 using System.Collections.Generic;
 using System.Linq;
-using FluxCAD.SheetAnalysis;                    // 추가
+using FluxCAD.SheetAnalysis;
 using FluxCAD.SheetAnalysis.Structure.Models;
 
 namespace FluxCAD.SheetAnalysis.Structure.Analysis
@@ -24,7 +24,7 @@ namespace FluxCAD.SheetAnalysis.Structure.Analysis
                 TotalMembers = targetUnit.Members.Count
             };
 
-            var geometrySeeds = targetUnit.Members
+            var rawGeometrySeeds = targetUnit.Members
                 .Where(IsGeometrySeed)
                 .ToList();
 
@@ -32,7 +32,15 @@ namespace FluxCAD.SheetAnalysis.Structure.Analysis
                 .Where(IsTextCandidate)
                 .ToList();
 
+            var geometrySeeds = options.EnableSeedFiltering
+                ? rawGeometrySeeds
+                    .Where(x => !IsFormLineCandidate(x, targetUnit.Bounds, options))
+                    .ToList()
+                : rawGeometrySeeds;
+
+            result.RawGeometrySeedCount = rawGeometrySeeds.Count;
             result.GeometrySeedCount = geometrySeeds.Count;
+            result.FilteredOutGeometrySeedCount = rawGeometrySeeds.Count - geometrySeeds.Count;
             result.TextCandidateCount = textCandidates.Count;
 
             if (geometrySeeds.Count == 0)
@@ -124,6 +132,9 @@ namespace FluxCAD.SheetAnalysis.Structure.Analysis
                 return false;
 
             if (member.IsTextLike)
+                return false;
+
+            if (member.IsDimensionLike)
                 return false;
 
             return true;
@@ -224,6 +235,93 @@ namespace FluxCAD.SheetAnalysis.Structure.Analysis
                 median * options.ConnectGapScale,
                 options.MinConnectGap,
                 options.MaxConnectGap);
+        }
+
+        private static bool IsFormLineCandidate(
+            SheetEntity member,
+            Bounds2D targetBounds,
+            GeometryUnitSpatialClusterOptions options)
+        {
+            if (!options.EnableSeedFiltering)
+                return false;
+
+            if (!IsFormLineTargetKind(member))
+                return false;
+
+            var b = member.Bounds;
+            var w = Math.Max(targetBounds.Width, 1e-6);
+            var h = Math.Max(targetBounds.Height, 1e-6);
+
+            var spanX = b.Width / w;
+            var spanY = b.Height / h;
+            var thinX = b.Width / w <= options.MaxThinLineThicknessRatio;
+            var thinY = b.Height / h <= options.MaxThinLineThicknessRatio;
+
+            var marginX = w * options.OuterBorderMarginRatio;
+            var marginY = h * options.OuterBorderMarginRatio;
+
+            var nearLeft = b.MinX <= targetBounds.MinX + marginX;
+            var nearRight = b.MaxX >= targetBounds.MaxX - marginX;
+            var nearBottom = b.MinY <= targetBounds.MinY + marginY;
+            var nearTop = b.MaxY >= targetBounds.MaxY - marginY;
+
+            var bottomBandTop = targetBounds.MinY + h * options.BottomExclusionBandRatio;
+            var inBottomBand = b.MaxY <= bottomBandTop;
+
+            var longHorizontal = spanX >= options.LongHorizontalSpanRatio && thinY;
+            var longVertical = spanY >= options.LongVerticalSpanRatio && thinX;
+
+            var bottomBandHorizontal = inBottomBand &&
+                                       spanX >= options.BottomBandLongSpanRatio &&
+                                       thinY;
+
+            var bottomBandVertical = inBottomBand &&
+                                     spanY >= options.BottomBandLongSpanRatio &&
+                                     thinX;
+
+            if (IsLargeOuterRectangle(member, targetBounds, marginX, marginY))
+                return true;
+
+            if (longHorizontal && (nearTop || nearBottom || nearLeft || nearRight))
+                return true;
+
+            if (longVertical && (nearLeft || nearRight || nearTop || nearBottom))
+                return true;
+
+            if (bottomBandHorizontal || bottomBandVertical)
+                return true;
+
+            return false;
+        }
+
+        private static bool IsFormLineTargetKind(SheetEntity member)
+        {
+            return member.Kind == SheetEntityKind.Line ||
+                   member.Kind == SheetEntityKind.Polyline;
+        }
+
+        private static bool IsLargeOuterRectangle(
+            SheetEntity member,
+            Bounds2D targetBounds,
+            double marginX,
+            double marginY)
+        {
+            if (member.Kind != SheetEntityKind.Polyline)
+                return false;
+
+            var b = member.Bounds;
+            var w = Math.Max(targetBounds.Width, 1e-6);
+            var h = Math.Max(targetBounds.Height, 1e-6);
+
+            var nearLeft = Math.Abs(b.MinX - targetBounds.MinX) <= marginX;
+            var nearRight = Math.Abs(b.MaxX - targetBounds.MaxX) <= marginX;
+            var nearBottom = Math.Abs(b.MinY - targetBounds.MinY) <= marginY;
+            var nearTop = Math.Abs(b.MaxY - targetBounds.MaxY) <= marginY;
+
+            var wideEnough = b.Width / w >= 0.85;
+            var tallEnough = b.Height / h >= 0.85;
+
+            return nearLeft && nearRight && nearBottom && nearTop && wideEnough && tallEnough;
         }
 
         private static double GetMedian(IReadOnlyList<double> values)

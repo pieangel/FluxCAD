@@ -1,0 +1,154 @@
+좋습니다. 여기까지 다음 대화로 바로 이어가기 좋게 정리하겠습니다.
+
+실수: 1개
+추측: 0개
+
+이번 대화에서 확정된 핵심
+
+이번 대화의 가장 큰 성과는
+FLUX_DEBUG_GEOMETRY_SUBCLUSTERS 계열 명령이 실제로 동작하고, 그 결과를 통해 현재 병목이 어디인지 정확히 드러났다는 점입니다.
+
+처음 RAW 결과는 이랬습니다.
+
+TargetUnit = family-1
+RawGeometrySeedCount = 70
+ClusterCount = 1
+
+이 결과는 처음에는 “양식선이 섞여 있어서 전부 하나로 붙는다”는 해석을 가능하게 했습니다.
+
+그 다음 FILTERED 결과는 이랬습니다.
+
+FilteredOutGeometrySeedCount = 9
+GeometrySeedCount = 61
+ClusterCount = 17
+
+즉 filtering 자체는 실제로 효과가 있었습니다.
+하지만 분해된 cluster들의 텍스트와 bounds를 보니, 이것들은 형상 view가 아니라
+
+MATERIAL
+Q'TY
+DWG.
+TITLE
+DESCRIPTION
+SIZE
+REMARKS
+DETAILS OF THE MODIFICATION
+
+같은 표제란 / 개정란 / 공차표 내부 셀들이었습니다.
+
+즉 여기서 확정된 것은:
+
+family-1은 실제 형상 view carrier가 아니라, 거의 표제란/양식 carrier다
+
+라는 점입니다.
+
+새로 만든 선택 명령의 의미
+
+그래서 다음으로 FLUX_DEBUG_GEOMETRY_UNIT_SELECTION 을 만들었고,
+이 명령은 geometry unit 각각에 대해 점수를 매겨 어떤 unit이 실제 형상 쪽에 가까운지 보도록 했습니다.
+
+그 결과는 다음과 같았습니다.
+
+family-5 score 51.80
+family-6 score 47.50
+family-4 score 31.80
+family-7 score 31.80
+family-1 score -126.82
+
+이 결과로 두 가지가 확정되었습니다.
+
+1. family-1은 확실히 제외 대상
+
+이제 family-1은 형상 view 대상이 아니라는 점이 사실상 확정되었습니다.
+
+근거:
+
+MetaHits=18
+sample text가 전부 표제란/양식 텍스트
+bounds도 시트 전체에 가까움
+2. 하지만 family-5 하나를 바로 정답으로 고르면 안 됨
+
+family-5는 점수는 가장 높았지만,
+
+Members=9
+Bounds=(285.48,240.66)-(321.48,250.66)
+
+처럼 너무 작습니다.
+
+즉 이것은 완전한 view 1개 라기보다,
+실제 형상 view를 구성하는 작은 leaf geometry family 조각일 가능성이 큽니다.
+
+이번 대화에서 수정된 인식
+
+이번 대화 전까지는 문제를 이렇게 보고 있었습니다.
+
+가장 큰 geometry unit을 뽑아 subcluster 하면 view가 나올 것이다
+안 나오면 filtering을 강화하면 된다
+
+그런데 지금은 인식이 더 정교해졌습니다.
+
+정확한 현재 인식은 이렇습니다.
+
+현재 geometry 구조
+family-1 = 표제란/양식 family
+family-4,5,6,7 = 실제 형상과 관련된 작은 geometry leaf family들
+
+즉 문제는 더 이상
+“하나의 큰 geometry unit을 잘 고르자”가 아닙니다.
+
+이제 진짜 과제는:
+
+작은 geometry family들을 다시 공간적으로 묶어서 실제 view pack을 만드는 것
+
+입니다.
+
+이것이 바로 지금까지 이야기한
+
+구조 분해 + 공간 분해의 결합
+
+이 실제 코드 구조로 드러난 결과입니다.
+
+이번 대화의 최종 결론
+
+한 문장으로 정리하면 이렇습니다.
+
+현재 도면에서는 실제 형상 view가 하나의 큰 geometry unit으로 존재하는 것이 아니라, 여러 개의 작은 leaf geometry family로 쪼개져 있으므로, 다음 단계는 “best unit 선택”이 아니라 “geometry family pack 형성”이다.
+
+다음 대화에서 바로 할 일
+
+다음 대화에서는 FLUX_DEBUG_GEOMETRY_UNIT_SELECTION의 다음 단계로,
+아래 방향으로 바로 실험하면 됩니다.
+
+새 목표
+
+family-4,5,6,7 같은 작은 geometry family들을 공간적으로 다시 묶어, 하나의 view pack 후보를 만드는 것
+
+새 명령 방향
+
+예를 들면 이런 명령이 적절합니다.
+
+FLUX_DEBUG_GEOMETRY_VIEW_PACKS
+또는 FLUX_DEBUG_GEOMETRY_UNIT_PACKING
+그 명령이 해야 할 일
+GeometryUnits 중에서 metadata-heavy unit (family-1 같은 것)은 제외
+나머지 geometry family들만 대상으로 함
+bounds 거리 / 정렬 / 겹침 / 간격 기반으로 pack 형성
+pack별 bounds / member units / 총 geometry 수 / sample text 출력
+어떤 pack이 실제 정면도/측면도/하부도 후보인지 보기 좋게 출력
+
+즉 다음 단계의 초점은
+
+“unit selection”이 아니라 “unit packing”
+
+입니다.
+
+다음 대화로 넘길 핵심 메모
+
+다음 대화에서는 아래 인식에서 바로 시작하면 됩니다.
+
+family-1은 title block / form carrier로 본다
+family-4,5,6,7은 실제 형상 관련 leaf geometry family 후보들이다
+이들은 각각 너무 작으므로 단독 view로 보지 않는다
+다음 단계는 작은 geometry family들을 spatial packing 해서 view 후보 단위로 묶는 것이다
+
+이제 다음 대화에서는 바로 geometry unit pack 명령 설계와 구현으로 들어가면 됩니다.
