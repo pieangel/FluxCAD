@@ -1,12 +1,7 @@
 ﻿using System;
-using System.Collections.Generic;
-using System.Linq;
-using System.Text;
-using System.Threading.Tasks;
 
 namespace FluxCAD.SheetAnalysis
 {
-
     public sealed class SheetEntity
     {
         public string Handle { get; set; } = "";
@@ -32,8 +27,6 @@ namespace FluxCAD.SheetAnalysis
         public SheetEntitySourceKind SourceKind { get; set; }
         public SheetEntityRole Role { get; set; }
 
-        //public string? BlockPath { get; set; }
-        //public int Depth { get; set; }
         public string? SnapshotKey { get; set; }
 
         public string? OwnerStructureNodeId { get; set; }
@@ -43,11 +36,15 @@ namespace FluxCAD.SheetAnalysis
         public int? OwnerDescendantLeafCount { get; set; }
 
         public bool IsVisible { get; set; } = true;
+
+        // 호환용 계산 속성
+        public string EntityTypeName => EntityType ?? string.Empty;
+        public Point2D RepresentativePoint => Anchor;
+        public bool HasText =>
+            !string.IsNullOrWhiteSpace(TextNormalized) ||
+            !string.IsNullOrWhiteSpace(Text);
+
         public bool IsBlockReference => Kind == SheetEntityKind.BlockReference;
-        public bool IsTextLike_old =>
-            Kind == SheetEntityKind.Text ||
-            Kind == SheetEntityKind.MText ||
-            Kind == SheetEntityKind.InsertAttribute;
 
         public bool IsTextLike =>
             Kind == SheetEntityKind.Text ||
@@ -55,7 +52,8 @@ namespace FluxCAD.SheetAnalysis
             Kind == SheetEntityKind.InsertAttribute;
 
         public bool IsDimensionLike =>
-            Kind == SheetEntityKind.Dimension || Kind == SheetEntityKind.Leader;
+            Kind == SheetEntityKind.Dimension ||
+            Kind == SheetEntityKind.Leader;
 
         public bool IsGeometryLike =>
             Kind == SheetEntityKind.Line ||
