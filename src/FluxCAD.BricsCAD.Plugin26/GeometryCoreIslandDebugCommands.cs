@@ -1,14 +1,249 @@
 ﻿using System;
+using System.Collections.Generic;
 using System.Linq;
 using Bricscad.ApplicationServices;
+using Teigha.DatabaseServices;
+using Teigha.Geometry;
 using Teigha.Runtime;
 using FluxCAD.SheetAnalysis;
 using FluxCAD.SheetAnalysis.ViewIsolation;
+using TeighaColor = Teigha.Colors.Color;
+using TeighaColorMethod = Teigha.Colors.ColorMethod;
+
 
 namespace FluxCAD.BricsCAD.Plugin26
 {
     public class GeometryCoreIslandDebugCommands
     {
+        private const string DebugLayerName = "FLUX_DEBUG_GEOM_ISLANDS";
+
+        [CommandMethod("FLUX_MARK_GEOMETRY_CORE_ISLANDS")]
+        public void FluxMarkGeometryCoreIslands()
+        {
+            var doc = Application.DocumentManager.MdiActiveDocument;
+            var db = doc.Database;
+            var ed = doc.Editor;
+
+            try
+            {
+                var sheetFilePath = db.Filename;
+                if (string.IsNullOrWhiteSpace(sheetFilePath))
+                {
+                    ed.WriteMessage("\n[FluxCAD] 저장된 DWG 파일이 아닙니다.");
+                    return;
+                }
+
+                IEntitySnapshotBuilder snapshotBuilder = new SimpleSheetFileSnapshotBuilder();
+                var entities = snapshotBuilder.Build(sheetFilePath);
+
+                if (entities == null || entities.Count == 0)
+                {
+                    ed.WriteMessage("\n[FluxCAD] snapshot이 비어 있습니다.");
+                    return;
+                }
+
+                var sheetBounds = Bounds2DHelper.FromEntities(entities);
+
+                var partitioner = new ScenePartitioner();
+                var partition = partitioner.Partition(entities);
+
+                var clusterBuilder = new GeometryClusterBuilder();
+                var clusters = clusterBuilder.Build(
+                    partition.GeometryCoreEntities,
+                    sheetBounds,
+                    new StructuredComponentBuildOptions());
+
+                var preFilter = new GeometryCorePreFilter();
+                var preFilterOptions = new GeometryCorePreFilterOptions
+                {
+                    OuterContainTolerance = 2.0,
+                    LooseMergeGapMultiplier = 1.25,
+
+                    // 현재까지 적용한 옵션들
+                    EnableTinyFragmentAbsorption = true,
+                    EnableColumnAlignedViewMerge = false
+                };
+
+                var preFilterResult = preFilter.Run(
+                    clusters,
+                    sheetBounds,
+                    preFilterOptions);
+
+                var finalClusters = preFilterResult.FinalClusters
+                    .OrderByDescending(GetArea)
+                    .ThenByDescending(x => x.GeometryCount)
+                    .ToList();
+
+                using (doc.LockDocument())
+                using (var tr = db.TransactionManager.StartTransaction())
+                {
+                    var layerId = EnsureLayer(db, tr, DebugLayerName, colorIndex: 1); // red
+                    ClearEntitiesOnLayer(db, tr, DebugLayerName);
+
+                    var bt = (BlockTable)tr.GetObject(db.BlockTableId, OpenMode.ForRead);
+                    var ms =
+                        (BlockTableRecord)tr.GetObject(bt[BlockTableRecord.ModelSpace], OpenMode.ForWrite);
+
+                    var textHeight = ComputeDebugTextHeight(sheetBounds);
+                    var margin = Math.Max(textHeight * 0.8, 3.0);
+
+                    for (int i = 0; i < finalClusters.Count; i++)
+                    {
+                        var cluster = finalClusters[i];
+                        var b = cluster.TotalBounds;
+
+                        var rect = InflateBounds(b, margin);
+                        var label = BuildIslandLabel(i + 1, cluster);
+
+                        var poly = CreateRectanglePolyline(rect);
+                        poly.LayerId = layerId;
+                        poly.ColorIndex = 1; // red
+
+                        ms.AppendEntity(poly);
+                        tr.AddNewlyCreatedDBObject(poly, true);
+
+                        var textPos = new Point3d(rect.MinX, rect.MaxY + textHeight * 0.2, 0);
+                        var text = new DBText
+                        {
+                            Position = textPos,
+                            Height = textHeight,
+                            TextString = label,
+                            LayerId = layerId,
+                            ColorIndex = 2 // yellow
+                        };
+
+                        ms.AppendEntity(text);
+                        tr.AddNewlyCreatedDBObject(text, true);
+                    }
+
+                    tr.Commit();
+                }
+
+                ed.WriteMessage(
+                    $"\n[FluxCAD] Geometry core island markers created: {finalClusters.Count} on layer {DebugLayerName}");
+            }
+            catch (System.Exception ex)
+            {
+                ed.WriteMessage($"\n[FluxCAD] FLUX_MARK_GEOMETRY_CORE_ISLANDS failed: {ex}");
+            }
+        }
+
+        [CommandMethod("FLUX_CLEAR_GEOMETRY_CORE_MARKS")]
+        public void FluxClearGeometryCoreMarks()
+        {
+            var doc = Application.DocumentManager.MdiActiveDocument;
+            var db = doc.Database;
+            var ed = doc.Editor;
+
+            try
+            {
+                using (doc.LockDocument())
+                using (var tr = db.TransactionManager.StartTransaction())
+                {
+                    ClearEntitiesOnLayer(db, tr, DebugLayerName);
+                    tr.Commit();
+                }
+
+                ed.WriteMessage($"\n[FluxCAD] cleared layer entities: {DebugLayerName}");
+            }
+            catch (System.Exception ex)
+            {
+                ed.WriteMessage($"\n[FluxCAD] FLUX_CLEAR_GEOMETRY_CORE_MARKS failed: {ex}");
+            }
+        }
+
+        private static ObjectId EnsureLayer(
+    Database db,
+    Transaction tr,
+    string layerName,
+    short colorIndex)
+        {
+            var lt = (LayerTable)tr.GetObject(db.LayerTableId, OpenMode.ForRead);
+
+            if (lt.Has(layerName))
+                return lt[layerName];
+
+            lt.UpgradeOpen();
+
+            var ltr = new LayerTableRecord
+            {
+                Name = layerName,
+                Color = TeighaColor.FromColorIndex(
+                    TeighaColorMethod.ByAci,
+                    colorIndex)
+            };
+
+            var id = lt.Add(ltr);
+            tr.AddNewlyCreatedDBObject(ltr, true);
+            return id;
+        }
+
+        private static void ClearEntitiesOnLayer(
+            Database db,
+            Transaction tr,
+            string layerName)
+        {
+            var lt = (LayerTable)tr.GetObject(db.LayerTableId, OpenMode.ForRead);
+            if (!lt.Has(layerName))
+                return;
+
+            var layerId = lt[layerName];
+
+            var bt = (BlockTable)tr.GetObject(db.BlockTableId, OpenMode.ForRead);
+            var ms =
+                (BlockTableRecord)tr.GetObject(bt[BlockTableRecord.ModelSpace], OpenMode.ForWrite);
+
+            var toErase = new List<ObjectId>();
+
+            foreach (ObjectId id in ms)
+            {
+                var ent = tr.GetObject(id, OpenMode.ForRead) as Entity;
+                if (ent == null)
+                    continue;
+
+                if (ent.LayerId == layerId)
+                    toErase.Add(id);
+            }
+
+            foreach (var id in toErase)
+            {
+                var ent = tr.GetObject(id, OpenMode.ForWrite) as Entity;
+                ent?.Erase();
+            }
+        }
+
+        private static Polyline CreateRectanglePolyline(Bounds2D b)
+        {
+            var poly = new Polyline();
+            poly.AddVertexAt(0, new Point2d(b.MinX, b.MinY), 0, 0, 0);
+            poly.AddVertexAt(1, new Point2d(b.MaxX, b.MinY), 0, 0, 0);
+            poly.AddVertexAt(2, new Point2d(b.MaxX, b.MaxY), 0, 0, 0);
+            poly.AddVertexAt(3, new Point2d(b.MinX, b.MaxY), 0, 0, 0);
+            poly.Closed = true;
+            return poly;
+        }
+
+        private static Bounds2D InflateBounds(Bounds2D b, double margin)
+        {
+            return new Bounds2D(
+                b.MinX - margin,
+                b.MinY - margin,
+                b.MaxX + margin,
+                b.MaxY + margin);
+        }
+
+        private static double ComputeDebugTextHeight(Bounds2D sheetBounds)
+        {
+            var baseSize = Math.Max(sheetBounds.Width, sheetBounds.Height) * 0.02;
+            return Math.Max(baseSize, 5.0);
+        }
+
+        private static string BuildIslandLabel(int index, GeometryCluster cluster)
+        {
+            return
+                $"G{index}  Geo={cluster.GeometryCount}  Round={cluster.RoundGeometryCount}  Area={GetArea(cluster):0}";
+        }
+
         [CommandMethod("FLUX_DEBUG_GEOMETRY_CORE_ISLANDS")]
         public void FluxDebugGeometryCoreIslands()
         {

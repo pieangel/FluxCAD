@@ -1,5 +1,6 @@
 ﻿using Bricscad.ApplicationServices;
 using FluxCAD.SheetAnalysis;
+using FluxCAD.SheetAnalysis.ViewIsolation;
 using System;
 using System.Collections.Generic;
 using System.IO;
@@ -13,6 +14,194 @@ namespace FluxCAD.BricsCAD.Plugin26
 {
     public sealed class SheetAnalysisDebugCommands
     {
+        [CommandMethod("FLUX_CLEAR_OCCUPANCY_MARKS")]
+        public void FluxClearOccupancyMarks()
+        {
+            var doc = Application.DocumentManager.MdiActiveDocument;
+            var db = doc.Database;
+            var ed = doc.Editor;
+
+            try
+            {
+                using (doc.LockDocument())
+                using (var tr = db.TransactionManager.StartTransaction())
+                {
+                    var drawer = new OccupancyDebugDrawer();
+                    drawer.ClearAll(db, tr);
+                    tr.Commit();
+                }
+
+                ed.WriteMessage("\n[FluxCAD] cleared occupancy debug layers.");
+            }
+            catch (System.Exception ex)
+            {
+                ed.WriteMessage($"\n[FluxCAD] FLUX_CLEAR_OCCUPANCY_MARKS failed: {ex}");
+            }
+        }
+
+        [CommandMethod("FLUX_DEBUG_OCCUPANCY_ISLANDS_WITH_CELLS")]
+        public void FluxDebugOccupancyIslandsWithCells()
+        {
+            var doc = Application.DocumentManager.MdiActiveDocument;
+            var db = doc.Database;
+            var ed = doc.Editor;
+
+            try
+            {
+                var sheetFilePath = db.Filename;
+                if (string.IsNullOrWhiteSpace(sheetFilePath))
+                {
+                    ed.WriteMessage("\n[FluxCAD] 저장된 DWG 파일이 아닙니다.");
+                    return;
+                }
+
+                IEntitySnapshotBuilder snapshotBuilder = new SimpleSheetFileSnapshotBuilder();
+                var entities = snapshotBuilder.Build(sheetFilePath);
+
+                if (entities == null || entities.Count == 0)
+                {
+                    ed.WriteMessage("\n[FluxCAD] snapshot이 비어 있습니다.");
+                    return;
+                }
+
+                var sheetBounds = Bounds2DHelper.FromEntities(entities);
+
+                var partitioner = new ScenePartitioner();
+                var partition = partitioner.Partition(entities);
+
+                var gridInput = partition.GeometryCoreEntities
+                    .Where(x => !x.Bounds.IsEmpty)
+                    .ToList();
+
+                if (gridInput.Count == 0)
+                {
+                    ed.WriteMessage("\n[FluxCAD] geometry core entities가 비어 있습니다.");
+                    return;
+                }
+
+                var gridBuilder = new OccupancyGridBuilder();
+                var buildResult = gridBuilder.Build(
+                    gridInput,
+                    sheetBounds,
+                    rows: 200,
+                    cols: 200);
+
+                var islandFinder = new OccupancyIslandFinder();
+                var islands = islandFinder.Find(buildResult.Grid)
+                    .OrderByDescending(x => x.CellCount)
+                    .ThenByDescending(x => x.Area)
+                    .ToList();
+
+                using (doc.LockDocument())
+                using (var tr = db.TransactionManager.StartTransaction())
+                {
+                    var drawer = new OccupancyDebugDrawer();
+
+                    drawer.DrawOccupiedCells(
+                        db,
+                        tr,
+                        buildResult,
+                        clearLayerFirst: true,
+                        maxCellsToDraw: 0);
+
+                    drawer.DrawIslands(
+                        db,
+                        tr,
+                        islands,
+                        buildResult.SheetBounds,
+                        clearLayerFirst: true,
+                        drawLabels: true);
+
+                    tr.Commit();
+                }
+
+                ed.WriteMessage(
+                    $"\n[FluxCAD] Occupancy islands={islands.Count}, occupiedCells={buildResult.OccupiedCount}");
+            }
+            catch (System.Exception ex)
+            {
+                ed.WriteMessage($"\n[FluxCAD] FLUX_DEBUG_OCCUPANCY_ISLANDS_WITH_CELLS failed: {ex}");
+            }
+        }
+
+        [CommandMethod("FLUX_DEBUG_OCCUPANCY_ISLANDS")]
+        public void FluxDebugOccupancyIslands()
+        {
+            var doc = Application.DocumentManager.MdiActiveDocument;
+            var db = doc.Database;
+            var ed = doc.Editor;
+
+            try
+            {
+                var sheetFilePath = db.Filename;
+                if (string.IsNullOrWhiteSpace(sheetFilePath))
+                {
+                    ed.WriteMessage("\n[FluxCAD] 저장된 DWG 파일이 아닙니다.");
+                    return;
+                }
+
+                IEntitySnapshotBuilder snapshotBuilder = new SimpleSheetFileSnapshotBuilder();
+                var entities = snapshotBuilder.Build(sheetFilePath);
+
+                if (entities == null || entities.Count == 0)
+                {
+                    ed.WriteMessage("\n[FluxCAD] snapshot이 비어 있습니다.");
+                    return;
+                }
+
+                var sheetBounds = Bounds2DHelper.FromEntities(entities);
+
+                var partitioner = new ScenePartitioner();
+                var partition = partitioner.Partition(entities);
+
+                var gridInput = partition.GeometryCoreEntities
+                    .Where(x => !x.Bounds.IsEmpty)
+                    .ToList();
+
+                if (gridInput.Count == 0)
+                {
+                    ed.WriteMessage("\n[FluxCAD] geometry core entities가 비어 있습니다.");
+                    return;
+                }
+
+                var gridBuilder = new OccupancyGridBuilder();
+                var buildResult = gridBuilder.Build(
+                    gridInput,
+                    sheetBounds,
+                    rows: 200,
+                    cols: 200);
+
+                var islandFinder = new OccupancyIslandFinder();
+                var islands = islandFinder.Find(buildResult.Grid)
+                    .OrderByDescending(x => x.CellCount)
+                    .ThenByDescending(x => x.Area)
+                    .ToList();
+
+                using (doc.LockDocument())
+                using (var tr = db.TransactionManager.StartTransaction())
+                {
+                    var drawer = new OccupancyDebugDrawer();
+
+                    drawer.DrawIslands(
+                        db,
+                        tr,
+                        islands,
+                        buildResult.SheetBounds,
+                        clearLayerFirst: true,
+                        drawLabels: true);
+
+                    tr.Commit();
+                }
+
+                ed.WriteMessage(
+                    $"\n[FluxCAD] Occupancy islands={islands.Count}, occupiedCells={buildResult.OccupiedCount}");
+            }
+            catch (System.Exception ex)
+            {
+                ed.WriteMessage($"\n[FluxCAD] FLUX_DEBUG_OCCUPANCY_ISLANDS failed: {ex}");
+            }
+        }
+
         [CommandMethod("FLUX_DEBUG_SHEET_ENTITY_ROLES")]
         public void FluxDebugSheetEntityRoles()
         {

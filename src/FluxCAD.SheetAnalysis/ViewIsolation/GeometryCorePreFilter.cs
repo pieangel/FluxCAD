@@ -118,7 +118,8 @@ namespace FluxCAD.SheetAnalysis.ViewIsolation
                         if (!ShouldMergeAsSameColumnView(work[i], work[j], options))
                             continue;
 
-                        work[i] = MergeTwoClusters(work[i], work[j], options);
+                        work[i] = TryMergeTwoClusters(work[i], work[j], options);
+                        
                         work.RemoveAt(j);
                         changed = true;
                         break;
@@ -598,10 +599,19 @@ namespace FluxCAD.SheetAnalysis.ViewIsolation
 
                     if (bestHostIndex >= 0)
                     {
-                        work[bestHostIndex] = MergeTwoClusters(work[bestHostIndex], fragment, options);
-                        work.RemoveAt(i);
-                        changed = true;
-                        break;
+                        var merged = TryMergeTwoClusters(work[bestHostIndex], fragment, options);
+
+                        if (merged != null)
+                        {
+                            work[bestHostIndex] = merged;
+                            work.RemoveAt(i);
+                            changed = true;
+                            break;
+                        }
+
+                        // merge 불가: 예외가 아니라 attach-only 후보로 남김
+                        fragment.Reasons.Add($"attach_only_to={work[bestHostIndex].ClusterId}");
+                        // 당장은 유지하고 다음 semantic 단계에서 FragmentIsland로 라벨링
                     }
                 }
             }
@@ -660,6 +670,57 @@ namespace FluxCAD.SheetAnalysis.ViewIsolation
             throw new InvalidOperationException(
                 $"MergeTwoClusters failed: merged.Count={merged.Count}, " +
                 $"A.Area={GetArea(a):0.##}, B.Area={GetArea(b):0.##}");
+        }
+
+        private static GeometryCluster? TryMergeTwoClusters(
+    GeometryCluster a,
+    GeometryCluster b,
+    GeometryCorePreFilterOptions options)
+        {
+            if (a == null)
+                throw new ArgumentNullException(nameof(a));
+            if (b == null)
+                throw new ArgumentNullException(nameof(b));
+
+            var forcedOptions = new GeometryCorePreFilterOptions
+            {
+                MergeRemainingClusters = true,
+                DropOuterFrameCandidates = false,
+                DropTinyNoise = false,
+                EnableTinyFragmentAbsorption = false,
+                EnableColumnAlignedViewMerge = false,
+
+                LooseMergeGapMultiplier = System.Math.Max(options.LooseMergeGapMultiplier, 1000.0),
+
+                OuterContainTolerance = options.OuterContainTolerance,
+
+                TinyFragmentMaxGeometryCount = options.TinyFragmentMaxGeometryCount,
+                TinyFragmentMaxWidth = options.TinyFragmentMaxWidth,
+                TinyFragmentMaxHeight = options.TinyFragmentMaxHeight,
+                TinyFragmentMaxArea = options.TinyFragmentMaxArea,
+                TinyFragmentHostGapTolerance = options.TinyFragmentHostGapTolerance,
+
+                ColumnMergeMinXOverlapRatio = options.ColumnMergeMinXOverlapRatio,
+                ColumnMergeMaxVerticalGap = options.ColumnMergeMaxVerticalGap,
+                ColumnMergeMaxCenterXDelta = options.ColumnMergeMaxCenterXDelta,
+                ColumnMergeMinArea = options.ColumnMergeMinArea,
+
+                // 중요: 아래도 원래 옵션을 같이 넘기는 편이 안전합니다.
+                MergeGapX = options.MergeGapX,
+                MergeGapY = options.MergeGapY,
+                MergeAxisOverlapMin = options.MergeAxisOverlapMin,
+                RoundFeatureMergeGapMultiplier = options.RoundFeatureMergeGapMultiplier,
+                LooseMergeCombinedGeometryCountMax = options.LooseMergeCombinedGeometryCountMax
+            };
+
+            var merged = MergeClusters(
+                    new List<GeometryCluster> { a, b },
+                    forcedOptions)
+                .OrderByDescending(GetArea)
+                .ThenByDescending(x => x.GeometryCount)
+                .ToList();
+
+            return merged.Count == 1 ? merged[0] : null;
         }
 
         private static bool IsAbsorbableTinyFragment(
