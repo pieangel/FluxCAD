@@ -15,6 +15,264 @@ namespace FluxCAD.BricsCAD.Plugin26
 {
     public class StructuralGeometryDebugCommands
     {
+        [CommandMethod("FLUX_DEBUG_PACK_COMBINED_CLUSTERS")]
+        public void FluxDebugPackCombinedClusters()
+        {
+            var doc = Application.DocumentManager.MdiActiveDocument;
+            var db = doc.Database;
+            var ed = doc.Editor;
+
+            try
+            {
+                var sheetFilePath = db.Filename;
+                if (string.IsNullOrWhiteSpace(sheetFilePath))
+                {
+                    ed.WriteMessage("\n[FluxCAD] 저장된 DWG 파일이 아닙니다.");
+                    return;
+                }
+
+                IEntitySnapshotBuilder snapshotBuilder = new SimpleSheetFileSnapshotBuilder();
+                var entities = snapshotBuilder.Build(sheetFilePath);
+
+                if (entities == null || entities.Count == 0)
+                {
+                    ed.WriteMessage("\n[FluxCAD] snapshot이 비어 있습니다.");
+                    return;
+                }
+
+                var sheetBounds = Bounds2DHelper.FromEntities(entities);
+                var separationResult = BuildStructuralSeparationResult(entities, sheetBounds);
+
+                if (separationResult.GeometryUnits == null || separationResult.GeometryUnits.Count == 0)
+                {
+                    ed.WriteMessage("\n[FluxCAD] Geometry unit이 없습니다.");
+                    return;
+                }
+
+                var packOptions = new GeometryUnitPackOptions
+                {
+                    ExcludeMetadataHeavyUnits = true,
+                    MetadataTextHitThreshold = 2,
+
+                    ExcludeOuterFrameLikeUnits = true,
+                    OuterFrameMarginRatio = 0.03,
+                    OuterFrameSpanRatio = 0.80,
+
+                    ConnectGapOverride = null,
+
+                    MinConnectGap = 8.0,
+                    MaxConnectGap = 80.0,
+                    ConnectGapScale = 1.0,
+                    OverlapTolerance = 1.0,
+
+                    UseNearestNeighborGapEstimation = true,
+                    NearestNeighborGapPercentile = 0.65,
+                    NearestNeighborGapScale = 1.45,
+                    MaxNearestNeighborGapForSampling = 120.0,
+
+                    UseUnitSpanFallback = true,
+                    UnitSpanFallbackScale = 0.12,
+                    DiagonalFallbackScale = 0.08,
+
+                    GeometryMemberWeight = 3.0,
+                    UnitMemberWeight = 5.0,
+                    MetadataPenalty = 25.0,
+                    AreaPenaltyScale = 0.0005
+                };
+
+                var packAnalyzer = new GeometryUnitPackAnalyzer();
+                var packResult = packAnalyzer.Build(
+                    separationResult.GeometryUnits,
+                    sheetBounds,
+                    packOptions);
+
+                ed.WriteMessage("\n");
+                ed.WriteMessage(GeometryUnitPackReportFormatter.Format(packResult));
+
+                var bestPack = packResult.Packs.FirstOrDefault();
+                if (bestPack == null)
+                {
+                    ed.WriteMessage("\n[FluxCAD] 추천 pack 이 없습니다.");
+                    return;
+                }
+
+                var combinedMembers = CollectDistinctPackMembers(bestPack);
+                if (combinedMembers.Count == 0)
+                {
+                    ed.WriteMessage("\n[FluxCAD] best pack 에 member 가 없습니다.");
+                    return;
+                }
+
+                var ownerByMember = BuildOwnerMap(bestPack);
+
+                var clusterOptions = new GeometryUnitSpatialClusterOptions
+                {
+                    EnableSeedFiltering = true,
+
+                    BottomExclusionBandRatio = 0.22,
+                    OuterBorderMarginRatio = 0.025,
+                    LongHorizontalSpanRatio = 0.60,
+                    LongVerticalSpanRatio = 0.60,
+                    BottomBandLongSpanRatio = 0.18,
+                    MaxThinLineThicknessRatio = 0.04
+                };
+
+                var clusterAnalyzer = new GeometryUnitSpatialClusterAnalyzer();
+                var combinedResult = clusterAnalyzer.BuildFromMembers(
+                    $"pack-{bestPack.PackIndex}",
+                    "combined-pack",
+                    bestPack.Bounds,
+                    combinedMembers,
+                    clusterOptions);
+
+                ed.WriteMessage("\n");
+                ed.WriteMessage(FormatCombinedPackClusterReport(
+                    bestPack,
+                    combinedMembers,
+                    combinedResult,
+                    ownerByMember));
+            }
+            catch (System.Exception ex)
+            {
+                ed.WriteMessage($"\n[FluxCAD] FLUX_DEBUG_PACK_COMBINED_CLUSTERS failed: {ex}");
+            }
+        }
+
+        private static List<SheetEntity> CollectDistinctPackMembers(GeometryUnitPack pack)
+        {
+            var result = new List<SheetEntity>();
+            var seen = new HashSet<SheetEntity>();
+
+            foreach (var unit in pack.Units)
+            {
+                if (unit?.Members == null)
+                    continue;
+
+                foreach (var member in unit.Members)
+                {
+                    if (member == null)
+                        continue;
+
+                    if (seen.Add(member))
+                        result.Add(member);
+                }
+            }
+
+            return result;
+        }
+
+        private static Dictionary<SheetEntity, string> BuildOwnerMap(GeometryUnitPack pack)
+        {
+            var map = new Dictionary<SheetEntity, string>();
+
+            foreach (var unit in pack.Units)
+            {
+                var unitId = unit?.UnitId ?? "(null-unit)";
+
+                if (unit?.Members == null)
+                    continue;
+
+                foreach (var member in unit.Members)
+                {
+                    if (member == null)
+                        continue;
+
+                    if (!map.ContainsKey(member))
+                        map[member] = unitId;
+                }
+            }
+
+            return map;
+        }
+
+        private static string FormatCombinedPackClusterReport(
+            GeometryUnitPack pack,
+            IReadOnlyList<SheetEntity> combinedMembers,
+            GeometryUnitSpatialClusterResult result,
+            IReadOnlyDictionary<SheetEntity, string> ownerByMember)
+        {
+            var sb = new StringBuilder();
+
+            sb.AppendLine("[CombinedPackClusters]");
+            sb.AppendLine($"  PackIndex={pack.PackIndex}");
+            sb.AppendLine($"  UnitCount={pack.Units.Count}");
+            sb.AppendLine($"  CombinedMemberCount={combinedMembers.Count}");
+            sb.AppendLine($"  RawGeometrySeedCount={result.RawGeometrySeedCount}");
+            sb.AppendLine($"  GeometrySeedCount={result.GeometrySeedCount}");
+            sb.AppendLine($"  FilteredOutGeometrySeedCount={result.FilteredOutGeometrySeedCount}");
+            sb.AppendLine($"  TextCandidateCount={result.TextCandidateCount}");
+            sb.AppendLine($"  ConnectGap={result.ConnectGap:F2}");
+            sb.AppendLine($"  TextAttachMargin={result.TextAttachMargin:F2}");
+            sb.AppendLine($"  ClusterCount={result.Clusters.Count}");
+            sb.AppendLine();
+
+            var unitIds = pack.Units
+                .Select(x => x.UnitId)
+                .Where(x => !string.IsNullOrWhiteSpace(x))
+                .ToList();
+
+            if (unitIds.Count > 0)
+            {
+                sb.AppendLine($"  PackUnits={string.Join(", ", unitIds)}");
+                sb.AppendLine();
+            }
+
+            foreach (var cluster in result.Clusters
+                         .OrderByDescending(x => x.GeometryMembers.Count)
+                         .ThenByDescending(x => x.Members.Count)
+                         .ThenByDescending(x => x.Bounds.Area)
+                         .Take(20))
+            {
+                var sourceUnits = cluster.Members
+                    .Select(x => ownerByMember.TryGetValue(x, out var unitId) ? unitId : string.Empty)
+                    .Where(x => !string.IsNullOrWhiteSpace(x))
+                    .Distinct()
+                    .ToList();
+
+                var sampleTexts = cluster.TextMembers
+                    .Select(x => NormalizeText(x.TextNormalized ?? x.Text))
+                    .Where(x => !string.IsNullOrWhiteSpace(x))
+                    .Distinct()
+                    .Take(6)
+                    .ToList();
+
+                sb.AppendLine(
+                    $"[Cluster {cluster.ClusterIndex}] Members={cluster.Members.Count} " +
+                    $"Geo={cluster.GeometryMembers.Count} Text={cluster.TextMembers.Count}");
+
+                sb.AppendLine(
+                    $"  B=({cluster.Bounds.MinX:F2},{cluster.Bounds.MinY:F2})-" +
+                    $"({cluster.Bounds.MaxX:F2},{cluster.Bounds.MaxY:F2})");
+
+                if (sourceUnits.Count > 0)
+                    sb.AppendLine($"  SourceUnits={string.Join(", ", sourceUnits)}");
+
+                if (sampleTexts.Count > 0)
+                    sb.AppendLine($"  SampleText={string.Join(" | ", sampleTexts)}");
+
+                sb.AppendLine();
+            }
+
+            if (result.UnassignedTextMembers.Count > 0)
+            {
+                sb.AppendLine($"[UnassignedText] Count={result.UnassignedTextMembers.Count}");
+
+                var preview = result.UnassignedTextMembers
+                    .Select(x => NormalizeText(x.TextNormalized ?? x.Text))
+                    .Where(x => !string.IsNullOrWhiteSpace(x))
+                    .Distinct()
+                    .Take(8)
+                    .ToList();
+
+                if (preview.Count > 0)
+                    sb.AppendLine($"  Sample={string.Join(" | ", preview)}");
+
+                sb.AppendLine();
+            }
+
+            return sb.ToString();
+        }
+
         [CommandMethod("FLUX_DEBUG_GEOMETRY_VIEW_PACKS")]
         public void FluxDebugGeometryViewPacks()
         {
@@ -58,13 +316,21 @@ namespace FluxCAD.BricsCAD.Plugin26
                     OuterFrameMarginRatio = 0.03,
                     OuterFrameSpanRatio = 0.80,
 
-                    ConnectGapOverride = 35.0,
+                    ConnectGapOverride = null,
 
-                    // 아래 값들은 override를 넣으면 사실상 지금 테스트에 큰 의미는 적습니다.
-                    ConnectGapScale = 0.35,
                     MinConnectGap = 8.0,
                     MaxConnectGap = 80.0,
+                    ConnectGapScale = 1.0,
                     OverlapTolerance = 1.0,
+
+                    UseNearestNeighborGapEstimation = true,
+                    NearestNeighborGapPercentile = 0.65,
+                    NearestNeighborGapScale = 1.45,
+                    MaxNearestNeighborGapForSampling = 120.0,
+
+                    UseUnitSpanFallback = true,
+                    UnitSpanFallbackScale = 0.12,
+                    DiagonalFallbackScale = 0.08,
 
                     GeometryMemberWeight = 3.0,
                     UnitMemberWeight = 5.0,

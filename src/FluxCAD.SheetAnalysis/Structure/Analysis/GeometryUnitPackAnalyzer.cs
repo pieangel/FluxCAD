@@ -127,6 +127,10 @@ namespace FluxCAD.SheetAnalysis.Structure.Analysis
             if (ExpandedIntersects(a.Bounds, b.Bounds, overlapTolerance))
                 return true;
 
+            var edgeDistance = DistanceBetweenBounds(a.Bounds, b.Bounds);
+            if (edgeDistance <= gap)
+                return true;
+
             var ax = a.Bounds.Center.X;
             var ay = a.Bounds.Center.Y;
             var bx = b.Bounds.Center.X;
@@ -136,11 +140,7 @@ namespace FluxCAD.SheetAnalysis.Structure.Analysis
             var dy = ay - by;
             var centerDistance = Math.Sqrt(dx * dx + dy * dy);
 
-            if (centerDistance <= gap)
-                return true;
-
-            var edgeDistance = DistanceBetweenBounds(a.Bounds, b.Bounds);
-            return edgeDistance <= gap;
+            return centerDistance <= gap;
         }
 
         private GeometryUnitPack BuildPack(
@@ -170,46 +170,107 @@ namespace FluxCAD.SheetAnalysis.Structure.Analysis
         }
 
         private static double EstimateConnectGap(
-    IReadOnlyList<SheetEntity> geometrySeeds,
-    GeometryUnitSpatialClusterOptions options)
-        {
-            var diagonals = geometrySeeds
-                .Select(x => GetDiagonal(x.Bounds))
-                .Where(x => x > 0)
-                .OrderBy(x => x)
-                .ToList();
-
-            if (diagonals.Count == 0)
-                return options.MinConnectGap;
-
-            var median = GetMedian(diagonals);
-
-            return Clamp(
-                median * options.ConnectGapScale,
-                options.MinConnectGap,
-                options.MaxConnectGap);
-        }
-
-
-        private static double EstimateConnectGap(
             IReadOnlyList<StructuralUnit> units,
             GeometryUnitPackOptions options)
         {
-            var diagonals = units
-                .Select(x => GetDiagonal(x.Bounds))
-                .Where(x => x > 0)
-                .OrderBy(x => x)
-                .ToList();
-
-            if (diagonals.Count == 0)
+            if (units == null || units.Count == 0)
                 return options.MinConnectGap;
 
-            var median = GetMedian(diagonals);
+            double candidate = 0.0;
 
-            return Clamp(
-                median * options.ConnectGapScale,
-                options.MinConnectGap,
-                options.MaxConnectGap);
+            if (options.UseNearestNeighborGapEstimation)
+            {
+                var nearestNeighborGaps = CollectNearestNeighborGaps(units, options);
+
+                if (nearestNeighborGaps.Count > 0)
+                {
+                    var percentileGap = GetPercentile(
+                        nearestNeighborGaps,
+                        options.NearestNeighborGapPercentile);
+
+                    candidate = percentileGap * options.NearestNeighborGapScale;
+                }
+            }
+
+            if (candidate <= 0.0 && options.UseUnitSpanFallback)
+            {
+                var spans = units
+                    .Select(x => GetCharacteristicSpan(x.Bounds))
+                    .Where(x => x > 0)
+                    .OrderBy(x => x)
+                    .ToList();
+
+                if (spans.Count > 0)
+                    candidate = GetMedian(spans) * options.UnitSpanFallbackScale;
+            }
+
+            if (candidate <= 0.0)
+            {
+                var diagonals = units
+                    .Select(x => GetDiagonal(x.Bounds))
+                    .Where(x => x > 0)
+                    .OrderBy(x => x)
+                    .ToList();
+
+                if (diagonals.Count > 0)
+                    candidate = GetMedian(diagonals) * options.DiagonalFallbackScale;
+            }
+
+            candidate *= options.ConnectGapScale;
+
+            return Clamp(candidate, options.MinConnectGap, options.MaxConnectGap);
+        }
+
+        private static List<double> CollectNearestNeighborGaps(
+            IReadOnlyList<StructuralUnit> units,
+            GeometryUnitPackOptions options)
+        {
+            var gaps = new List<double>();
+
+            for (int i = 0; i < units.Count; i++)
+            {
+                double best = double.MaxValue;
+
+                for (int j = 0; j < units.Count; j++)
+                {
+                    if (i == j)
+                        continue;
+
+                    var gap = DistanceBetweenBounds(units[i].Bounds, units[j].Bounds);
+
+                    if (gap <= options.OverlapTolerance)
+                        continue;
+
+                    if (gap > options.MaxNearestNeighborGapForSampling)
+                        continue;
+
+                    if (gap < best)
+                        best = gap;
+                }
+
+                if (best < double.MaxValue)
+                    gaps.Add(best);
+            }
+
+            gaps.Sort();
+            return gaps;
+        }
+
+        private static double GetCharacteristicSpan(Bounds2D bounds)
+        {
+            var w = Math.Max(bounds.Width, 0.0);
+            var h = Math.Max(bounds.Height, 0.0);
+
+            if (w <= 0.0 && h <= 0.0)
+                return 0.0;
+
+            if (w <= 0.0)
+                return h;
+
+            if (h <= 0.0)
+                return w;
+
+            return Math.Min(w, h);
         }
 
         private static int CountGeometryMembers(StructuralUnit unit)
@@ -324,6 +385,27 @@ namespace FluxCAD.SheetAnalysis.Structure.Analysis
                 return values[mid];
 
             return (values[mid - 1] + values[mid]) * 0.5;
+        }
+
+        private static double GetPercentile(IReadOnlyList<double> sortedValues, double percentile01)
+        {
+            if (sortedValues == null || sortedValues.Count == 0)
+                return 0.0;
+
+            if (sortedValues.Count == 1)
+                return sortedValues[0];
+
+            var p = Clamp(percentile01, 0.0, 1.0);
+            var index = (sortedValues.Count - 1) * p;
+
+            var lo = (int)Math.Floor(index);
+            var hi = (int)Math.Ceiling(index);
+
+            if (lo == hi)
+                return sortedValues[lo];
+
+            var t = index - lo;
+            return sortedValues[lo] + (sortedValues[hi] - sortedValues[lo]) * t;
         }
 
         private static double Clamp(double value, double min, double max)

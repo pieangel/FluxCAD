@@ -15,26 +15,44 @@ namespace FluxCAD.SheetAnalysis.Structure.Analysis
             if (targetUnit == null)
                 throw new ArgumentNullException(nameof(targetUnit));
 
+            return BuildFromMembers(
+                targetUnit.UnitId,
+                targetUnit.GroupKey,
+                targetUnit.Bounds,
+                targetUnit.Members,
+                options);
+        }
+
+        public GeometryUnitSpatialClusterResult BuildFromMembers(
+            string? targetUnitId,
+            string? targetGroupKey,
+            Bounds2D targetBounds,
+            IReadOnlyList<SheetEntity> members,
+            GeometryUnitSpatialClusterOptions? options = null)
+        {
+            if (members == null)
+                throw new ArgumentNullException(nameof(members));
+
             options ??= new GeometryUnitSpatialClusterOptions();
 
             var result = new GeometryUnitSpatialClusterResult
             {
-                TargetUnitId = targetUnit.UnitId,
-                TargetGroupKey = targetUnit.GroupKey,
-                TotalMembers = targetUnit.Members.Count
+                TargetUnitId = targetUnitId,
+                TargetGroupKey = targetGroupKey,
+                TotalMembers = members.Count
             };
 
-            var rawGeometrySeeds = targetUnit.Members
+            var rawGeometrySeeds = members
                 .Where(IsGeometrySeed)
                 .ToList();
 
-            var textCandidates = targetUnit.Members
+            var textCandidates = members
                 .Where(IsTextCandidate)
                 .ToList();
 
             var geometrySeeds = options.EnableSeedFiltering
                 ? rawGeometrySeeds
-                    .Where(x => !IsFormLineCandidate(x, targetUnit.Bounds, options))
+                    .Where(x => !IsFormLineCandidate(x, targetBounds, options))
                     .ToList()
                 : rawGeometrySeeds;
 
@@ -89,7 +107,7 @@ namespace FluxCAD.SheetAnalysis.Structure.Analysis
             }
 
             var clusters = grouped.Values
-                .Select((members, index) => BuildCluster(index + 1, members))
+                .Select((clusterMembers, index) => BuildCluster(index + 1, clusterMembers))
                 .OrderByDescending(x => x.GeometryMembers.Count)
                 .ThenByDescending(x => x.Bounds.Area)
                 .ToList();
@@ -217,27 +235,6 @@ namespace FluxCAD.SheetAnalysis.Structure.Analysis
         }
 
         private static double EstimateConnectGap(
-            IReadOnlyList<SheetEntity> geometrySeeds,
-            GeometryUnitSpatialClusterOptions options)
-        {
-            var diagonals = geometrySeeds
-                .Select(x => GetDiagonal(x.Bounds))
-                .Where(x => x > 0)
-                .OrderBy(x => x)
-                .ToList();
-
-            if (diagonals.Count == 0)
-                return options.MinConnectGap;
-
-            var median = GetMedian(diagonals);
-
-            return Clamp(
-                median * options.ConnectGapScale,
-                options.MinConnectGap,
-                options.MaxConnectGap);
-        }
-
-        private static double EstimateConnectGap_old(
             IReadOnlyList<SheetEntity> geometrySeeds,
             GeometryUnitSpatialClusterOptions options)
         {

@@ -5,15 +5,36 @@
         // 직접 override 가능
         public double? ConnectGapOverride { get; set; }
 
-        // 자동 gap 추정용
-        public double MinConnectGap { get; set; } = 20.0;
-        public double MaxConnectGap { get; set; } = 60.0;
+        // 최종 clamp
+        public double MinConnectGap { get; set; } = 8.0;
+        public double MaxConnectGap { get; set; } = 80.0;
+
+        // 마지막 전체 배율
         public double ConnectGapScale { get; set; } = 1.0;
 
         // 겹침/근접 연결
         public double OverlapTolerance { get; set; } = 1.0;
 
-        // 너무 작은 조각은 살아남게 하되, pack scoring에서 페널티
+        // nearest-neighbor 기반 auto gap 추정
+        public bool UseNearestNeighborGapEstimation { get; set; } = true;
+
+        // 각 unit의 "가장 가까운 다른 unit" 거리들의 percentile
+        public double NearestNeighborGapPercentile { get; set; } = 0.65;
+
+        // percentile 결과에 곱할 배율
+        public double NearestNeighborGapScale { get; set; } = 1.45;
+
+        // 너무 먼 unit까지 샘플에 넣지 않기 위한 상한
+        public double MaxNearestNeighborGapForSampling { get; set; } = 120.0;
+
+        // fallback: unit span 기반
+        public bool UseUnitSpanFallback { get; set; } = true;
+        public double UnitSpanFallbackScale { get; set; } = 0.12;
+
+        // fallback: diagonal 기반
+        public double DiagonalFallbackScale { get; set; } = 0.08;
+
+        // 너무 작은 조각은 살아남게 하되, pack scoring에서 활용 가능
         public int MinGeometryMembersForPreferredUnit { get; set; } = 2;
 
         // metadata-heavy unit 필터

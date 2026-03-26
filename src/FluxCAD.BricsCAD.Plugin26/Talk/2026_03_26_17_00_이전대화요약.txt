@@ -1,0 +1,255 @@
+좋습니다. 다음 대화에서 바로 이어갈 수 있도록 지금까지를 깔끔하게 정리하겠습니다.
+
+실수: 0개
+추측: 0개
+
+현재까지 확정된 핵심 결론
+
+이번 대화에서 가장 중요한 결론은 이것입니다.
+
+이제 중심 전략은 pack 보정이 아니라 Geometry Core / Annotation Scene 분리입니다.
+
+즉 앞으로는
+
+치수와 주석을 먼저 분리하고 → 순수 형상만으로 View Island를 만든 뒤 → 필요하면 치수를 다시 귀속시키는 방향
+
+으로 가는 것이 맞습니다.
+
+왜 이 방향으로 바뀌었는가
+1) 비교 이미지가 매우 강한 근거를 보여 주었음
+
+원본 도면과
+RotatedDimension, DiametricDimension 제거본을 비교했을 때,
+
+치수가 빠진 순간 도면의 실제 구조가 훨씬 선명하게 드러났습니다.
+
+즉 원래 한 덩어리처럼 보이던 장면이 아니라 실제로는
+
+상단 view
+중단 view
+하단 main view
+하단 또 다른 side view
+우측 section/detail
+우하단 title / note 영역
+
+처럼 상당히 잘 분리된다는 것이 확인되었습니다.
+
+이것은 아주 중요합니다.
+즉 현재 병목의 상당 부분이 형상 자체의 복잡성보다
+치수 객체가 공간 분리를 방해하는 효과에 있었다는 뜻입니다.
+
+2) 모든 설계 도면에서 치수는 진짜 치수 객체라는 사실이 확인됨
+
+이것은 전략적으로 매우 큰 이점입니다.
+
+즉 치수가 explode된 선/화살표/문자 묶음이 아니라
+처음부터 의미 있는 CAD 객체로 존재하므로,
+
+확실하게 분리 저장할 수 있고
+geometry 분석 시 안전하게 제외할 수 있고
+나중에 다시 복원할 수 있습니다
+
+이 점 때문에 이 전략은 임시 땜질이 아니라
+구조적으로 매우 건강한 파이프라인이 됩니다.
+
+3) 최종 목적에도 더 잘 맞음
+
+최종 목표는 도면을 그대로 예쁘게 재현하는 것이 아니라,
+
+형상 추출
+뷰 분리
+분류
+전개
+철판 배치
+
+입니다.
+
+그리고 최종 철판에는 치수가 실리지 않습니다.
+즉 실무 목적상 먼저 필요한 것은
+치수 없는 순수 형상입니다.
+
+그래서 우선순위는 이제 분명합니다.
+
+Geometry First, Dimension Later
+
+현재까지의 기술적 판단
+기존 실험에서 확인된 것
+구조 분리 자체는 잘 되고 있었습니다.
+family-1 같은 outer/meta 성격 unit 배제도 잘 되고 있었습니다.
+family-4, 5, 7을 하나의 상위 pack으로 묶는 재결합도 성공했습니다.
+하지만 combined cluster 단계에서는 unit 간 통합이 충분히 일어나지 않았습니다.
+그 이유
+
+combined 단계의 직접 실패 원인은
+annotation 때문이라기보다
+pack 내부 combined clustering 규칙과 connect gap 문제였습니다.
+
+하지만 이번 이미지 비교를 통해 더 본질적인 사실이 드러났습니다.
+
+그 이전 단계에서 아예 치수/annotation을 제거한 scene으로 들어가면, View Island 형성이 훨씬 쉬워진다는 점입니다.
+
+즉 이제는
+
+기존 pack/combined 보정은 보조 과제가 되고
+상위 전략은 scene 분리로 바뀌는 것이 맞습니다
+지금부터의 새 파이프라인
+
+앞으로의 기준 구조는 아래처럼 잡는 것이 맞습니다.
+
+Scene A — Geometry Core
+
+실제 형상 후보만 포함합니다.
+
+예:
+
+Line
+Arc
+Circle
+Polyline
+Ellipse
+Spline
+기타 primitive geometry
+Scene B — Annotation / Dimension
+
+설명용 객체를 별도 보관합니다.
+
+예:
+
+RotatedDimension
+AlignedDimension
+DiametricDimension
+RadialDimension
+Angular 계열
+Leader / MLeader
+section 표시
+callout 관련 text
+Scene C — Sheet / Metadata
+
+도면 양식과 표 영역을 별도 관리합니다.
+
+예:
+
+frame
+title block
+table
+note block
+metadata text
+이 구조에서의 핵심 처리 순서
+1단계
+
+Geometry Core만으로 View Island를 만든다
+
+즉 치수 없는 상태에서
+
+정면도
+측면도
+단면도
+상세도
+
+를 먼저 공간적으로 안정적으로 분리합니다.
+
+2단계
+
+각 island의 특성을 계산합니다.
+
+예:
+
+bounds
+중심
+폭/높이
+주축 방향
+내부 primitive 분포
+작은 detail 포함 여부
+3단계
+
+필요하면 Dimension/Annotation을 다시 island에 귀속시킵니다.
+
+이때는 단순 거리보다
+
+dimension 기준점
+extension point
+leader arrow point
+text position
+geometry와의 실제 참조 관계
+
+를 우선 사용합니다.
+
+4단계
+
+그 다음에야 의미 분류로 들어갑니다.
+
+예:
+
+main view
+section view
+detail view
+auxiliary feature
+hole/detail island
+현재 시점의 한 줄 요약
+
+이제부터는 “치수를 포함한 채로 공간을 풀기”보다, “치수를 잠시 제외하고 순수 형상만으로 View Island를 먼저 만든 뒤, 필요하면 치수를 다시 붙이는 방식”이 주 전략입니다.
+
+다음 대화에서 바로 시작할 일
+
+다음 대화에서는 아래 순서로 시작하는 것이 가장 좋습니다.
+
+1) 객체 3분류 파이프라인을 코드 구조로 명시하기
+
+우선 현재 snapshot/entity 계층에서 객체를 아래처럼 확정 분류하는 설계를 만듭니다.
+
+Geometry Core
+Annotation / Dimension
+Sheet / Metadata
+
+즉 “어떤 객체가 어느 scene으로 들어가는가”를 명확히 정리합니다.
+
+2) Geometry Core only View Island 디버그 명령 만들기
+
+새 명령 하나를 만드는 것이 좋습니다.
+
+예시 이름:
+
+FLUX_DEBUG_GEOMETRY_CORE_ISLANDS
+또는 FLUX_DEBUG_VIEW_ISLANDS_GEOMETRY_ONLY
+
+이 명령의 목표는:
+
+snapshot에서 geometry core만 추출
+dimension / leader / annotation 제외
+geometry만으로 cluster/island 생성
+island별 bounds / member count / 주요 primitive 구성 출력
+
+입니다.
+
+3) 현재 샘플에서 geometry-only island가 실제로 몇 개 나오는지 확인
+
+이 단계에서 보고 싶은 것은 이것입니다.
+
+상단 view가 하나로 잡히는가
+중단 긴 view가 하나로 잡히는가
+하단 긴 main view가 하나로 잡히는가
+우측 detail/section들이 별도 island로 떨어지는가
+title block 영역이 geometry island에 섞이지 않는가
+
+즉 사용자가 눈으로 본 분리가
+코드 상에서도 재현되는지를 먼저 확인해야 합니다.
+
+4) 그 다음에 dimension 복원 규칙 초안 설계
+
+geometry island가 안정적으로 나오면, 그 다음 대화 또는 그 다음 단계에서
+
+dimension object의 기준점
+leader arrow point
+text anchor
+
+를 이용해 어느 island에 붙일지 규칙을 설계합니다.
+
+하지만 이건 geometry-only island가 먼저 안정화된 뒤에 하는 것이 맞습니다.
+
+다음 대화 시작 문장 수준의 목표
+
+다음 대화에서는 이렇게 시작하면 됩니다.
+
+“Geometry Core / Annotation / Metadata 분류 기준을 먼저 확정하고, Geometry Core만으로 View Island를 찾는 새 디버그 명령을 설계하자.”
+
+이것이 현재 가장 자연스럽고 전략적으로도 맞는 다음 단계입니다.
