@@ -48,18 +48,63 @@ namespace FluxCAD.BricsCAD.Plugin26
 
                 var clusterBuilder = new GeometryClusterBuilder();
 
-                // 이 부분은 사용 중인 실제 Build 시그니처에 맞춰 유지하세요.
                 var clusters = clusterBuilder.Build(
                     partition.GeometryCoreEntities,
                     sheetBounds,
                     new StructuredComponentBuildOptions());
 
-                ed.WriteMessage($"\n[GeometryCoreIslands] IslandCount={clusters.Count}");
+                ed.WriteMessage($"\n[GeometryCoreIslands] BaselineIslandCount={clusters.Count}");
 
-                var ordered = clusters
+                // -----------------------------
+                // PreFilter 실제 연결
+                // -----------------------------
+                var preFilterOptions = new GeometryCorePreFilterOptions
+                {
+                    // 다음 두 값은 이번 단계에서 반드시 살아 있어야 하는 옵션
+                    OuterContainTolerance = 2.0,
+                    LooseMergeGapMultiplier = 1.25
+                };
+
+                var preFilter = new GeometryCorePreFilter();
+
+                // 가정한 Run 시그니처:
+                // Run(IReadOnlyList<GeometryCluster> input, Bounds2D sheetBounds, GeometryCorePreFilterOptions options)
+                var preFilterResult = preFilter.Run(
+                    clusters,
+                    sheetBounds,
+                    preFilterOptions);
+
+                ed.WriteMessage(
+                     $"\n[PreFilter] Input={preFilterResult.InputClusters.Count}, " +
+                     $"DropOuter={preFilterResult.DroppedOuterFrameClusters.Count}, " +
+                     $"DropTiny={preFilterResult.DroppedTinyNoiseClusters.Count}, " +
+                     $"KeptBeforeMerge={preFilterResult.KeptBeforeMergeClusters.Count}, " +
+                     $"Final={preFilterResult.FinalClusters.Count}");
+
+                if (preFilterResult.DroppedOuterFrameClusters.Count > 0)
+                {
+                    var droppedOuterIds = string.Join(", ",
+                        preFilterResult.DroppedOuterFrameClusters
+                            .Select(x => Safe(x.ClusterId)));
+
+                    ed.WriteMessage($"\n[PreFilter] DroppedOuterIds={droppedOuterIds}");
+                }
+
+                if (preFilterResult.DroppedTinyNoiseClusters.Count > 0)
+                {
+                    var droppedTinyIds = string.Join(", ",
+                        preFilterResult.DroppedTinyNoiseClusters
+                            .Select(x => Safe(x.ClusterId)));
+
+                    ed.WriteMessage($"\n[PreFilter] DroppedTinyIds={droppedTinyIds}");
+                }
+
+                var ordered = preFilterResult.FinalClusters
                     .OrderByDescending(GetArea)
                     .ThenByDescending(x => x.GeometryCount)
                     .ToList();
+
+                ed.WriteMessage($"\n[GeometryCoreIslands] FinalIslandCount={ordered.Count}");
 
                 for (int i = 0; i < ordered.Count; i++)
                 {
@@ -78,6 +123,7 @@ namespace FluxCAD.BricsCAD.Plugin26
                     var pointCount = CountByKind(cluster, SheetEntityKind.Point);
                     var regionCount = CountByKind(cluster, SheetEntityKind.Region);
 
+                    // 여기서는 "현재 남은 final cluster"를 참고용으로 다시 보여줍니다.
                     var likelyOuterFrame = IsLikelyOuterFrameCandidate(cluster, sheetBounds);
                     var likelyTinyFragment = IsLikelyTinyFragment(cluster);
 
@@ -155,7 +201,6 @@ namespace FluxCAD.BricsCAD.Plugin26
             var heightRatio = b.Height / sheetBounds.Height;
             var areaRatio = GetArea(cluster) / Math.Max(1.0, sheetBounds.Width * sheetBounds.Height);
 
-            // 전체 시트와 거의 비슷한 큰 경계 후보
             if (widthRatio >= 0.80 && heightRatio >= 0.80)
                 return true;
 
@@ -170,7 +215,6 @@ namespace FluxCAD.BricsCAD.Plugin26
             var b = cluster.TotalBounds;
             var area = GetArea(cluster);
 
-            // 너무 작은 조각 / 점 / 짧은 선 / 작은 기호 후보
             if (cluster.GeometryCount <= 2 && (b.Width <= 5 || b.Height <= 5))
                 return true;
 

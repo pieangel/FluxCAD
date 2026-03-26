@@ -30,5 +30,18 @@ namespace FluxCAD.SheetAnalysis.ViewIsolation
 
         public double OuterContainTolerance { get; set; } = 2.0;
         public double LooseMergeGapMultiplier { get; set; } = 1.5;
+
+        public bool EnableTinyFragmentAbsorption { get; set; } = true;
+        public int TinyFragmentMaxGeometryCount { get; set; } = 6;
+        public double TinyFragmentMaxWidth { get; set; } = 12.0;
+        public double TinyFragmentMaxHeight { get; set; } = 12.0;
+        public double TinyFragmentMaxArea { get; set; } = 100.0;
+        public double TinyFragmentHostGapTolerance { get; set; } = 6.0;
+
+        public bool EnableColumnAlignedViewMerge { get; set; } = true;
+        public double ColumnMergeMinXOverlapRatio { get; set; } = 0.90;
+        public double ColumnMergeMaxVerticalGap { get; set; } = 40.0;
+        public double ColumnMergeMaxCenterXDelta { get; set; } = 12.0;
+        public double ColumnMergeMinArea { get; set; } = 150.0;
     }
 }

@@ -7,10 +7,11 @@ namespace FluxCAD.SheetAnalysis.ViewIsolation
 {
     public sealed class GeometryCorePreFilter
     {
+
         public GeometryCorePreFilterResult Run(
-            IReadOnlyList<GeometryCluster> inputClusters,
-            Bounds2D sheetBounds,
-            GeometryCorePreFilterOptions? options = null)
+    IReadOnlyList<GeometryCluster> inputClusters,
+    Bounds2D sheetBounds,
+    GeometryCorePreFilterOptions? options = null)
         {
             if (inputClusters == null)
                 throw new ArgumentNullException(nameof(inputClusters));
@@ -41,31 +42,156 @@ namespace FluxCAD.SheetAnalysis.ViewIsolation
                 kept.Add(cluster);
             }
 
-            result.KeptBeforeMergeClusters.AddRange(
-                kept.OrderByDescending(GetArea)
-                    .ThenByDescending(x => x.GeometryCount));
+            var keptOrdered = kept
+                .OrderByDescending(GetArea)
+                .ThenByDescending(x => x.GeometryCount)
+                .ToList();
+
+            result.KeptBeforeMergeClusters.AddRange(keptOrdered);
 
             List<GeometryCluster> finalClusters;
             if (options.MergeRemainingClusters)
             {
-                finalClusters = MergeClusters(kept, options);
-                result.Reasons.Add($"merged {kept.Count} -> {finalClusters.Count}");
+                finalClusters = MergeClusters(keptOrdered, options);
+                result.Reasons.Add($"merged {keptOrdered.Count} -> {finalClusters.Count}");
             }
             else
             {
-                finalClusters = kept
-                    .OrderByDescending(GetArea)
-                    .ThenByDescending(x => x.GeometryCount)
-                    .ToList();
+                finalClusters = keptOrdered.ToList();
             }
 
+            if (options.EnableTinyFragmentAbsorption)
+            {
+                var beforeAbsorb = finalClusters.Count;
+                finalClusters = AbsorbTinyFragments(finalClusters, options);
+
+                if (beforeAbsorb != finalClusters.Count)
+                    result.Reasons.Add($"absorb_tiny_fragments {beforeAbsorb} -> {finalClusters.Count}");
+            }
+
+            if (options.EnableColumnAlignedViewMerge)
+            {
+                var beforeColumnMerge = finalClusters.Count;
+                finalClusters = MergeColumnAlignedDisconnectedViews(finalClusters, options);
+
+                if (beforeColumnMerge != finalClusters.Count)
+                    result.Reasons.Add($"merge_column_aligned {beforeColumnMerge} -> {finalClusters.Count}");
+            }
+
+            finalClusters = finalClusters
+                .OrderByDescending(GetArea)
+                .ThenByDescending(x => x.GeometryCount)
+                .ToList();
+
             result.FinalClusters.AddRange(finalClusters);
+
             result.Reasons.Add($"input={inputClusters.Count}");
             result.Reasons.Add($"drop_outer={result.DroppedOuterFrameClusters.Count}");
             result.Reasons.Add($"drop_tiny={result.DroppedTinyNoiseClusters.Count}");
+            result.Reasons.Add($"kept_before_merge={result.KeptBeforeMergeClusters.Count}");
             result.Reasons.Add($"final={result.FinalClusters.Count}");
 
             return result;
+        }
+
+        private static List<GeometryCluster> MergeColumnAlignedDisconnectedViews(
+    IList<GeometryCluster> input,
+    GeometryCorePreFilterOptions options)
+        {
+            var work = input
+                .OrderByDescending(GetArea)
+                .ThenByDescending(x => x.GeometryCount)
+                .ToList();
+
+            if (work.Count <= 1)
+                return work;
+
+            bool changed;
+            do
+            {
+                changed = false;
+
+                for (int i = 0; i < work.Count; i++)
+                {
+                    for (int j = i + 1; j < work.Count; j++)
+                    {
+                        if (!ShouldMergeAsSameColumnView(work[i], work[j], options))
+                            continue;
+
+                        work[i] = MergeTwoClusters(work[i], work[j], options);
+                        work.RemoveAt(j);
+                        changed = true;
+                        break;
+                    }
+
+                    if (changed)
+                        break;
+                }
+            }
+            while (changed);
+
+            return work
+                .OrderByDescending(GetArea)
+                .ThenByDescending(x => x.GeometryCount)
+                .ToList();
+        }
+
+        private static bool ShouldMergeAsSameColumnView(
+    GeometryCluster a,
+    GeometryCluster b,
+    GeometryCorePreFilterOptions options)
+        {
+            var ab = a.TotalBounds;
+            var bb = b.TotalBounds;
+
+            var areaA = GetArea(a);
+            var areaB = GetArea(b);
+
+            if (areaA < options.ColumnMergeMinArea || areaB < options.ColumnMergeMinArea)
+                return false;
+
+            var xOverlap = GetOverlapLength(ab.MinX, ab.MaxX, bb.MinX, bb.MaxX);
+            if (xOverlap <= 0)
+                return false;
+
+            var minWidth = System.Math.Min(ab.Width, bb.Width);
+            if (minWidth <= 0)
+                return false;
+
+            var xOverlapRatio = xOverlap / minWidth;
+            if (xOverlapRatio < options.ColumnMergeMinXOverlapRatio)
+                return false;
+
+            var centerXDelta = System.Math.Abs(GetCenterX(ab) - GetCenterX(bb));
+            if (centerXDelta > options.ColumnMergeMaxCenterXDelta)
+                return false;
+
+            var verticalGap = GetVerticalGap(ab, bb);
+            if (verticalGap > options.ColumnMergeMaxVerticalGap)
+                return false;
+
+            return true;
+        }
+
+        private static double GetOverlapLength(double aMin, double aMax, double bMin, double bMax)
+        {
+            return System.Math.Max(0.0, System.Math.Min(aMax, bMax) - System.Math.Max(aMin, bMin));
+        }
+
+        private static double GetCenterX(Bounds2D b)
+        {
+            return (b.MinX + b.MaxX) * 0.5;
+        }
+
+        private static double GetVerticalGap(Bounds2D a, Bounds2D b)
+        {
+            if (a.MaxY < b.MinY)
+                return b.MinY - a.MaxY;
+
+            if (b.MaxY < a.MinY)
+                return a.MinY - b.MaxY;
+
+            return 0.0;
         }
 
         public bool IsLikelyOuterFrameCandidate(
@@ -419,6 +545,166 @@ namespace FluxCAD.SheetAnalysis.ViewIsolation
 
             if (ra != rb)
                 parent[rb] = ra;
+        }
+
+        private static List<GeometryCluster> AbsorbTinyFragments(
+    IList<GeometryCluster> input,
+    GeometryCorePreFilterOptions options)
+        {
+            var work = input.ToList();
+            if (work.Count <= 1)
+                return work;
+
+            bool changed;
+            do
+            {
+                changed = false;
+
+                for (int i = 0; i < work.Count; i++)
+                {
+                    var fragment = work[i];
+                    if (!IsAbsorbableTinyFragment(fragment, options))
+                        continue;
+
+                    int bestHostIndex = -1;
+                    double bestGap = double.MaxValue;
+
+                    for (int j = 0; j < work.Count; j++)
+                    {
+                        if (i == j)
+                            continue;
+
+                        var host = work[j];
+
+                        // fragment보다 충분히 큰 쪽만 host 후보로 봅니다.
+                        if (host.GeometryCount < fragment.GeometryCount)
+                            continue;
+
+                        if (host.RoundGeometryCount > 0 && fragment.RoundGeometryCount == 0 && host.GeometryCount <= 10)
+                        {
+                            // 작은 round cluster끼리 이상하게 붙는 것을 조금 방지
+                        }
+
+                        var gap = GetBoundsGap(fragment.TotalBounds, host.TotalBounds);
+                        if (gap > options.TinyFragmentHostGapTolerance)
+                            continue;
+
+                        if (gap < bestGap)
+                        {
+                            bestGap = gap;
+                            bestHostIndex = j;
+                        }
+                    }
+
+                    if (bestHostIndex >= 0)
+                    {
+                        work[bestHostIndex] = MergeTwoClusters(work[bestHostIndex], fragment, options);
+                        work.RemoveAt(i);
+                        changed = true;
+                        break;
+                    }
+                }
+            }
+            while (changed);
+
+            return work;
+        }
+
+        private static GeometryCluster MergeTwoClusters(
+    GeometryCluster a,
+    GeometryCluster b,
+    GeometryCorePreFilterOptions options)
+        {
+            if (a == null)
+                throw new ArgumentNullException(nameof(a));
+
+            if (b == null)
+                throw new ArgumentNullException(nameof(b));
+
+            var forcedOptions = new GeometryCorePreFilterOptions
+            {
+                MergeRemainingClusters = true,
+                DropOuterFrameCandidates = false,
+                DropTinyNoise = false,
+                EnableTinyFragmentAbsorption = false,
+                EnableColumnAlignedViewMerge = false,
+
+                // 여기서 핵심은 두 클러스터를 "무조건 merge 시도" 쪽으로 강하게 미는 것입니다.
+                LooseMergeGapMultiplier = System.Math.Max(options.LooseMergeGapMultiplier, 1000.0),
+
+                // 기존 옵션은 보존
+                OuterContainTolerance = options.OuterContainTolerance,
+
+                TinyFragmentMaxGeometryCount = options.TinyFragmentMaxGeometryCount,
+                TinyFragmentMaxWidth = options.TinyFragmentMaxWidth,
+                TinyFragmentMaxHeight = options.TinyFragmentMaxHeight,
+                TinyFragmentMaxArea = options.TinyFragmentMaxArea,
+                TinyFragmentHostGapTolerance = options.TinyFragmentHostGapTolerance,
+
+                ColumnMergeMinXOverlapRatio = options.ColumnMergeMinXOverlapRatio,
+                ColumnMergeMaxVerticalGap = options.ColumnMergeMaxVerticalGap,
+                ColumnMergeMaxCenterXDelta = options.ColumnMergeMaxCenterXDelta,
+                ColumnMergeMinArea = options.ColumnMergeMinArea
+            };
+
+            var merged = MergeClusters(
+                    new List<GeometryCluster> { a, b },
+                    forcedOptions)
+                .OrderByDescending(GetArea)
+                .ThenByDescending(x => x.GeometryCount)
+                .ToList();
+
+            if (merged.Count == 1)
+                return merged[0];
+
+            throw new InvalidOperationException(
+                $"MergeTwoClusters failed: merged.Count={merged.Count}, " +
+                $"A.Area={GetArea(a):0.##}, B.Area={GetArea(b):0.##}");
+        }
+
+        private static bool IsAbsorbableTinyFragment(
+    GeometryCluster cluster,
+    GeometryCorePreFilterOptions options)
+        {
+            if (cluster == null)
+                return false;
+
+            // round feature는 tiny여도 보존 정책 유지
+            if (cluster.RoundGeometryCount > 0)
+                return false;
+
+            var b = cluster.TotalBounds;
+            var w = b.Width;
+            var h = b.Height;
+            var area = Math.Max(0, w) * Math.Max(0, h);
+
+            if (cluster.GeometryCount > options.TinyFragmentMaxGeometryCount)
+                return false;
+
+            if (w > options.TinyFragmentMaxWidth && h > options.TinyFragmentMaxHeight)
+                return false;
+
+            if (area > options.TinyFragmentMaxArea)
+                return false;
+
+            return true;
+        }
+
+        private static double GetBoundsGap(Bounds2D a, Bounds2D b)
+        {
+            var dx = 0.0;
+            if (a.MaxX < b.MinX)
+                dx = b.MinX - a.MaxX;
+            else if (b.MaxX < a.MinX)
+                dx = a.MinX - b.MaxX;
+
+            var dy = 0.0;
+            if (a.MaxY < b.MinY)
+                dy = b.MinY - a.MaxY;
+            else if (b.MaxY < a.MinY)
+                dy = a.MinY - b.MaxY;
+
+            return System.Math.Sqrt(dx * dx + dy * dy);
         }
     }
 }
