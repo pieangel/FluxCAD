@@ -36,6 +36,12 @@ namespace FluxCAD.SheetAnalysis
         //public int Depth { get; set; }
         public string? SnapshotKey { get; set; }
 
+        public string? OwnerStructureNodeId { get; set; }
+        public int? OwnerDirectChildCount { get; set; }
+        public int? OwnerDirectGeometryChildCount { get; set; }
+        public int? OwnerDirectTextChildCount { get; set; }
+        public int? OwnerDescendantLeafCount { get; set; }
+
         public bool IsVisible { get; set; } = true;
         public bool IsBlockReference => Kind == SheetEntityKind.BlockReference;
         public bool IsTextLike_old =>

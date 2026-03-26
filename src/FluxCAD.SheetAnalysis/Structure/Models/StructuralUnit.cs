@@ -29,5 +29,11 @@ namespace FluxCAD.SheetAnalysis.Structure.Models
         public bool HasTextLike => Composition.TextLikeCount > 0;
         public bool HasGeometryLike => Composition.GeometryCount > 0;
         public bool HasAnnotationLike => Composition.AnnotationCount > 0;
+
+        public StructuralOriginSnapshot Origin { get; } = new();
+
+        public int CurrentMemberCount => Members.Count;
+
+        public int MemberDelta => CurrentMemberCount - Origin.OriginalMemberCount;
     }
 }

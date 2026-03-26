@@ -93,10 +93,11 @@ namespace FluxCAD.SheetAnalysis.Structure.Builders
                 var badgeMembers = new List<SheetEntity> { geometry, match };
 
                 var badgeUnit = CreateDerivedLooseUnit(
-                    $"loose-{nextLooseIndex++}",
-                    loose.ParentUnitId,
-                    "refined-badge",
-                    badgeMembers);
+    $"loose-{nextLooseIndex++}",
+    loose.ParentUnitId,
+    loose.UnitId,
+    "refined-badge",
+    badgeMembers);
 
                 AppendReasonUnique(badgeUnit.Reasons, "refined as identifier badge");
 
@@ -119,10 +120,11 @@ namespace FluxCAD.SheetAnalysis.Structure.Builders
             foreach (var qtyText in qtyLikeTexts)
             {
                 var qtyUnit = CreateDerivedLooseUnit(
-                    $"loose-{nextLooseIndex++}",
-                    loose.ParentUnitId,
-                    "refined-qty-note",
-                    new List<SheetEntity> { qtyText });
+    $"loose-{nextLooseIndex++}",
+    loose.ParentUnitId,
+    loose.UnitId,
+    "refined-qty-note",
+    new List<SheetEntity> { qtyText });
 
                 AppendReasonUnique(qtyUnit.Reasons, "refined as qty-like note");
                 additions.Add(qtyUnit);
@@ -142,10 +144,11 @@ namespace FluxCAD.SheetAnalysis.Structure.Builders
                     continue;
 
                 var noteUnit = CreateDerivedLooseUnit(
-                    $"loose-{nextLooseIndex++}",
-                    loose.ParentUnitId,
-                    "refined-note",
-                    cluster);
+    $"loose-{nextLooseIndex++}",
+    loose.ParentUnitId,
+    loose.UnitId,
+    "refined-note",
+    cluster);
 
                 AppendReasonUnique(noteUnit.Reasons, "refined as free note cluster");
 
@@ -314,7 +317,7 @@ namespace FluxCAD.SheetAnalysis.Structure.Builders
             return Distance(a.Anchor, b.Anchor) <= 35.0;
         }
 
-        private StructuralUnit CreateDerivedLooseUnit(
+        private StructuralUnit CreateDerivedLooseUnit_old(
             string unitId,
             string? parentUnitId,
             string groupKey,
@@ -339,6 +342,43 @@ namespace FluxCAD.SheetAnalysis.Structure.Builders
             };
 
             unit.Members.AddRange(members);
+            return unit;
+        }
+
+        private StructuralUnit CreateDerivedLooseUnit(
+    string unitId,
+    string? parentUnitId,
+    string? derivedFromUnitId,
+    string groupKey,
+    List<SheetEntity> members)
+        {
+            var bounds = Bounds2DHelper.FromEntities(members);
+            var commonPath = FindCommonBlockPath(members);
+
+            var unit = new StructuralUnit
+            {
+                UnitId = unitId,
+                ParentUnitId = parentUnitId,
+                Kind = StructuralUnitKind.LoosePrimitiveGroup,
+                GroupKey = groupKey,
+                Bounds = bounds,
+                RepresentativePoint = SelectRepresentativePoint(members, bounds),
+                Depth = commonPath.Count,
+                CommonBlockPath = commonPath,
+                SourceBlockName = SelectSourceBlockName(members),
+                Composition = _compositionBuilder(members),
+                RoleHint = StructuralRoleHint.Unknown
+            };
+
+            unit.Members.AddRange(members);
+
+            CaptureOriginSnapshot(
+                unit,
+                members,
+                isDerivedUnit: true,
+                derivedFromUnitId: derivedFromUnitId,
+                derivedStage: groupKey);
+
             return unit;
         }
 

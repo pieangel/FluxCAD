@@ -40,6 +40,41 @@ namespace FluxCAD.SheetAnalysis.Structure.Reporting
             if (unit.CommonBlockPath != null && unit.CommonBlockPath.Count > 0)
                 sb.AppendLine($"  CommonPath={string.Join(" > ", unit.CommonBlockPath)}");
 
+            if (unit.Origin.OriginalMemberCount > 0)
+            {
+                sb.AppendLine(
+                    $"  Origin: Members={unit.Origin.OriginalMemberCount} " +
+                    $"Delta={unit.MemberDelta} " +
+                    $"OrigDepth={unit.Origin.OriginalDepth} " +
+                    $"OrigBlock={unit.Origin.OriginalSourceBlockName}");
+
+                if (unit.Origin.SourceDirectChildCount.HasValue ||
+                    unit.Origin.SourceDescendantLeafCount.HasValue)
+                {
+                    sb.AppendLine(
+                        $"  Struct: DirectChild={FmtNullable(unit.Origin.SourceDirectChildCount)} " +
+                        $"DirectGeo={FmtNullable(unit.Origin.SourceDirectGeometryChildCount)} " +
+                        $"DirectText={FmtNullable(unit.Origin.SourceDirectTextChildCount)} " +
+                        $"DescLeaf={FmtNullable(unit.Origin.SourceDescendantLeafCount)}");
+                }
+
+                if (unit.Origin.IsDerivedUnit)
+                {
+                    sb.AppendLine(
+                        $"  Derived: From={unit.Origin.DerivedFromUnitId} Stage={unit.Origin.DerivedStage}");
+                }
+
+                if (!string.IsNullOrWhiteSpace(unit.Origin.ConsumedByUnitId))
+                {
+                    sb.AppendLine($"  ConsumedBy={unit.Origin.ConsumedByUnitId}");
+                }
+
+                if (unit.Origin.AbsorbedUnitIds.Count > 0)
+                {
+                    sb.AppendLine($"  Absorbed={string.Join(", ", unit.Origin.AbsorbedUnitIds)}");
+                }
+            }
+
             var c = unit.Composition;
             sb.AppendLine(
                 $"  Comp: Total={c.TotalCount} Geo={c.GeometryCount} Text={c.TextLikeCount} Dim={c.AnnotationCount} BlockRef={c.BlockReferenceCount}");

@@ -399,7 +399,7 @@ namespace FluxCAD.SheetAnalysis.Structure.Builders
             }
         }
 
-        private static StructuralUnit CreateUnit(
+        private static StructuralUnit CreateUnit_old(
             string unitId,
             StructuralUnitKind kind,
             string key,
@@ -430,6 +430,78 @@ namespace FluxCAD.SheetAnalysis.Structure.Builders
             unit.Members.AddRange(members);
 
             return unit;
+        }
+
+        private static StructuralUnit CreateUnit(
+    string unitId,
+    StructuralUnitKind kind,
+    string key,
+    List<SheetEntity> members)
+        {
+            var bounds = Bounds2DHelper.FromEntities(members);
+            var commonPath = FindCommonBlockPath(members);
+
+            var unit = new StructuralUnit
+            {
+                UnitId = unitId,
+                Kind = kind,
+                GroupKey = key,
+                Bounds = bounds,
+                RepresentativePoint = bounds.Center,
+                Depth = commonPath.Count,
+                CommonBlockPath = commonPath,
+                SourceBlockName = members
+                    .Select(GetLeafBlockName)
+                    .Where(x => !string.IsNullOrWhiteSpace(x))
+                    .GroupBy(x => x)
+                    .OrderByDescending(g => g.Count())
+                    .Select(g => g.Key)
+                    .FirstOrDefault(),
+                Composition = PrimitiveCompositionProfile.FromEntities(members)
+            };
+
+            unit.Members.AddRange(members);
+
+            CaptureOriginSnapshot(unit, members, isDerivedUnit: false, derivedFromUnitId: null, derivedStage: null);
+
+            return unit;
+        }
+
+        private static void CaptureOriginSnapshot(
+            StructuralUnit unit,
+            IReadOnlyList<SheetEntity> members,
+            bool isDerivedUnit,
+            string? derivedFromUnitId,
+            string? derivedStage)
+        {
+            var bounds = Bounds2DHelper.FromEntities(members);
+            var commonPath = FindCommonBlockPath(members);
+
+            unit.Origin.OriginalMemberCount = members.Count;
+            unit.Origin.OriginalBounds = bounds;
+            unit.Origin.OriginalComposition = PrimitiveCompositionProfile.FromEntities(members);
+            unit.Origin.OriginalGroupKey = unit.GroupKey;
+            unit.Origin.OriginalSourceBlockName = members
+                .Select(GetLeafBlockName)
+                .Where(x => !string.IsNullOrWhiteSpace(x))
+                .GroupBy(x => x)
+                .OrderByDescending(g => g.Count())
+                .Select(g => g.Key)
+                .FirstOrDefault();
+            unit.Origin.OriginalDepth = commonPath.Count;
+            unit.Origin.OriginalCommonBlockPath = commonPath;
+
+            unit.Origin.IsDerivedUnit = isDerivedUnit;
+            unit.Origin.DerivedFromUnitId = derivedFromUnitId;
+            unit.Origin.DerivedStage = derivedStage;
+
+            // 아래 4개는 지금은 null 상태로 두고,
+            // 다음 단계에서 snapshot builder가 채워주게 연결합니다.
+            // unit.Origin.SourceNodeId = ...
+            // unit.Origin.SourceDirectChildCount = ...
+            // unit.Origin.SourceDirectGeometryChildCount = ...
+            // unit.Origin.SourceDirectTextChildCount = ...
+            // unit.Origin.SourceDescendantLeafCount = ...
         }
 
         private static string GetExactBlockPathKey(SheetEntity entity)
