@@ -48,7 +48,7 @@ namespace FluxCAD.BricsCAD.Plugin26
 
                 var clusterBuilder = new GeometryClusterBuilder();
 
-                // 이 Build 시그니처는 기존 프로젝트 정의를 그대로 사용했다고 가정
+                // 이 부분은 사용 중인 실제 Build 시그니처에 맞춰 유지하세요.
                 var clusters = clusterBuilder.Build(
                     partition.GeometryCoreEntities,
                     sheetBounds,
@@ -58,33 +58,55 @@ namespace FluxCAD.BricsCAD.Plugin26
 
                 var ordered = clusters
                     .OrderByDescending(GetArea)
+                    .ThenByDescending(x => x.GeometryCount)
                     .ToList();
 
                 for (int i = 0; i < ordered.Count; i++)
                 {
                     var cluster = ordered[i];
-                    var bounds = cluster.TotalBounds;
+                    var b = cluster.TotalBounds;
+                    var c = cluster.Center;
 
-                    // Geometry-only island의 primitive 구성은 GeometryEntities 기준으로 보는 것이 맞음
-                    var lineCount = CountByEntityType(cluster, "Line");
-                    var arcCount = CountByEntityType(cluster, "Arc");
-                    var circleCount = CountByEntityType(cluster, "Circle");
-                    var polylineCount = CountByEntityType(cluster, "Polyline", "LwPolyline");
-                    var ellipseCount = CountByEntityType(cluster, "Ellipse");
-                    var splineCount = CountByEntityType(cluster, "Spline");
-                    var hatchCount = CountByEntityType(cluster, "Hatch");
+                    var lineCount = CountByKind(cluster, SheetEntityKind.Line);
+                    var polylineCount = CountByKind(cluster, SheetEntityKind.Polyline);
+                    var arcCount = CountByKind(cluster, SheetEntityKind.Arc);
+                    var circleCount = CountByKind(cluster, SheetEntityKind.Circle);
+                    var ellipseCount = CountByKind(cluster, SheetEntityKind.Ellipse);
+                    var splineCount = CountByKind(cluster, SheetEntityKind.Spline);
+                    var hatchCount = CountByKind(cluster, SheetEntityKind.Hatch);
+                    var solidCount = CountByKind(cluster, SheetEntityKind.Solid);
+                    var pointCount = CountByKind(cluster, SheetEntityKind.Point);
+                    var regionCount = CountByKind(cluster, SheetEntityKind.Region);
+
+                    var likelyOuterFrame = IsLikelyOuterFrameCandidate(cluster, sheetBounds);
+                    var likelyTinyFragment = IsLikelyTinyFragment(cluster);
+
+                    var kindSummary = BuildKindSummary(cluster);
+                    var rawTypeSummary = BuildRawTypeSummary(cluster);
 
                     ed.WriteMessage(
                         $"\n[Island {i + 1}] " +
-                        $"ClusterId={cluster.ClusterId}, " +
+                        $"ClusterId={Safe(cluster.ClusterId)}, " +
                         $"Geometry={cluster.GeometryCount}, " +
                         $"Dim={cluster.DimensionCount}, " +
                         $"Text={cluster.TextCount}, " +
                         $"All={cluster.AllEntities.Count()}, " +
-                        $"Bounds=({bounds.MinX:0.##},{bounds.MinY:0.##})-({bounds.MaxX:0.##},{bounds.MaxY:0.##}), " +
-                        $"W={bounds.Width:0.##}, H={bounds.Height:0.##}, " +
-                        $"Line={lineCount}, Arc={arcCount}, Circle={circleCount}, " +
-                        $"Polyline={polylineCount}, Ellipse={ellipseCount}, Spline={splineCount}, Hatch={hatchCount}");
+                        $"Round={cluster.RoundGeometryCount}, " +
+                        $"Center=({c.X:0.##},{c.Y:0.##}), " +
+                        $"Bounds=({b.MinX:0.##},{b.MinY:0.##})-({b.MaxX:0.##},{b.MaxY:0.##}), " +
+                        $"W={b.Width:0.##}, H={b.Height:0.##}, " +
+                        $"Area={GetArea(cluster):0.##}, " +
+                        $"OuterFrame?={(likelyOuterFrame ? "Y" : "N")}, " +
+                        $"Tiny?={(likelyTinyFragment ? "Y" : "N")}");
+
+                    ed.WriteMessage(
+                        $"\n  Primitive: " +
+                        $"Line={lineCount}, Polyline={polylineCount}, Arc={arcCount}, Circle={circleCount}, " +
+                        $"Ellipse={ellipseCount}, Spline={splineCount}, Hatch={hatchCount}, " +
+                        $"Solid={solidCount}, Point={pointCount}, Region={regionCount}");
+
+                    ed.WriteMessage($"\n  Kinds: {kindSummary}");
+                    ed.WriteMessage($"\n  RawTypes: {rawTypeSummary}");
                 }
             }
             catch (System.Exception ex)
@@ -93,17 +115,83 @@ namespace FluxCAD.BricsCAD.Plugin26
             }
         }
 
-        private static int CountByEntityType(GeometryCluster cluster, params string[] entityTypes)
+        private static int CountByKind(GeometryCluster cluster, params SheetEntityKind[] kinds)
         {
-            return cluster.GeometryEntities.Count(x =>
-                entityTypes.Any(t =>
-                    string.Equals(x.EntityType, t, StringComparison.OrdinalIgnoreCase)));
+            return cluster.GeometryEntities.Count(x => kinds.Contains(x.Kind));
+        }
+
+        private static string BuildKindSummary(GeometryCluster cluster)
+        {
+            var items = cluster.GeometryEntities
+                .GroupBy(x => x.Kind)
+                .OrderByDescending(g => g.Count())
+                .ThenBy(g => g.Key.ToString())
+                .Select(g => $"{g.Key}={g.Count()}")
+                .ToList();
+
+            return items.Count == 0 ? "-" : string.Join(", ", items);
+        }
+
+        private static string BuildRawTypeSummary(GeometryCluster cluster)
+        {
+            var items = cluster.GeometryEntities
+                .GroupBy(x => string.IsNullOrWhiteSpace(x.EntityType) ? "(empty)" : x.EntityType)
+                .OrderByDescending(g => g.Count())
+                .ThenBy(g => g.Key)
+                .Select(g => $"{g.Key}={g.Count()}")
+                .ToList();
+
+            return items.Count == 0 ? "-" : string.Join(", ", items);
+        }
+
+        private static bool IsLikelyOuterFrameCandidate(GeometryCluster cluster, Bounds2D sheetBounds)
+        {
+            var b = cluster.TotalBounds;
+
+            if (sheetBounds.Width <= 0 || sheetBounds.Height <= 0)
+                return false;
+
+            var widthRatio = b.Width / sheetBounds.Width;
+            var heightRatio = b.Height / sheetBounds.Height;
+            var areaRatio = GetArea(cluster) / Math.Max(1.0, sheetBounds.Width * sheetBounds.Height);
+
+            // 전체 시트와 거의 비슷한 큰 경계 후보
+            if (widthRatio >= 0.80 && heightRatio >= 0.80)
+                return true;
+
+            if (areaRatio >= 0.65 && cluster.GeometryCount <= 6)
+                return true;
+
+            return false;
+        }
+
+        private static bool IsLikelyTinyFragment(GeometryCluster cluster)
+        {
+            var b = cluster.TotalBounds;
+            var area = GetArea(cluster);
+
+            // 너무 작은 조각 / 점 / 짧은 선 / 작은 기호 후보
+            if (cluster.GeometryCount <= 2 && (b.Width <= 5 || b.Height <= 5))
+                return true;
+
+            if (cluster.GeometryCount <= 2 && area <= 25)
+                return true;
+
+            if (cluster.GeometryCount == 1 && (b.Width == 0 || b.Height == 0))
+                return true;
+
+            return false;
         }
 
         private static double GetArea(GeometryCluster cluster)
         {
             var b = cluster.TotalBounds;
             return Math.Max(0, b.Width) * Math.Max(0, b.Height);
+        }
+
+        private static string Safe(string? value)
+        {
+            return string.IsNullOrWhiteSpace(value) ? "-" : value;
         }
     }
 }
