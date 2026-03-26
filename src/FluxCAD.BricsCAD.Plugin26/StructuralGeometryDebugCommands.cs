@@ -15,6 +15,141 @@ namespace FluxCAD.BricsCAD.Plugin26
 {
     public class StructuralGeometryDebugCommands
     {
+        [CommandMethod("FLUX_DEBUG_GEOMETRY_VIEW_PACKS")]
+        public void FluxDebugGeometryViewPacks()
+        {
+            var doc = Application.DocumentManager.MdiActiveDocument;
+            var db = doc.Database;
+            var ed = doc.Editor;
+
+            try
+            {
+                var sheetFilePath = db.Filename;
+                if (string.IsNullOrWhiteSpace(sheetFilePath))
+                {
+                    ed.WriteMessage("\n[FluxCAD] 저장된 DWG 파일이 아닙니다.");
+                    return;
+                }
+
+                IEntitySnapshotBuilder snapshotBuilder = new SimpleSheetFileSnapshotBuilder();
+                var entities = snapshotBuilder.Build(sheetFilePath);
+
+                if (entities == null || entities.Count == 0)
+                {
+                    ed.WriteMessage("\n[FluxCAD] snapshot이 비어 있습니다.");
+                    return;
+                }
+
+                var sheetBounds = Bounds2DHelper.FromEntities(entities);
+                var separationResult = BuildStructuralSeparationResult(entities, sheetBounds);
+
+                if (separationResult.GeometryUnits == null || separationResult.GeometryUnits.Count == 0)
+                {
+                    ed.WriteMessage("\n[FluxCAD] Geometry unit이 없습니다.");
+                    return;
+                }
+
+                var packOptions = new GeometryUnitPackOptions
+                {
+                    ExcludeMetadataHeavyUnits = true,
+                    MetadataTextHitThreshold = 2,
+
+                    ExcludeOuterFrameLikeUnits = true,
+                    OuterFrameMarginRatio = 0.03,
+                    OuterFrameSpanRatio = 0.80,
+
+                    ConnectGapOverride = 35.0,
+
+                    // 아래 값들은 override를 넣으면 사실상 지금 테스트에 큰 의미는 적습니다.
+                    ConnectGapScale = 0.35,
+                    MinConnectGap = 8.0,
+                    MaxConnectGap = 80.0,
+                    OverlapTolerance = 1.0,
+
+                    GeometryMemberWeight = 3.0,
+                    UnitMemberWeight = 5.0,
+                    MetadataPenalty = 25.0,
+                    AreaPenaltyScale = 0.0005
+                };
+
+                var analyzer = new GeometryUnitPackAnalyzer();
+                var packResult = analyzer.Build(
+                    separationResult.GeometryUnits,
+                    sheetBounds,
+                    packOptions);
+
+                ed.WriteMessage("\n");
+                ed.WriteMessage(GeometryUnitPackReportFormatter.Format(packResult));
+
+                var bestPack = packResult.Packs.FirstOrDefault();
+                if (bestPack == null)
+                {
+                    ed.WriteMessage("\n[FluxCAD] 추천 pack 이 없습니다.");
+                    return;
+                }
+
+                ed.WriteMessage(
+                    $"\n[BestPack] Index={bestPack.PackIndex}, " +
+                    $"Units={bestPack.Units.Count}, " +
+                    $"Members={bestPack.TotalMemberCount}, " +
+                    $"Geo={bestPack.TotalGeometryMemberCount}, " +
+                    $"Text={bestPack.TotalTextMemberCount}, " +
+                    $"MetaHits={bestPack.MetadataHitCount}, " +
+                    $"Score={bestPack.Score:F2}");
+
+                WriteBestPackSubclusterReports(ed, bestPack);
+            }
+            catch (System.Exception ex)
+            {
+                ed.WriteMessage($"\n[FluxCAD] FLUX_DEBUG_GEOMETRY_VIEW_PACKS failed: {ex}");
+            }
+        }
+
+        private static void WriteBestPackSubclusterReports(
+            Bricscad.EditorInput.Editor ed,
+            GeometryUnitPack bestPack)
+        {
+            if (ed == null || bestPack == null || bestPack.Units.Count == 0)
+                return;
+
+            var options = new GeometryUnitSpatialClusterOptions
+            {
+                EnableSeedFiltering = true,
+
+                BottomExclusionBandRatio = 0.22,
+                OuterBorderMarginRatio = 0.025,
+                LongHorizontalSpanRatio = 0.60,
+                LongVerticalSpanRatio = 0.60,
+                BottomBandLongSpanRatio = 0.18,
+                MaxThinLineThicknessRatio = 0.04
+            };
+
+            var analyzer = new GeometryUnitSpatialClusterAnalyzer();
+
+            ed.WriteMessage("\n");
+            ed.WriteMessage("\n[FluxCAD] ===== BEST PACK SUBCLUSTER REPORT =====");
+
+            foreach (var unit in bestPack.Units
+                         .OrderByDescending(x => x.Composition.GeometryCount)
+                         .ThenByDescending(x => x.MemberCount)
+                         .ThenByDescending(x => x.Bounds.Area)
+                         .ThenBy(x => x.UnitId))
+            {
+                ed.WriteMessage("\n----------------------------------------");
+                ed.WriteMessage(
+                    $"\n[PackUnit] Id={unit.UnitId}, Kind={unit.Kind}, Role={unit.RoleHint}, " +
+                    $"Members={unit.MemberCount}, Geo={unit.Composition.GeometryCount}, " +
+                    $"Text={unit.Composition.TextLikeCount}, Ann={unit.Composition.AnnotationCount}");
+
+                var subclusterResult = analyzer.Build(unit, options);
+                var report = GeometryUnitSpatialClusterReportFormatter.Format(unit, subclusterResult);
+                ed.WriteMessage("\n");
+                ed.WriteMessage(report);
+            }
+
+            ed.WriteMessage("\n[FluxCAD] ===== END OF BEST PACK SUBCLUSTER REPORT =====");
+        }
+
         [CommandMethod("FLUX_DEBUG_GEOMETRY_UNIT_SELECTION")]
         public void FluxDebugGeometryUnitSelection()
         {

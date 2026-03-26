@@ -237,6 +237,27 @@ namespace FluxCAD.SheetAnalysis.Structure.Analysis
                 options.MaxConnectGap);
         }
 
+        private static double EstimateConnectGap_old(
+            IReadOnlyList<SheetEntity> geometrySeeds,
+            GeometryUnitSpatialClusterOptions options)
+        {
+            var diagonals = geometrySeeds
+                .Select(x => GetDiagonal(x.Bounds))
+                .Where(x => x > 0)
+                .OrderBy(x => x)
+                .ToList();
+
+            if (diagonals.Count == 0)
+                return options.MinConnectGap;
+
+            var median = GetMedian(diagonals);
+
+            return Clamp(
+                median * options.ConnectGapScale,
+                options.MinConnectGap,
+                options.MaxConnectGap);
+        }
+
         private static bool IsFormLineCandidate(
             SheetEntity member,
             Bounds2D targetBounds,
