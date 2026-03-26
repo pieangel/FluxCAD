@@ -158,6 +158,106 @@ namespace FluxCAD.SheetAnalysis.Structure.Builders
 
             refresher.RefreshAll(model.Units);
 
+            var looseRefiner = new StructuralLooseRemainderRefiner(
+                members => PrimitiveCompositionProfile.FromEntities(members));
+
+            looseRefiner.Refine(model.Units);
+
+            var crossLooseMerger = new StructuralCrossLooseMerger();
+            crossLooseMerger.Merge(model.Units);
+
+            model.Units.RemoveAll(x =>
+                x.Kind == StructuralUnitKind.LoosePrimitiveGroup &&
+                x.Members.Count == 0);
+
+            refresher.RefreshAll(model.Units);
+
+            foreach (var unit in model.Units)
+            {
+                if (unit.Kind == StructuralUnitKind.SheetRoot)
+                    continue;
+
+                var preservedReasons = unit.Reasons
+                    .Where(x => !string.IsNullOrWhiteSpace(x))
+                    .Distinct(StringComparer.OrdinalIgnoreCase)
+                    .ToList();
+
+                var groupingReason = GetGroupingReason(unit.Kind);
+
+                unit.RoleHint = _roleClassifier.Classify(unit);
+
+                foreach (var reason in preservedReasons)
+                {
+                    if (!unit.Reasons.Any(x => string.Equals(x, reason, StringComparison.OrdinalIgnoreCase)))
+                    {
+                        unit.Reasons.Add(reason);
+                    }
+                }
+
+                if (!string.IsNullOrWhiteSpace(groupingReason) &&
+                    !unit.Reasons.Any(x => string.Equals(x, groupingReason, StringComparison.OrdinalIgnoreCase)))
+                {
+                    unit.Reasons.Add(groupingReason);
+                }
+            }
+        }
+
+        private void PostProcessUnits_old(SheetStructuralModel model)
+        {
+            var resolver = new StructuralOwnershipResolver();
+            resolver.ResolveInPlace(model.Units);
+
+            model.Units.RemoveAll(x =>
+                x.Kind == StructuralUnitKind.LoosePrimitiveGroup &&
+                x.Members.Count == 0);
+
+            var refresher = new StructuralUnitMemberRefresher(
+                members => PrimitiveCompositionProfile.FromEntities(members));
+
+            refresher.RefreshAll(model.Units);
+
+            var looseRefiner = new StructuralLooseRemainderRefiner(
+                members => PrimitiveCompositionProfile.FromEntities(members));
+
+            looseRefiner.Refine(model.Units);
+
+            model.Units.RemoveAll(x =>
+                x.Kind == StructuralUnitKind.LoosePrimitiveGroup &&
+                x.Members.Count == 0);
+
+            refresher.RefreshAll(model.Units);
+
+            foreach (var unit in model.Units)
+            {
+                if (unit.Kind == StructuralUnitKind.SheetRoot)
+                    continue;
+
+                var groupingReason = GetGroupingReason(unit.Kind);
+
+                unit.RoleHint = _roleClassifier.Classify(unit);
+
+                if (!string.IsNullOrWhiteSpace(groupingReason) &&
+                    !unit.Reasons.Contains(groupingReason))
+                {
+                    unit.Reasons.Add(groupingReason);
+                }
+            }
+        }
+
+        private void PostProcessUnits_old2(SheetStructuralModel model)
+        {
+            var resolver = new StructuralOwnershipResolver();
+            resolver.ResolveInPlace(model.Units);
+
+            model.Units.RemoveAll(x =>
+                x.Kind == StructuralUnitKind.LoosePrimitiveGroup &&
+                x.Members.Count == 0);
+
+            var refresher = new StructuralUnitMemberRefresher(
+                members => PrimitiveCompositionProfile.FromEntities(members));
+
+            refresher.RefreshAll(model.Units);
+
             foreach (var unit in model.Units)
             {
                 if (unit.Kind == StructuralUnitKind.SheetRoot)

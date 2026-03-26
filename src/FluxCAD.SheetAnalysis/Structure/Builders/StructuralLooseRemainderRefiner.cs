@@ -2,12 +2,17 @@
 using System.Collections.Generic;
 using System.Linq;
 using System.Reflection;
+using System.Text.RegularExpressions;
 using FluxCAD.SheetAnalysis.Structure.Models;
 
 namespace FluxCAD.SheetAnalysis.Structure.Builders
 {
     public sealed class StructuralLooseRemainderRefiner
     {
+        private static readonly Regex QtyLikeExpressionRegex = new(
+            @"^\s*\d+\s*(?:[*xX×]\s*\d+\s*)?(?:SET|SETS|EA|EACH|PCS|PC)\s*$|^\s*\d+\s*(?:[*xX×])\s*\d+\s*(?:SET|SETS|EA|EACH|PCS|PC)\s*$",
+            RegexOptions.IgnoreCase | RegexOptions.CultureInvariant | RegexOptions.Compiled);
+
         private readonly Func<IReadOnlyList<SheetEntity>, PrimitiveCompositionProfile> _compositionBuilder;
 
         public StructuralLooseRemainderRefiner(
@@ -63,7 +68,7 @@ namespace FluxCAD.SheetAnalysis.Structure.Builders
                     continue;
 
                 target.Members.Add(text);
-                target.Reasons.Add("absorbed nearby leader-attached note");
+                AppendReasonUnique(target.Reasons, "absorbed nearby leader-attached note");
                 consumed.Add(text);
             }
 
@@ -93,7 +98,7 @@ namespace FluxCAD.SheetAnalysis.Structure.Builders
                     "refined-badge",
                     badgeMembers);
 
-                badgeUnit.Reasons.Add("refined as identifier badge");
+                AppendReasonUnique(badgeUnit.Reasons, "refined as identifier badge");
 
                 additions.Add(badgeUnit);
 
@@ -102,12 +107,34 @@ namespace FluxCAD.SheetAnalysis.Structure.Builders
                 remainingTexts.Remove(match);
             }
 
-            // 3) 남은 자유 텍스트는 note cluster로 다시 분리
+            // 3) 남은 자유 텍스트 중 qty-like를 먼저 분리
             var freeTexts = members
                 .Where(x => x.IsTextLike && !consumed.Contains(x))
                 .ToList();
 
-            var textClusters = ClusterFreeTexts(freeTexts);
+            var qtyLikeTexts = freeTexts
+                .Where(LooksLikeQtyText)
+                .ToList();
+
+            foreach (var qtyText in qtyLikeTexts)
+            {
+                var qtyUnit = CreateDerivedLooseUnit(
+                    $"loose-{nextLooseIndex++}",
+                    loose.ParentUnitId,
+                    "refined-qty-note",
+                    new List<SheetEntity> { qtyText });
+
+                AppendReasonUnique(qtyUnit.Reasons, "refined as qty-like note");
+                additions.Add(qtyUnit);
+                consumed.Add(qtyText);
+            }
+
+            // 4) 남은 문장형 자유 텍스트만 note cluster로 분리
+            var noteTexts = members
+                .Where(x => x.IsTextLike && !consumed.Contains(x))
+                .ToList();
+
+            var textClusters = ClusterFreeTexts(noteTexts);
 
             foreach (var cluster in textClusters)
             {
@@ -120,7 +147,7 @@ namespace FluxCAD.SheetAnalysis.Structure.Builders
                     "refined-note",
                     cluster);
 
-                noteUnit.Reasons.Add("refined as free note cluster");
+                AppendReasonUnique(noteUnit.Reasons, "refined as free note cluster");
 
                 additions.Add(noteUnit);
 
@@ -180,16 +207,50 @@ namespace FluxCAD.SheetAnalysis.Structure.Builders
 
         private static bool LooksLikeBadgeText(SheetEntity text)
         {
-            var s = ReadText(text);
+            var s = NormalizeText(ReadText(text));
             if (string.IsNullOrWhiteSpace(s))
                 return false;
-
-            s = s.Trim();
 
             if (s.Length > 4)
                 return false;
 
-            return s.All(ch => char.IsLetterOrDigit(ch));
+            return s.All(char.IsLetterOrDigit);
+        }
+
+        private static bool LooksLikeQtyText(SheetEntity text)
+        {
+            var s = NormalizeText(ReadText(text));
+            if (string.IsNullOrWhiteSpace(s))
+                return false;
+
+            if (s.Length > 32)
+                return false;
+
+            if (s.Any(IsKoreanCharacter))
+                return false;
+
+            if (s.Contains('.') || s.Contains(',') || s.Contains(':') || s.Contains(';'))
+                return false;
+
+            return QtyLikeExpressionRegex.IsMatch(s);
+        }
+
+        private static string NormalizeText(string? value)
+        {
+            if (string.IsNullOrWhiteSpace(value))
+                return string.Empty;
+
+            return value
+                .Replace("\r", " ")
+                .Replace("\n", " ")
+                .Trim();
+        }
+
+        private static bool IsKoreanCharacter(char ch)
+        {
+            return (ch >= 0x1100 && ch <= 0x11FF) ||
+                   (ch >= 0x3130 && ch <= 0x318F) ||
+                   (ch >= 0xAC00 && ch <= 0xD7AF);
         }
 
         private static bool IsTextAttachedToBadge(SheetEntity text, SheetEntity geometry)
@@ -397,6 +458,17 @@ namespace FluxCAD.SheetAnalysis.Structure.Builders
             }
 
             return string.Empty;
+        }
+
+        private static void AppendReasonUnique(ICollection<string> reasons, string reason)
+        {
+            if (string.IsNullOrWhiteSpace(reason))
+                return;
+
+            if (reasons.Any(x => string.Equals(x, reason, StringComparison.OrdinalIgnoreCase)))
+                return;
+
+            reasons.Add(reason);
         }
 
         private static bool IsPointInsideInflatedBounds(Point2D p, Bounds2D b, double margin)
