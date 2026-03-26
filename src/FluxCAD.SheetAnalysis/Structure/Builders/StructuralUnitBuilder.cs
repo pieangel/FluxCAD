@@ -10,21 +10,10 @@ namespace FluxCAD.SheetAnalysis.Structure.Builders
     {
         private readonly StructuralRoleClassifier _roleClassifier = new();
 
-
         public SheetStructuralModel Build(
-    IReadOnlyList<SheetEntity> entities,
-    Bounds2D sheetBounds,
-    StructuralBuildOptions? options = null)
-        {
-            var model = BuildRaw(entities, sheetBounds, options);
-            RunPostProcessForDebug(model);
-            return model;
-        }
-
-        public SheetStructuralModel Build_old1(
-    IReadOnlyList<SheetEntity> entities,
-    Bounds2D sheetBounds,
-    StructuralBuildOptions? options = null)
+            IReadOnlyList<SheetEntity> entities,
+            Bounds2D sheetBounds,
+            StructuralBuildOptions? options = null)
         {
             var model = BuildRaw(entities, sheetBounds, options);
             RunPostProcessForDebug(model);
@@ -32,46 +21,6 @@ namespace FluxCAD.SheetAnalysis.Structure.Builders
         }
 
         public SheetStructuralModel BuildRaw(
-    IReadOnlyList<SheetEntity> entities,
-    Bounds2D sheetBounds,
-    StructuralBuildOptions? options = null)
-        {
-            options ??= new StructuralBuildOptions();
-
-            var filtered = entities
-                .Where(x => !options.IgnoreInvisibleEntities || x.IsVisible)
-                .ToList();
-
-            var model = new SheetStructuralModel
-            {
-                SheetBounds = sheetBounds
-            };
-
-            model.RootUnit.Bounds = sheetBounds;
-            model.RootUnit.RepresentativePoint = sheetBounds.Center;
-            model.RootUnit.Composition = PrimitiveCompositionProfile.FromEntities(filtered);
-            model.RootUnit.RoleHint = StructuralRoleHint.MixedCarrier;
-            model.RootUnit.Reasons.Clear();
-            model.RootUnit.Reasons.Add("root unit for entire sheet");
-
-            model.Units.Add(model.RootUnit);
-
-            BuildBranchUnits(filtered, model, options);
-            BuildLoosePrimitiveUnits(filtered, model, options);
-            BuildBlockFamilyUnits(filtered, model, options);
-
-            return model;
-        }
-
-        public void RunPostProcessForDebug(SheetStructuralModel model)
-        {
-            if (model == null)
-                throw new ArgumentNullException(nameof(model));
-
-            PostProcessUnits(model);
-        }
-
-        public SheetStructuralModel BuildRaw_old(
             IReadOnlyList<SheetEntity> entities,
             Bounds2D sheetBounds,
             StructuralBuildOptions? options = null)
@@ -94,6 +43,15 @@ namespace FluxCAD.SheetAnalysis.Structure.Builders
             model.RootUnit.Reasons.Clear();
             model.RootUnit.Reasons.Add("root unit for entire sheet");
 
+            // root는 synthetic unit이므로 Origin은 굳이 강제 저장하지 않아도 됩니다.
+            // 필요하면 아래처럼 넣을 수 있습니다.
+            // CaptureOriginSnapshot(
+            //     model.RootUnit,
+            //     filtered,
+            //     isDerivedUnit: false,
+            //     derivedFromUnitId: null,
+            //     derivedStage: "synthetic-root");
+
             model.Units.Add(model.RootUnit);
 
             BuildBranchUnits(filtered, model, options);
@@ -103,45 +61,12 @@ namespace FluxCAD.SheetAnalysis.Structure.Builders
             return model;
         }
 
-        public void RunPostProcessForDebug_old(SheetStructuralModel model)
+        public void RunPostProcessForDebug(SheetStructuralModel model)
         {
             if (model == null)
                 throw new ArgumentNullException(nameof(model));
 
             PostProcessUnits(model);
-        }
-
-        public SheetStructuralModel Build_old2(
-    IReadOnlyList<SheetEntity> entities,
-    Bounds2D sheetBounds,
-    StructuralBuildOptions? options = null)
-        {
-            options ??= new StructuralBuildOptions();
-
-            var filtered = entities
-                .Where(x => !options.IgnoreInvisibleEntities || x.IsVisible)
-                .ToList();
-
-            var model = new SheetStructuralModel
-            {
-                SheetBounds = sheetBounds
-            };
-
-            model.RootUnit.Bounds = sheetBounds;
-            model.RootUnit.RepresentativePoint = sheetBounds.Center;
-            model.RootUnit.Composition = PrimitiveCompositionProfile.FromEntities(filtered);
-            model.RootUnit.RoleHint = StructuralRoleHint.MixedCarrier;
-            model.RootUnit.Reasons.Add("root unit for entire sheet");
-
-            model.Units.Add(model.RootUnit);
-
-            BuildBranchUnits(filtered, model, options);
-            BuildLoosePrimitiveUnits(filtered, model, options);
-            BuildBlockFamilyUnits(filtered, model, options);
-
-            PostProcessUnits(model);
-
-            return model;
         }
 
         private void PostProcessUnits(SheetStructuralModel model)
@@ -196,80 +121,6 @@ namespace FluxCAD.SheetAnalysis.Structure.Builders
 
                 if (!string.IsNullOrWhiteSpace(groupingReason) &&
                     !unit.Reasons.Any(x => string.Equals(x, groupingReason, StringComparison.OrdinalIgnoreCase)))
-                {
-                    unit.Reasons.Add(groupingReason);
-                }
-            }
-        }
-
-        private void PostProcessUnits_old(SheetStructuralModel model)
-        {
-            var resolver = new StructuralOwnershipResolver();
-            resolver.ResolveInPlace(model.Units);
-
-            model.Units.RemoveAll(x =>
-                x.Kind == StructuralUnitKind.LoosePrimitiveGroup &&
-                x.Members.Count == 0);
-
-            var refresher = new StructuralUnitMemberRefresher(
-                members => PrimitiveCompositionProfile.FromEntities(members));
-
-            refresher.RefreshAll(model.Units);
-
-            var looseRefiner = new StructuralLooseRemainderRefiner(
-                members => PrimitiveCompositionProfile.FromEntities(members));
-
-            looseRefiner.Refine(model.Units);
-
-            model.Units.RemoveAll(x =>
-                x.Kind == StructuralUnitKind.LoosePrimitiveGroup &&
-                x.Members.Count == 0);
-
-            refresher.RefreshAll(model.Units);
-
-            foreach (var unit in model.Units)
-            {
-                if (unit.Kind == StructuralUnitKind.SheetRoot)
-                    continue;
-
-                var groupingReason = GetGroupingReason(unit.Kind);
-
-                unit.RoleHint = _roleClassifier.Classify(unit);
-
-                if (!string.IsNullOrWhiteSpace(groupingReason) &&
-                    !unit.Reasons.Contains(groupingReason))
-                {
-                    unit.Reasons.Add(groupingReason);
-                }
-            }
-        }
-
-        private void PostProcessUnits_old2(SheetStructuralModel model)
-        {
-            var resolver = new StructuralOwnershipResolver();
-            resolver.ResolveInPlace(model.Units);
-
-            model.Units.RemoveAll(x =>
-                x.Kind == StructuralUnitKind.LoosePrimitiveGroup &&
-                x.Members.Count == 0);
-
-            var refresher = new StructuralUnitMemberRefresher(
-                members => PrimitiveCompositionProfile.FromEntities(members));
-
-            refresher.RefreshAll(model.Units);
-
-            foreach (var unit in model.Units)
-            {
-                if (unit.Kind == StructuralUnitKind.SheetRoot)
-                    continue;
-
-                unit.Reasons.Clear();
-
-                var groupingReason = GetGroupingReason(unit.Kind);
-
-                unit.RoleHint = _roleClassifier.Classify(unit);
-
-                if (!string.IsNullOrWhiteSpace(groupingReason))
                 {
                     unit.Reasons.Add(groupingReason);
                 }
@@ -399,7 +250,7 @@ namespace FluxCAD.SheetAnalysis.Structure.Builders
             }
         }
 
-        private static StructuralUnit CreateUnit_old(
+        private static StructuralUnit CreateUnit(
             string unitId,
             StructuralUnitKind kind,
             string key,
@@ -414,55 +265,21 @@ namespace FluxCAD.SheetAnalysis.Structure.Builders
                 Kind = kind,
                 GroupKey = key,
                 Bounds = bounds,
-                RepresentativePoint = bounds.Center,
+                RepresentativePoint = SelectRepresentativePoint(members, bounds),
                 Depth = commonPath.Count,
                 CommonBlockPath = commonPath,
-                SourceBlockName = members
-                    .Select(GetLeafBlockName)
-                    .Where(x => !string.IsNullOrWhiteSpace(x))
-                    .GroupBy(x => x)
-                    .OrderByDescending(g => g.Count())
-                    .Select(g => g.Key)
-                    .FirstOrDefault(),
+                SourceBlockName = SelectSourceBlockName(members),
                 Composition = PrimitiveCompositionProfile.FromEntities(members)
             };
 
             unit.Members.AddRange(members);
 
-            return unit;
-        }
-
-        private static StructuralUnit CreateUnit(
-    string unitId,
-    StructuralUnitKind kind,
-    string key,
-    List<SheetEntity> members)
-        {
-            var bounds = Bounds2DHelper.FromEntities(members);
-            var commonPath = FindCommonBlockPath(members);
-
-            var unit = new StructuralUnit
-            {
-                UnitId = unitId,
-                Kind = kind,
-                GroupKey = key,
-                Bounds = bounds,
-                RepresentativePoint = bounds.Center,
-                Depth = commonPath.Count,
-                CommonBlockPath = commonPath,
-                SourceBlockName = members
-                    .Select(GetLeafBlockName)
-                    .Where(x => !string.IsNullOrWhiteSpace(x))
-                    .GroupBy(x => x)
-                    .OrderByDescending(g => g.Count())
-                    .Select(g => g.Key)
-                    .FirstOrDefault(),
-                Composition = PrimitiveCompositionProfile.FromEntities(members)
-            };
-
-            unit.Members.AddRange(members);
-
-            CaptureOriginSnapshot(unit, members, isDerivedUnit: false, derivedFromUnitId: null, derivedStage: null);
+            CaptureOriginSnapshot(
+                unit,
+                members,
+                isDerivedUnit: false,
+                derivedFromUnitId: null,
+                derivedStage: null);
 
             return unit;
         }
@@ -480,28 +297,30 @@ namespace FluxCAD.SheetAnalysis.Structure.Builders
             unit.Origin.OriginalMemberCount = members.Count;
             unit.Origin.OriginalBounds = bounds;
             unit.Origin.OriginalComposition = PrimitiveCompositionProfile.FromEntities(members);
+
             unit.Origin.OriginalGroupKey = unit.GroupKey;
-            unit.Origin.OriginalSourceBlockName = members
-                .Select(GetLeafBlockName)
-                .Where(x => !string.IsNullOrWhiteSpace(x))
-                .GroupBy(x => x)
-                .OrderByDescending(g => g.Count())
-                .Select(g => g.Key)
-                .FirstOrDefault();
+            unit.Origin.OriginalSourceBlockName = SelectSourceBlockName(members);
             unit.Origin.OriginalDepth = commonPath.Count;
             unit.Origin.OriginalCommonBlockPath = commonPath;
 
             unit.Origin.IsDerivedUnit = isDerivedUnit;
             unit.Origin.DerivedFromUnitId = derivedFromUnitId;
             unit.Origin.DerivedStage = derivedStage;
+        }
 
-            // 아래 4개는 지금은 null 상태로 두고,
-            // 다음 단계에서 snapshot builder가 채워주게 연결합니다.
-            // unit.Origin.SourceNodeId = ...
-            // unit.Origin.SourceDirectChildCount = ...
-            // unit.Origin.SourceDirectGeometryChildCount = ...
-            // unit.Origin.SourceDirectTextChildCount = ...
-            // unit.Origin.SourceDescendantLeafCount = ...
+        private static Point2D SelectRepresentativePoint(
+            IReadOnlyList<SheetEntity> members,
+            Bounds2D bounds)
+        {
+            var textLike = members.FirstOrDefault(x => x.IsTextLike);
+            if (textLike != null)
+                return textLike.Anchor;
+
+            var dimLike = members.FirstOrDefault(x => x.IsDimensionLike);
+            if (dimLike != null)
+                return dimLike.Anchor;
+
+            return bounds.Center;
         }
 
         private static string GetExactBlockPathKey(SheetEntity entity)
@@ -521,6 +340,17 @@ namespace FluxCAD.SheetAnalysis.Structure.Builders
             return "loose-unknown";
         }
 
+        private static string? SelectSourceBlockName(IReadOnlyList<SheetEntity> members)
+        {
+            return members
+                .Select(GetLeafBlockName)
+                .Where(x => !string.IsNullOrWhiteSpace(x))
+                .GroupBy(x => x)
+                .OrderByDescending(g => g.Count())
+                .Select(g => g.Key)
+                .FirstOrDefault();
+        }
+
         private static string? GetLeafBlockName(SheetEntity entity)
         {
             if (!string.IsNullOrWhiteSpace(entity.BlockName))
@@ -532,7 +362,7 @@ namespace FluxCAD.SheetAnalysis.Structure.Builders
             return null;
         }
 
-        private static IReadOnlyList<string> FindCommonBlockPath(List<SheetEntity> members)
+        private static IReadOnlyList<string> FindCommonBlockPath(IReadOnlyList<SheetEntity> members)
         {
             if (members.Count == 0)
                 return Array.Empty<string>();

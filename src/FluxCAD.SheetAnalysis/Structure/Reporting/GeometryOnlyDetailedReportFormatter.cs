@@ -28,35 +28,57 @@ namespace FluxCAD.SheetAnalysis.Structure.Reporting
             {
                 var unit = ordered[i];
                 var b = unit.Bounds;
-
-                sb.AppendLine(
-                    $"  Members={unit.Members.Count} (Orig={unit.Origin.OriginalMemberCount}, Delta={unit.MemberDelta}), " +
-                    $"GeometryLike={GetGeometryLikeCount(unit)}, TextLike={GetTextLikeCount(unit)}, " +
-                    $"DimensionLike={GetDimensionLikeCount(unit)}, BlockRefLike={GetBlockRefCount(unit)}");
-
-                if (unit.Origin.IsDerivedUnit)
-                {
-                    sb.AppendLine(
-                        $"  DerivedFrom={Safe(unit.Origin.DerivedFromUnitId)}, Stage={Safe(unit.Origin.DerivedStage)}");
-                }
+                var origin = unit.Origin;
 
                 sb.AppendLine(
                     $"[Geometry {i + 1}] UnitId={Safe(unit.UnitId)}, Kind={unit.Kind}, RoleHint={unit.RoleHint}");
 
                 sb.AppendLine(
-                    $"  GroupKey={Safe(unit.GroupKey)}, SourceBlock={Safe(unit.SourceBlockName)}, Depth={unit.Depth}");
+                    $"  Current: Members={unit.Members.Count} (Orig={origin.OriginalMemberCount}, Delta={unit.MemberDelta}), " +
+                    $"GeometryLike={GetGeometryLikeCount(unit)}, TextLike={GetTextLikeCount(unit)}, " +
+                    $"DimensionLike={GetDimensionLikeCount(unit)}, BlockRefLike={GetBlockRefCount(unit)}");
 
                 sb.AppendLine(
-                    $"  Bounds=({Fmt(b.MinX)}, {Fmt(b.MinY)}) - ({Fmt(b.MaxX)}, {Fmt(b.MaxY)})");
+                    $"  CurrentGroup: GroupKey={Safe(unit.GroupKey)}, SourceBlock={Safe(unit.SourceBlockName)}, Depth={SafeValue(unit.Depth)}");
 
                 sb.AppendLine(
-                    $"  Width={Fmt(GetWidth(b))}, Height={Fmt(GetHeight(b))}, Center=({Fmt(b.Center.X)}, {Fmt(b.Center.Y)})");
+                    $"  CurrentBounds=({Fmt(b.MinX)}, {Fmt(b.MinY)}) - ({Fmt(b.MaxX)}, {Fmt(b.MaxY)})");
+
+                sb.AppendLine(
+                    $"  Width={Fmt(b.Width)}, Height={Fmt(b.Height)}, Center=({Fmt(b.Center.X)}, {Fmt(b.Center.Y)})");
 
                 sb.AppendLine(
                     $"  RepPoint=({Fmt(unit.RepresentativePoint.X)}, {Fmt(unit.RepresentativePoint.Y)})");
 
                 sb.AppendLine(
-                    $"  Members={unit.Members.Count}, GeometryLike={GetGeometryLikeCount(unit)}, TextLike={GetTextLikeCount(unit)}, DimensionLike={GetDimensionLikeCount(unit)}, BlockRefLike={GetBlockRefCount(unit)}");
+                    $"  Origin: Members={origin.OriginalMemberCount}, Composition={FmtComposition(origin.OriginalComposition)}, " +
+                    $"GroupKey={Safe(origin.OriginalGroupKey)}, SourceBlock={Safe(origin.OriginalSourceBlockName)}, Depth={origin.OriginalDepth}"); var ob = origin.OriginalBounds;
+                sb.AppendLine(
+                    $"  OriginBounds=({Fmt(ob.MinX)}, {Fmt(ob.MinY)}) - ({Fmt(ob.MaxX)}, {Fmt(ob.MaxY)})");
+
+                sb.AppendLine(
+                    $"  OriginPath: CommonBlockPath={FmtPath(origin.OriginalCommonBlockPath)}, SourceNodeId={Safe(origin.SourceNodeId)}");
+                sb.AppendLine(
+                    $"  Struct: DirectChild={SafeValue(origin.SourceDirectChildCount)}, " +
+                    $"DirectGeo={SafeValue(origin.SourceDirectGeometryChildCount)}, " +
+                    $"DirectText={SafeValue(origin.SourceDirectTextChildCount)}, " +
+                    $"DescLeaf={SafeValue(origin.SourceDescendantLeafCount)}");
+
+                sb.AppendLine(
+                    $"  Provenance: IsDerived={origin.IsDerivedUnit}, " +
+                    $"DerivedFrom={Safe(origin.DerivedFromUnitId)}, Stage={Safe(origin.DerivedStage)}, " +
+                    $"ConsumedBy={Safe(origin.ConsumedByUnitId)}");
+
+                if (origin.AbsorbedUnitIds != null && origin.AbsorbedUnitIds.Count > 0)
+                {
+                    var absorbed = origin.AbsorbedUnitIds
+                        .Where(x => !string.IsNullOrWhiteSpace(x))
+                        .Distinct(StringComparer.OrdinalIgnoreCase)
+                        .ToList();
+
+                    if (absorbed.Count > 0)
+                        sb.AppendLine($"  Absorbed={string.Join(", ", absorbed)}");
+                }
 
                 if (unit.Reasons != null && unit.Reasons.Count > 0)
                 {
@@ -73,6 +95,25 @@ namespace FluxCAD.SheetAnalysis.Structure.Reporting
             return sb.ToString();
         }
 
+        private static string FmtComposition(PrimitiveCompositionProfile? value)
+        {
+            return value?.ToString() ?? "(null)";
+        }
+
+        private static string FmtPath(IReadOnlyList<string>? path)
+        {
+            if (path == null || path.Count == 0)
+                return "(empty)";
+
+            var items = path
+                .Where(x => !string.IsNullOrWhiteSpace(x))
+                .ToList();
+
+            if (items.Count == 0)
+                return "(empty)";
+
+            return string.Join(" > ", items);
+        }
         private static int GetGeometryLikeCount(StructuralUnit unit)
         {
             return unit.Members.Count(x => x.IsGeometryLike);
@@ -93,20 +134,9 @@ namespace FluxCAD.SheetAnalysis.Structure.Reporting
             return unit.Members.Count(x => x.IsBlockReference);
         }
 
-        private static double GetWidth(Bounds2D b)
-        {
-            return b.MaxX - b.MinX;
-        }
-
-        private static double GetHeight(Bounds2D b)
-        {
-            return b.MaxY - b.MinY;
-        }
-
         private static double GetArea(StructuralUnit unit)
         {
-            var b = unit.Bounds;
-            return Math.Max(0, GetWidth(b)) * Math.Max(0, GetHeight(b));
+            return Math.Max(0, unit.Bounds.Area);
         }
 
         private static string Fmt(double value)
@@ -117,6 +147,11 @@ namespace FluxCAD.SheetAnalysis.Structure.Reporting
         private static string Safe(string? value)
         {
             return string.IsNullOrWhiteSpace(value) ? "(null)" : value;
+        }
+
+        private static string SafeValue(object? value)
+        {
+            return value?.ToString() ?? "-";
         }
     }
 }

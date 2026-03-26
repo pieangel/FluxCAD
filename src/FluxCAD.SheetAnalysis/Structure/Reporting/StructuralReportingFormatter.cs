@@ -27,6 +27,11 @@ namespace FluxCAD.SheetAnalysis.Structure.Reporting
             return sb.ToString();
         }
 
+        private static string FmtNullable(int? value)
+        {
+            return value.HasValue ? value.Value.ToString() : "-";
+        }
+
         private static void AppendUnit(StringBuilder sb, StructuralUnit unit)
         {
             sb.AppendLine($"[Unit] Id={unit.UnitId} Kind={unit.Kind} Role={unit.RoleHint} Members={unit.MemberCount} Depth={unit.Depth}");

@@ -67,6 +67,13 @@ namespace FluxCAD.SheetAnalysis.Structure.Builders
                     continue;
 
                 geometryUnit.Members.AddRange(bestTextUnit.Members);
+                // provenance 기록
+                if (!string.IsNullOrWhiteSpace(bestTextUnit.UnitId))
+                {
+                    geometryUnit.Origin.AbsorbedUnitIds.Add(bestTextUnit.UnitId);
+                }
+                bestTextUnit.Origin.ConsumedByUnitId = geometryUnit.UnitId;
+
                 geometryUnit.GroupKey = "merged-badge";
                 AppendReasonUnique(geometryUnit.Reasons, "merged nearby badge text unit");
 
@@ -119,6 +126,13 @@ namespace FluxCAD.SheetAnalysis.Structure.Builders
                     continue;
 
                 bestTarget.Members.Add(text);
+                // provenance 기록
+                if (!string.IsNullOrWhiteSpace(textUnit.UnitId))
+                {
+                    bestTarget.Origin.AbsorbedUnitIds.Add(textUnit.UnitId);
+                }
+                textUnit.Origin.ConsumedByUnitId = bestTarget.UnitId;
+
                 AppendReasonUnique(bestTarget.Reasons, "absorbed nearby annotation text loose");
 
                 textUnit.GroupKey = "merged-into-annotation";
