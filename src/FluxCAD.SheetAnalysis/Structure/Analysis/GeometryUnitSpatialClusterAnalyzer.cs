@@ -1,6 +1,7 @@
 ﻿using System;
 using System.Collections.Generic;
 using System.Linq;
+using FluxCAD.SheetAnalysis;                    // 추가
 using FluxCAD.SheetAnalysis.Structure.Models;
 
 namespace FluxCAD.SheetAnalysis.Structure.Analysis
@@ -275,6 +276,9 @@ namespace FluxCAD.SheetAnalysis.Structure.Analysis
 
         private static Point2D GetRepresentativePoint(SheetEntity member)
         {
+            if (member.IsTextLike || member.IsDimensionLike)
+                return member.Anchor;
+
             return member.Bounds.Center;
         }
 

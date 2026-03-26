@@ -1,10 +1,13 @@
 ﻿using Bricscad.ApplicationServices;
 using FluxCAD.SheetAnalysis;
+using FluxCAD.SheetAnalysis.Structure.Analysis;
 using FluxCAD.SheetAnalysis.Structure.Builders;
 using FluxCAD.SheetAnalysis.Structure.Models;
 using FluxCAD.SheetAnalysis.Structure.Reporting;
 using FluxCAD.SheetAnalysis.Structure.Results;
 using System;
+using System.Collections.Generic;
+using System.Linq;
 using Teigha.Runtime;
 
 namespace FluxCAD.BricsCAD.Plugin26
@@ -49,6 +52,79 @@ namespace FluxCAD.BricsCAD.Plugin26
             }
         }
 
+        [CommandMethod("FLUX_DEBUG_GEOMETRY_SUBCLUSTERS")]
+        public void FluxDebugGeometrySubclusters()
+        {
+            var doc = Application.DocumentManager.MdiActiveDocument;
+            var db = doc.Database;
+            var ed = doc.Editor;
+
+            try
+            {
+                var sheetFilePath = db.Filename;
+                if (string.IsNullOrWhiteSpace(sheetFilePath))
+                {
+                    ed.WriteMessage("\n[FluxCAD] 저장된 DWG 파일이 아닙니다.");
+                    return;
+                }
+
+                IEntitySnapshotBuilder snapshotBuilder = new SimpleSheetFileSnapshotBuilder();
+                var entities = snapshotBuilder.Build(sheetFilePath);
+
+                if (entities == null || entities.Count == 0)
+                {
+                    ed.WriteMessage("\n[FluxCAD] snapshot이 비어 있습니다.");
+                    return;
+                }
+
+                var sheetBounds = Bounds2DHelper.FromEntities(entities);
+                var separationResult = BuildStructuralSeparationResult(entities, sheetBounds);
+
+                if (separationResult.GeometryUnits == null || separationResult.GeometryUnits.Count == 0)
+                {
+                    ed.WriteMessage("\n[FluxCAD] Geometry unit이 없습니다.");
+                    return;
+                }
+
+                var targetUnit = separationResult.GeometryUnits
+                    .OrderByDescending(x => x.MemberCount)
+                    .ThenByDescending(CountGeometrySeedMembers)
+                    .ThenByDescending(x => x.Bounds.Area)
+                    .FirstOrDefault();
+
+                if (targetUnit == null)
+                {
+                    ed.WriteMessage("\n[FluxCAD] 분석할 geometry unit을 찾지 못했습니다.");
+                    return;
+                }
+
+                var options = new GeometryUnitSpatialClusterOptions();
+                var analyzer = new GeometryUnitSpatialClusterAnalyzer();
+                var clusterResult = analyzer.Build(targetUnit, options);
+
+                var report = GeometryUnitSpatialClusterReportFormatter.Format(targetUnit, clusterResult);
+
+                ed.WriteMessage("\n");
+                ed.WriteMessage(report);
+            }
+            catch (System.Exception ex)
+            {
+                ed.WriteMessage($"\n[FluxCAD] FLUX_DEBUG_GEOMETRY_SUBCLUSTERS failed: {ex}");
+            }
+        }
+
+        private static int CountGeometrySeedMembers(StructuralUnit unit)
+        {
+            if (unit?.Members == null)
+                return 0;
+
+            return unit.Members.Count(x =>
+                x != null &&
+                !x.IsBlockReference &&
+                x.IsGeometryLike &&
+                !x.IsTextLike);
+        }
+
         private static void WriteGeometryOnlyReport(
             Bricscad.EditorInput.Editor ed,
             GeometryViewInput input)
@@ -89,8 +165,8 @@ namespace FluxCAD.BricsCAD.Plugin26
         }
 
         private static StructuralSeparationResult BuildStructuralSeparationResult(
-    IReadOnlyList<SheetEntity> entities,
-    Bounds2D sheetBounds)
+            IReadOnlyList<SheetEntity> entities,
+            Bounds2D sheetBounds)
         {
             if (entities == null)
                 throw new ArgumentNullException(nameof(entities));
@@ -166,8 +242,6 @@ namespace FluxCAD.BricsCAD.Plugin26
             if (string.Equals(groupKey, "loose-geometry", StringComparison.OrdinalIgnoreCase))
                 return true;
 
-            // 보수적 geometry 판정:
-            // 텍스트/치수 없이 geometry 비중이 높은 unit만 geometry로 봅니다.
             int geometryCount = unit.Members.Count(x => x.IsGeometryLike && !x.IsTextLike && !x.IsDimensionLike);
             int textCount = unit.Members.Count(x => x.IsTextLike);
             int dimCount = unit.Members.Count(x => x.IsDimensionLike);
@@ -298,16 +372,6 @@ namespace FluxCAD.BricsCAD.Plugin26
                 return false;
 
             return unit.Reasons.Any(x => string.Equals(x, reason, StringComparison.OrdinalIgnoreCase));
-        }
-
-        private static System.Collections.Generic.IReadOnlyList<FluxCAD.SheetAnalysis.Structure.Models.StructuralUnit>
-            GetGeometryUnitsFromExistingPipeline(
-                FluxCAD.SheetAnalysis.Structure.Models.SheetStructuralModel model)
-        {
-            // 여기에는 기존 FLUX_DEBUG_GEOMETRY_ONLY 명령에서 사용하던
-            // separation/bucket 코드만 그대로 옮겨 적으시면 됩니다.
-            throw new NotImplementedException(
-                "기존 FLUX_DEBUG_GEOMETRY_ONLY의 geometry bucket 추출 코드를 여기에 그대로 복사하세요.");
         }
     }
 }
