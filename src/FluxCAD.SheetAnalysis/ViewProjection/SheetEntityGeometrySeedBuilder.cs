@@ -21,6 +21,7 @@ namespace FluxCAD.SheetAnalysis.ViewProjection
                 throw new ArgumentNullException(nameof(geometryUnits));
 
             var result = new List<SheetGeometrySeed>();
+            var seenHandles = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
             foreach (var unit in geometryUnits)
             {
@@ -32,8 +33,22 @@ namespace FluxCAD.SheetAnalysis.ViewProjection
                     if (member == null)
                         continue;
 
+                    if (_options.DeduplicateByHandle)
+                    {
+                        var handle = member.Handle ?? string.Empty;
+
+                        // Handle이 있는 경우만 dedupe 적용
+                        if (!string.IsNullOrWhiteSpace(handle))
+                        {
+                            if (!seenHandles.Add(handle))
+                                continue;
+                        }
+                    }
+
                     var seed = CreateSeed(member);
-                    if (seed != null)
+
+                    // 최종 결과에는 실제 stroke candidate만 넣습니다.
+                    if (seed != null && seed.IsStrokeCandidate)
                     {
                         result.Add(seed);
                     }
@@ -50,23 +65,16 @@ namespace FluxCAD.SheetAnalysis.ViewProjection
 
             if (_options.ExcludeBlockReference && entity.IsBlockReference)
             {
-                return new SheetGeometrySeed
-                {
-                    Handle = entity.Handle,
-                    EntityType = entity.EntityTypeName,
-                    Layer = entity.Layer,
-                    BlockName = entity.BlockName,
-                    BlockPath = entity.BlockPath,
-                    Depth = entity.Depth,
-                    Source = entity,
-                    IsStrokeCandidate = false,
-                    HasUsableGeometry = false,
-                    Reason = "block reference excluded at snapshot stage"
-                };
+                return null;
             }
 
             bool includedByKind = IsIncludedKind(entity);
+            if (!includedByKind)
+                return null;
+
             bool hasUsableGeometry = HasUsableGeometry(entity);
+            if (!hasUsableGeometry)
+                return null;
 
             return new SheetGeometrySeed
             {
@@ -77,9 +85,9 @@ namespace FluxCAD.SheetAnalysis.ViewProjection
                 BlockPath = entity.BlockPath,
                 Depth = entity.Depth,
                 Source = entity,
-                IsStrokeCandidate = includedByKind && hasUsableGeometry,
-                HasUsableGeometry = hasUsableGeometry,
-                Reason = BuildReason(entity, includedByKind, hasUsableGeometry)
+                IsStrokeCandidate = true,
+                HasUsableGeometry = true,
+                Reason = $"accepted geometry seed: {entity.Kind}"
             };
         }
 
@@ -108,24 +116,28 @@ namespace FluxCAD.SheetAnalysis.ViewProjection
             switch (entity.Kind)
             {
                 case SheetEntityKind.Line:
-                    return entity.StartPoint.HasValue && entity.EndPoint.HasValue;
+                    return entity.StartPoint.HasValue
+                        && entity.EndPoint.HasValue
+                        && !AreSamePoint(entity.StartPoint.Value, entity.EndPoint.Value);
 
                 case SheetEntityKind.Polyline:
                 case SheetEntityKind.Spline:
-                    return entity.Vertices != null && entity.Vertices.Count >= 2;
+                    return entity.Vertices != null
+                        && entity.Vertices.Count >= 2;
 
                 case SheetEntityKind.Circle:
-                    return (entity.CenterPoint.HasValue || entity.Center.HasValue)
+                    return HasCenter(entity)
                         && entity.Radius.HasValue
                         && entity.Radius.Value > 0;
 
                 case SheetEntityKind.Arc:
-                    return (entity.CenterPoint.HasValue || entity.Center.HasValue)
+                    return HasCenter(entity)
                         && entity.Radius.HasValue
-                        && entity.Radius.Value > 0;
+                        && entity.Radius.Value > 0
+                        && HasArcAngles(entity);
 
                 case SheetEntityKind.Ellipse:
-                    return (entity.CenterPoint.HasValue || entity.Center.HasValue)
+                    return HasCenter(entity)
                         && entity.MajorRadius.HasValue
                         && entity.MinorRadius.HasValue
                         && entity.MajorRadius.Value > 0
@@ -142,18 +154,34 @@ namespace FluxCAD.SheetAnalysis.ViewProjection
             }
         }
 
-        private static string BuildReason(
-            SheetEntity entity,
-            bool includedByKind,
-            bool hasUsableGeometry)
+        private static bool HasCenter(SheetEntity entity)
         {
-            if (!includedByKind)
-                return $"excluded by kind: {entity.Kind}";
+            return entity.CenterPoint.HasValue || entity.Center.HasValue;
+        }
 
-            if (!hasUsableGeometry)
-                return $"included kind but missing usable geometry payload: {entity.Kind}";
+        private static bool HasArcAngles(SheetEntity entity)
+        {
+            // 우선 nullable 2D 각도 필드를 신뢰
+            if (entity.StartAngleDeg2D.HasValue && entity.EndAngleDeg2D.HasValue)
+                return true;
 
-            return $"accepted geometry seed: {entity.Kind}";
+            // 호환용 필드 fallback
+            // StartAngleDeg / EndAngleDeg 는 non-nullable이라
+            // 값이 0,0 인 경우도 있을 수 있지만, 현재 구조상 fallback으로만 사용
+            if (!double.IsNaN(entity.StartAngleDeg) && !double.IsNaN(entity.EndAngleDeg))
+            {
+                // 완전 동일 각도라도 CAD 상 full circle/degenerate ambiguity가 있으므로
+                // 현재 단계에서는 "값 존재" 수준으로만 판단합니다.
+                return true;
+            }
+
+            return false;
+        }
+
+        private static bool AreSamePoint(Point2D a, Point2D b, double tol = 1e-9)
+        {
+            return Math.Abs(a.X - b.X) <= tol &&
+                   Math.Abs(a.Y - b.Y) <= tol;
         }
     }
 }
