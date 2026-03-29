@@ -54,12 +54,21 @@ namespace FluxCAD.SheetAnalysis.Structure.Analysis
                 ? rawGeometrySeeds
                     .Where(x => !IsFormLineCandidate(x, targetBounds, options))
                     .ToList()
-                : rawGeometrySeeds;
+                : rawGeometrySeeds.ToList();
+
+            var filteredOutGeometrySeeds = rawGeometrySeeds
+                .Where(x => !ContainsEntity(geometrySeeds, x))
+                .ToList();
 
             result.RawGeometrySeedCount = rawGeometrySeeds.Count;
             result.GeometrySeedCount = geometrySeeds.Count;
-            result.FilteredOutGeometrySeedCount = rawGeometrySeeds.Count - geometrySeeds.Count;
+            result.FilteredOutGeometrySeedCount = filteredOutGeometrySeeds.Count;
             result.TextCandidateCount = textCandidates.Count;
+
+            // 핵심 추가
+            result.RawGeometrySeeds.AddRange(rawGeometrySeeds);
+            result.GeometrySeeds.AddRange(geometrySeeds);
+            result.FilteredGeometrySeeds.AddRange(filteredOutGeometrySeeds);
 
             if (geometrySeeds.Count == 0)
                 return result;
@@ -136,6 +145,30 @@ namespace FluxCAD.SheetAnalysis.Structure.Analysis
                         .ThenByDescending(x => x.Bounds.Area));
 
             return result;
+        }
+
+        private static bool ContainsEntity(
+    IReadOnlyList<SheetEntity> list,
+    SheetEntity target)
+        {
+            if (list == null || target == null)
+                return false;
+
+            foreach (var item in list)
+            {
+                if (item == null)
+                    continue;
+
+                if (!string.IsNullOrWhiteSpace(item.Handle) &&
+                    !string.IsNullOrWhiteSpace(target.Handle) &&
+                    string.Equals(item.Handle, target.Handle, StringComparison.OrdinalIgnoreCase))
+                    return true;
+
+                if (ReferenceEquals(item, target))
+                    return true;
+            }
+
+            return false;
         }
 
         private static bool IsGeometrySeed(SheetEntity member)

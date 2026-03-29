@@ -88,10 +88,12 @@ namespace FluxCAD.BricsCAD.Plugin26
 
                 var islandFinder = new OccupancyIslandFinder();
                 var rawIslands = islandFinder.Find(buildResult.Grid);
-
                 WriteIslandDetails(ed, rawIslands, "RawOccupancyIslands");
 
-                var islands = rawIslands
+                var mergedIslands = MergeNeighborIslands(rawIslands);
+                WriteIslandDetails(ed, mergedIslands, "MergedOccupancyIslands");
+
+                var islands = mergedIslands
                     .OrderByDescending(x => x.CellCount)
                     .ThenByDescending(x => x.Area)
                     .ToList();
@@ -128,6 +130,146 @@ namespace FluxCAD.BricsCAD.Plugin26
             }
         }
 
+
+        private static List<OccupancyIsland> MergeNeighborIslands(
+    IReadOnlyList<OccupancyIsland> islands)
+        {
+            if (islands == null || islands.Count == 0)
+                return new List<OccupancyIsland>();
+
+            var working = islands
+                .Where(x => x != null && x.CellCount > 0)
+                .OrderByDescending(x => x.CellCount)
+                .ThenByDescending(x => x.Area)
+                .ToList();
+
+            if (working.Count <= 1)
+                return working;
+
+            bool changed;
+
+            do
+            {
+                changed = false;
+                var used = new bool[working.Count];
+                var next = new List<OccupancyIsland>();
+                int nextId = 1;
+
+                for (int i = 0; i < working.Count; i++)
+                {
+                    if (used[i])
+                        continue;
+
+                    var current = working[i];
+                    used[i] = true;
+
+                    bool localChanged;
+                    do
+                    {
+                        localChanged = false;
+
+                        for (int j = 0; j < working.Count; j++)
+                        {
+                            if (used[j])
+                                continue;
+
+                            if (!ShouldMergeIslands(current, working[j]))
+                                continue;
+
+                            current = MergeTwoIslands(current, working[j], nextId++);
+                            used[j] = true;
+                            localChanged = true;
+                            changed = true;
+                        }
+                    }
+                    while (localChanged);
+
+                    next.Add(current);
+                }
+
+                // Id를 다시 정리
+                for (int k = 0; k < next.Count; k++)
+                {
+                    var normalized = new OccupancyIsland
+                    {
+                        Id = k + 1
+                    };
+
+                    foreach (var cell in next[k].Cells)
+                        normalized.AddCell(cell);
+
+                    normalized.FinalizeBounds();
+                    next[k] = normalized;
+                }
+
+                working = next
+                    .OrderByDescending(x => x.CellCount)
+                    .ThenByDescending(x => x.Area)
+                    .ToList();
+            }
+            while (changed);
+
+            return working;
+        }
+
+        private static OccupancyIsland MergeTwoIslands(
+    OccupancyIsland a,
+    OccupancyIsland b,
+    int mergedId)
+        {
+            if (a == null)
+                throw new ArgumentNullException(nameof(a));
+
+            if (b == null)
+                throw new ArgumentNullException(nameof(b));
+
+            var merged = new OccupancyIsland
+            {
+                Id = mergedId
+            };
+
+            foreach (var cell in a.Cells)
+                merged.AddCell(cell);
+
+            foreach (var cell in b.Cells)
+                merged.AddCell(cell);
+
+            merged.FinalizeBounds();
+            return merged;
+        }
+
+        private static bool ShouldMergeIslands(
+    OccupancyIsland a,
+    OccupancyIsland b)
+        {
+            if (a == null || b == null)
+                return false;
+
+            var ab = a.Bounds;
+            var bb = b.Bounds;
+
+            // Y overlap
+            var overlapY = Math.Max(0.0, Math.Min(ab.MaxY, bb.MaxY) - Math.Max(ab.MinY, bb.MinY));
+            var minH = Math.Max(1e-6, Math.Min(ab.Height, bb.Height));
+            var overlapRatioY = overlapY / minH;
+
+            // X gap
+            double gapX = 0.0;
+            if (ab.MaxX < bb.MinX)
+                gapX = bb.MinX - ab.MaxX;
+            else if (bb.MaxX < ab.MinX)
+                gapX = ab.MinX - bb.MaxX;
+            else
+                gapX = 0.0;
+
+            var maxH = Math.Max(ab.Height, bb.Height);
+            var similarHeight = Math.Abs(ab.Height - bb.Height) <= maxH * 0.40;
+
+            return overlapRatioY >= 0.60 &&
+                   gapX <= Math.Max(ab.Width, bb.Width) * 0.20 &&
+                   similarHeight;
+        }
+
         private static void WriteIslandDetails(
     Bricscad.EditorInput.Editor ed,
     IEnumerable<OccupancyIsland> islands,
@@ -154,10 +296,11 @@ namespace FluxCAD.BricsCAD.Plugin26
             }
         }
 
+
         private List<SheetEntity> PrepareOccupancyInput(
-    IReadOnlyList<SheetEntity> entities,
-    Bounds2D sheetBounds,
-    Bricscad.EditorInput.Editor ed)
+            IReadOnlyList<SheetEntity> entities,
+            Bounds2D sheetBounds,
+            Bricscad.EditorInput.Editor ed)
         {
             if (entities == null)
                 throw new ArgumentNullException(nameof(entities));
@@ -206,7 +349,10 @@ namespace FluxCAD.BricsCAD.Plugin26
             if (viewInput.GeometryUnits.Count == 0)
                 return new List<SheetEntity>();
 
-            // 4) geometry pack 분석
+            // -----------------------------------------------------------------
+            // Pack 분석은 occupancy 입력 선택에 사용하지 않는다.
+            // 오직 참고용 debug 로그로만 남긴다.
+            // -----------------------------------------------------------------
             var packAnalyzer = new GeometryUnitPackAnalyzer();
             var packResult = packAnalyzer.Build(
                 viewInput.GeometryUnits,
@@ -218,113 +364,263 @@ namespace FluxCAD.BricsCAD.Plugin26
                 });
 
             ed.WriteMessage(
-                $"\n[FluxCAD] GeometryPack input={packResult.InputUnitCount}, candidate={packResult.CandidateUnitCount}, " +
-                $"excluded={packResult.ExcludedUnitCount}, packs={packResult.Packs.Count}, " +
-                $"connectGap={packResult.ConnectGap:0.##}");
+                $"\n[FluxCAD] GeometryPack(debug-only) input={packResult.InputUnitCount}, " +
+                $"candidate={packResult.CandidateUnitCount}, excluded={packResult.ExcludedUnitCount}, " +
+                $"packs={packResult.Packs.Count}, connectGap={packResult.ConnectGap:0.##}");
 
-            if (packResult.Packs.Count == 0)
-                return new List<SheetEntity>();
-
-            // 핵심 개선 1: best pack 하나만 쓰지 않고 상위 pack 여러 개 사용
-            var rankedPacks = packResult.Packs
-    .OrderByDescending(x => x.Score)
-    .ThenByDescending(x => x.TotalGeometryMemberCount)
-    .ThenByDescending(x => x.Units.Count)
-    .ToList();
-
-            var bestScore = rankedPacks.Count > 0 ? rankedPacks[0].Score : 0.0;
-
-            var selectedPacks = rankedPacks
-                .Where((x, index) =>
-                    index == 0 ||
-                    (bestScore > 0 && x.Score >= bestScore * 0.35))
-                .Take(2)
-                .ToList();
-
-            ed.WriteMessage(
-                $"\n[FluxCAD] SelectedPacks count={selectedPacks.Count}, " +
-                $"indices={string.Join(",", selectedPacks.Select(x => x.PackIndex))}");
-
-            foreach (var pack in selectedPacks)
+            foreach (var pack in packResult.Packs
+                         .OrderByDescending(x => x.Score)
+                         .ThenByDescending(x => x.TotalGeometryMemberCount)
+                         .Take(5))
             {
                 ed.WriteMessage(
-                    $"\n[FluxCAD] Pack index={pack.PackIndex}, units={pack.Units.Count}, " +
+                    $"\n  [Pack] index={pack.PackIndex}, units={pack.Units.Count}, " +
                     $"geomMembers={pack.TotalGeometryMemberCount}, textMembers={pack.TotalTextMemberCount}, " +
                     $"metaHits={pack.MetadataHitCount}, score={pack.Score:0.##}");
             }
 
-            // 5) pack 내부 unit 재분석
+            // 4) geometry unit 전체를 대상으로 spatial seed 수집
             var spatialAnalyzer = new GeometryUnitSpatialClusterAnalyzer();
             var finalEntities = new List<SheetEntity>();
 
-            foreach (var pack in selectedPacks)
+            int usedUnitCount = 0;
+            int totalRawSeedCount = 0;
+            int totalGeometrySeedCount = 0;
+            int totalFilteredOutSeedCount = 0;
+            int totalAcceptedSeedCount = 0;
+
+            foreach (var unit in viewInput.GeometryUnits)
             {
-                foreach (var unit in pack.Units)
+                if (unit == null || unit.Members == null || unit.Members.Count == 0)
+                    continue;
+
+                if (!string.IsNullOrWhiteSpace(unit.UnitId) &&
+    unit.UnitId.StartsWith("loose-", StringComparison.OrdinalIgnoreCase))
                 {
-                    if (unit == null || unit.Members == null || unit.Members.Count == 0)
-                        continue;
+                    ed.WriteMessage($"\n  [Unit] id={unit.UnitId} skipped: loose unit");
+                    continue;
+                }
 
-                    var clusterResult = spatialAnalyzer.Build(
-                        unit,
-                        new GeometryUnitSpatialClusterOptions
-                        {
-                            EnableSeedFiltering = true
-                        });
+                usedUnitCount++;
 
-                    var totalMembers = unit.Members.Count;
-                    var geometryLikeMembers = unit.Members.Count(x =>
-                        x != null &&
-                        !x.Bounds.IsEmpty &&
-                        !x.IsBlockReference &&
-                        x.IsGeometryLike &&
-                        !x.IsTextLike &&
-                        !x.IsDimensionLike);
-
-                    var acceptedMembers = CountAcceptedGeometryMembers(unit, sheetBounds);
-
-                    ed.WriteMessage(
-                        $"\n  [Unit] pack={pack.PackIndex}, id={unit.UnitId}, " +
-                        $"members={totalMembers}, geomLike={geometryLikeMembers}, accepted={acceptedMembers}, " +
-                        $"rawSeeds={clusterResult.RawGeometrySeedCount}, filteredSeeds={clusterResult.GeometrySeedCount}, " +
-                        $"clusters={clusterResult.Clusters.Count}");
-                    // 핵심 변경:
-                    // occupancy 입력은 cluster.GeometryMembers가 아니라
-                    // 선택된 unit 전체 멤버 중 geometry primitive를 사용
-                    foreach (var member in unit.Members)
+                var clusterResult = spatialAnalyzer.Build(
+                    unit,
+                    new GeometryUnitSpatialClusterOptions
                     {
-                        if (member == null)
-                            continue;
+                        EnableSeedFiltering = true
+                    });
 
-                        if (member.Bounds.IsEmpty)
-                            continue;
+                totalRawSeedCount += clusterResult.RawGeometrySeedCount;
+                totalGeometrySeedCount += clusterResult.GeometrySeedCount;
+                totalFilteredOutSeedCount += clusterResult.FilteredOutGeometrySeedCount;
 
-                        if (member.IsBlockReference)
-                            continue;
+                var candidateClusters = clusterResult.Clusters
+                    .Where(x => IsCandidateViewCluster(x, sheetBounds))
+                    .ToList();
 
-                        if (!member.IsGeometryLike)
-                            continue;
+                var acceptedSeeds = candidateClusters
+                    .SelectMany(x => x.GeometryMembers)
+                    .Where(x => IsValidOccupancyPrimitive(x, sheetBounds))
+                    .ToList();
 
-                        if (member.IsTextLike || member.IsDimensionLike)
-                            continue;
+                totalAcceptedSeedCount += acceptedSeeds.Count;
+                finalEntities.AddRange(acceptedSeeds);
 
-                        if (IsInBottomMetadataBand(member, sheetBounds))
-                            continue;
+                ed.WriteMessage(
+                    $"\n  [Unit] id={unit.UnitId}, members={unit.Members.Count}, " +
+                    $"rawSeeds={clusterResult.RawGeometrySeedCount}, " +
+                    $"geometrySeeds={clusterResult.GeometrySeedCount}, " +
+                    $"filteredOut={clusterResult.FilteredOutGeometrySeedCount}, " +
+                    $"candidateClusters={candidateClusters.Count}, " +
+                    $"acceptedGeometrySeeds={acceptedSeeds.Count}, " +
+                    $"clusters={clusterResult.Clusters.Count}");
 
-                        finalEntities.Add(member);
-                    }
+                foreach (var cluster in clusterResult.Clusters
+                             .OrderByDescending(x => x.GeometryMembers.Count)
+                             .ThenByDescending(x => x.Bounds.Area))
+                {
+                    ed.WriteMessage(
+                        $"\n    [Cluster] unit={unit.UnitId}, idx={cluster.ClusterIndex}, " +
+                        $"members={cluster.Members.Count}, " +
+                        $"geom={cluster.GeometryMembers.Count}, " +
+                        $"text={cluster.TextMembers.Count}, " +
+                        $"bounds=({cluster.Bounds.MinX:0.##},{cluster.Bounds.MinY:0.##})-({cluster.Bounds.MaxX:0.##},{cluster.Bounds.MaxY:0.##}), " +
+                        $"w={cluster.Bounds.Width:0.##}, h={cluster.Bounds.Height:0.##}, area={cluster.Bounds.Area:0.##}");
                 }
             }
 
-            // 6) handle 기준 dedupe
+            // 5) handle 기준 dedupe
             finalEntities = finalEntities
-                .GroupBy(x => string.IsNullOrWhiteSpace(x.Handle) ? Guid.NewGuid().ToString() : x.Handle)
+                .GroupBy(GetOccupancyDedupKey)
                 .Select(g => g.First())
-                .Where(x => !x.Bounds.IsEmpty)
+                .Where(x => x != null && !x.Bounds.IsEmpty)
                 .ToList();
 
-            ed.WriteMessage($"\n[FluxCAD] OccupancyInput primitives={finalEntities.Count}");
-
+            ed.WriteMessage(
+    $"\n[FluxCAD] OccupancyInput unitsUsed={usedUnitCount}, " +
+    $"rawSeeds={totalRawSeedCount}, geometrySeeds={totalGeometrySeedCount}, " +
+    $"filteredOut={totalFilteredOutSeedCount}, acceptedGeometrySeeds={totalAcceptedSeedCount}, " +
+    $"primitives={finalEntities.Count}");
             return finalEntities;
+        }
+
+        private static bool IsCandidateViewCluster(
+    GeometryUnitSubCluster cluster,
+    Bounds2D sheetBounds)
+        {
+            if (cluster == null)
+                return false;
+
+            if (cluster.Bounds.IsEmpty)
+                return false;
+
+            var geomCount = cluster.GeometryMembers?.Count ?? 0;
+            if (geomCount < 4)
+                return false;
+
+            var b = cluster.Bounds;
+            var sheetW = Math.Max(sheetBounds.Width, 1e-6);
+            var sheetH = Math.Max(sheetBounds.Height, 1e-6);
+
+            var widthRatio = b.Width / sheetW;
+            var heightRatio = b.Height / sheetH;
+
+            // 너무 작은 점/조각 제거
+            if (b.Area < sheetBounds.Area * 0.0025 && geomCount <= 2)
+                return false;
+
+            // 지나치게 얇은 긴 선형 cluster 제거
+            var thinX = widthRatio <= 0.02;
+            var thinY = heightRatio <= 0.02;
+            var longHorizontal = widthRatio >= 0.18 && thinY;
+            var longVertical = heightRatio >= 0.18 && thinX;
+            if (longHorizontal || longVertical)
+                return false;
+
+            // 너무 큰 frame/table 영역 제거
+            if (widthRatio >= 0.65 && heightRatio >= 0.65)
+                return false;
+
+            // 아래쪽 표 영역 제거
+            var bandTop = sheetBounds.MinY + (sheetBounds.Height * 0.22);
+            if (b.MaxY <= bandTop)
+                return false;
+
+            return true;
+        }
+
+        private static bool IsValidOccupancyPrimitive(
+    SheetEntity member,
+    Bounds2D sheetBounds)
+        {
+            if (member == null)
+                return false;
+
+            if (member.Bounds.IsEmpty)
+                return false;
+
+            if (member.IsBlockReference)
+                return false;
+
+            if (!member.IsGeometryLike)
+                return false;
+
+            if (member.IsTextLike || member.IsDimensionLike)
+                return false;
+
+            if (IsInBottomMetadataBand(member, sheetBounds))
+                return false;
+
+            if (IsLongThinConnector(member, sheetBounds))
+                return false;
+
+            if (IsLargeFrameLikePrimitive(member, sheetBounds))
+                return false;
+
+            return true;
+        }
+
+        private static bool IsLongThinConnector(
+    SheetEntity entity,
+    Bounds2D sheetBounds)
+        {
+            if (entity == null || entity.Bounds.IsEmpty)
+                return false;
+
+            if (entity.Kind != SheetEntityKind.Line &&
+                entity.Kind != SheetEntityKind.Polyline)
+                return false;
+
+            var b = entity.Bounds;
+
+            var sheetW = Math.Max(sheetBounds.Width, 1e-6);
+            var sheetH = Math.Max(sheetBounds.Height, 1e-6);
+
+            var spanX = b.Width / sheetW;
+            var spanY = b.Height / sheetH;
+
+            var thinX = b.Width <= sheetW * 0.01;
+            var thinY = b.Height <= sheetH * 0.01;
+
+            var longHorizontal = spanX >= 0.30 && thinY;
+            var longVertical = spanY >= 0.30 && thinX;
+
+            return longHorizontal || longVertical;
+        }
+
+        private static bool IsLargeFrameLikePrimitive(
+    SheetEntity entity,
+    Bounds2D sheetBounds)
+        {
+            if (entity == null || entity.Bounds.IsEmpty)
+                return false;
+
+            if (entity.Kind != SheetEntityKind.Polyline)
+                return false;
+
+            var b = entity.Bounds;
+
+            var sheetW = Math.Max(sheetBounds.Width, 1e-6);
+            var sheetH = Math.Max(sheetBounds.Height, 1e-6);
+
+            var widthRatio = b.Width / sheetW;
+            var heightRatio = b.Height / sheetH;
+
+            return widthRatio >= 0.70 && heightRatio >= 0.70;
+        }
+
+        private static string GetOccupancyDedupKey(SheetEntity entity)
+        {
+            if (entity == null)
+                return Guid.NewGuid().ToString();
+
+            if (!string.IsNullOrWhiteSpace(entity.Handle))
+                return entity.Handle!;
+
+            return string.Join("|",
+                entity.EntityType ?? entity.Kind.ToString(),
+                entity.Layer ?? "",
+                entity.BlockName ?? "",
+                Math.Round(entity.Bounds.MinX, 4).ToString(),
+                Math.Round(entity.Bounds.MinY, 4).ToString(),
+                Math.Round(entity.Bounds.MaxX, 4).ToString(),
+                Math.Round(entity.Bounds.MaxY, 4).ToString());
+        }
+
+        private static IReadOnlyList<SheetEntity> GetRawGeometrySeeds(
+    GeometryUnitSpatialClusterResult clusterResult)
+        {
+            if (clusterResult == null)
+                return Array.Empty<SheetEntity>();
+
+            if (clusterResult.RawGeometrySeeds != null)
+                return clusterResult.RawGeometrySeeds;
+
+            // fallback
+            if (clusterResult.GeometrySeeds != null)
+                return clusterResult.GeometrySeeds;
+
+            return Array.Empty<SheetEntity>();
         }
 
         private static int CountAcceptedGeometryMembers(

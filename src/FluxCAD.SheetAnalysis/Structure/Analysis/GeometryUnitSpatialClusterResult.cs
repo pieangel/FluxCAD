@@ -21,5 +21,13 @@ namespace FluxCAD.SheetAnalysis.Structure.Analysis
 
         public List<GeometryUnitSubCluster> Clusters { get; } = new();
         public List<SheetEntity> UnassignedTextMembers { get; } = new();
+
+
+        public List<SheetEntity> RawGeometrySeeds { get; } = new();
+        public List<SheetEntity> GeometrySeeds { get; } = new();
+
+
+        public List<SheetEntity> FilteredGeometrySeeds { get; } = new();
+
     }
 }
