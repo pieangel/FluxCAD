@@ -9,11 +9,17 @@ using Teigha.DatabaseServices;
 //using Teigha.EditorInput;
 using Teigha.Geometry;
 using Teigha.Runtime;
+using FluxCAD.SheetAnalysis.Structure.Analysis;
+using FluxCAD.SheetAnalysis.Structure.Builders;
+using FluxCAD.SheetAnalysis.Structure.Classifiers;
+using FluxCAD.SheetAnalysis.Structure.Models;
+using FluxCAD.SheetAnalysis.Structure.Results;
 
 namespace FluxCAD.BricsCAD.Plugin26
 {
     public sealed class SheetAnalysisDebugCommands
     {
+        
         [CommandMethod("FLUX_CLEAR_OCCUPANCY_MARKS")]
         public void FluxClearOccupancyMarks()
         {
@@ -66,16 +72,10 @@ namespace FluxCAD.BricsCAD.Plugin26
 
                 var sheetBounds = Bounds2DHelper.FromEntities(entities);
 
-                var partitioner = new ScenePartitioner();
-                var partition = partitioner.Partition(entities);
-
-                var gridInput = partition.GeometryCoreEntities
-                    .Where(x => !x.Bounds.IsEmpty)
-                    .ToList();
-
+                var gridInput = PrepareOccupancyInput(entities, sheetBounds, ed);
                 if (gridInput.Count == 0)
                 {
-                    ed.WriteMessage("\n[FluxCAD] geometry core entities가 비어 있습니다.");
+                    ed.WriteMessage("\n[FluxCAD] occupancy input이 비어 있습니다.");
                     return;
                 }
 
@@ -83,8 +83,646 @@ namespace FluxCAD.BricsCAD.Plugin26
                 var buildResult = gridBuilder.Build(
                     gridInput,
                     sheetBounds,
-                    rows: 200,
-                    cols: 200);
+                    rows: 120,
+                    cols: 120);
+
+                var islandFinder = new OccupancyIslandFinder();
+                var rawIslands = islandFinder.Find(buildResult.Grid);
+
+                WriteIslandDetails(ed, rawIslands, "RawOccupancyIslands");
+
+                var islands = rawIslands
+                    .OrderByDescending(x => x.CellCount)
+                    .ThenByDescending(x => x.Area)
+                    .ToList();
+
+                using (doc.LockDocument())
+                using (var tr = db.TransactionManager.StartTransaction())
+                {
+                    var drawer = new OccupancyDebugDrawer();
+
+                    drawer.DrawOccupiedCells(
+                        db,
+                        tr,
+                        buildResult,
+                        clearLayerFirst: true,
+                        maxCellsToDraw: 0);
+
+                    drawer.DrawIslands(
+                        db,
+                        tr,
+                        islands,
+                        buildResult.SheetBounds,
+                        clearLayerFirst: true,
+                        drawLabels: true);
+
+                    tr.Commit();
+                }
+
+                ed.WriteMessage(
+                    $"\n[FluxCAD] Occupancy islands raw={rawIslands.Count}, filtered=OFF, occupiedCells={buildResult.OccupiedCount}");
+            }
+            catch (System.Exception ex)
+            {
+                ed.WriteMessage($"\n[FluxCAD] FLUX_DEBUG_OCCUPANCY_ISLANDS_WITH_CELLS failed: {ex}");
+            }
+        }
+
+        private static void WriteIslandDetails(
+    Bricscad.EditorInput.Editor ed,
+    IEnumerable<OccupancyIsland> islands,
+    string title)
+        {
+            var list = islands
+                .OrderByDescending(x => x.CellCount)
+                .ThenByDescending(x => x.Area)
+                .ToList();
+
+            ed.WriteMessage($"\n[FluxCAD] {title} count={list.Count}");
+
+            for (int i = 0; i < list.Count; i++)
+            {
+                var island = list[i];
+                var b = island.Bounds;
+
+                ed.WriteMessage(
+                    $"\n  [Island {i + 1}] " +
+                    $"Cells={island.CellCount}, " +
+                    $"Rows={island.MinRow}-{island.MaxRow}, Cols={island.MinCol}-{island.MaxCol}, " +
+                    $"Bounds=({b.MinX:0.##},{b.MinY:0.##})-({b.MaxX:0.##},{b.MaxY:0.##}), " +
+                    $"W={island.Width:0.##}, H={island.Height:0.##}, Area={island.Area:0.##}");
+            }
+        }
+
+        private List<SheetEntity> PrepareOccupancyInput(
+    IReadOnlyList<SheetEntity> entities,
+    Bounds2D sheetBounds,
+    Bricscad.EditorInput.Editor ed)
+        {
+            if (entities == null)
+                throw new ArgumentNullException(nameof(entities));
+
+            // 0) scene partition 로그
+            var partitioner = new ScenePartitioner();
+            var partition = partitioner.Partition(entities);
+
+            ed.WriteMessage(
+                $"\n[FluxCAD] ScenePartition geometry={partition.GeometryCoreEntities.Count}, " +
+                $"annotation={partition.AnnotationEntities.Count}, metadata={partition.MetadataEntities.Count}, " +
+                $"unknown={partition.UnknownEntities.Count}");
+
+            // 1) 구조 단위 구축
+            var structuralBuilder = new StructuralUnitBuilder();
+            var structuralModel = structuralBuilder.Build(
+                entities,
+                sheetBounds,
+                options: null);
+
+            ed.WriteMessage($"\n[FluxCAD] StructuralUnits total={structuralModel.Units.Count}");
+
+            // 2) 역할별 분리
+            var separator = new StructuralSeparator();
+            var separation = separator.Separate(structuralModel);
+
+            ed.WriteMessage(
+                $"\n[FluxCAD] Separation geometry={separation.GeometryUnits.Count}, " +
+                $"annotation={separation.AnnotationUnits.Count}, table={separation.TableUnits.Count}, " +
+                $"frame={separation.FrameUnits.Count}, metadata={separation.MetadataUnits.Count}, " +
+                $"mixed={separation.MixedUnits.Count}");
+
+            // 3) geometry input 구축
+            var viewInputBuilder = new GeometryViewInputBuilder(
+                new GeometryViewInputBuildOptions
+                {
+                    IncludeMixedUnits = false
+                });
+
+            var viewInput = viewInputBuilder.Build(separation);
+
+            ed.WriteMessage(
+                $"\n[FluxCAD] GeometryViewInput included={viewInput.GeometryUnitCount}, " +
+                $"rejected={viewInput.RejectedUnitCount}");
+
+            if (viewInput.GeometryUnits.Count == 0)
+                return new List<SheetEntity>();
+
+            // 4) geometry pack 분석
+            var packAnalyzer = new GeometryUnitPackAnalyzer();
+            var packResult = packAnalyzer.Build(
+                viewInput.GeometryUnits,
+                sheetBounds,
+                new GeometryUnitPackOptions
+                {
+                    ExcludeMetadataHeavyUnits = true,
+                    ExcludeOuterFrameLikeUnits = true
+                });
+
+            ed.WriteMessage(
+                $"\n[FluxCAD] GeometryPack input={packResult.InputUnitCount}, candidate={packResult.CandidateUnitCount}, " +
+                $"excluded={packResult.ExcludedUnitCount}, packs={packResult.Packs.Count}, " +
+                $"connectGap={packResult.ConnectGap:0.##}");
+
+            if (packResult.Packs.Count == 0)
+                return new List<SheetEntity>();
+
+            // 핵심 개선 1: best pack 하나만 쓰지 않고 상위 pack 여러 개 사용
+            var rankedPacks = packResult.Packs
+    .OrderByDescending(x => x.Score)
+    .ThenByDescending(x => x.TotalGeometryMemberCount)
+    .ThenByDescending(x => x.Units.Count)
+    .ToList();
+
+            var bestScore = rankedPacks.Count > 0 ? rankedPacks[0].Score : 0.0;
+
+            var selectedPacks = rankedPacks
+                .Where((x, index) =>
+                    index == 0 ||
+                    (bestScore > 0 && x.Score >= bestScore * 0.35))
+                .Take(2)
+                .ToList();
+
+            ed.WriteMessage(
+                $"\n[FluxCAD] SelectedPacks count={selectedPacks.Count}, " +
+                $"indices={string.Join(",", selectedPacks.Select(x => x.PackIndex))}");
+
+            foreach (var pack in selectedPacks)
+            {
+                ed.WriteMessage(
+                    $"\n[FluxCAD] Pack index={pack.PackIndex}, units={pack.Units.Count}, " +
+                    $"geomMembers={pack.TotalGeometryMemberCount}, textMembers={pack.TotalTextMemberCount}, " +
+                    $"metaHits={pack.MetadataHitCount}, score={pack.Score:0.##}");
+            }
+
+            // 5) pack 내부 unit 재분석
+            var spatialAnalyzer = new GeometryUnitSpatialClusterAnalyzer();
+            var finalEntities = new List<SheetEntity>();
+
+            foreach (var pack in selectedPacks)
+            {
+                foreach (var unit in pack.Units)
+                {
+                    if (unit == null || unit.Members == null || unit.Members.Count == 0)
+                        continue;
+
+                    var clusterResult = spatialAnalyzer.Build(
+                        unit,
+                        new GeometryUnitSpatialClusterOptions
+                        {
+                            EnableSeedFiltering = true
+                        });
+
+                    var totalMembers = unit.Members.Count;
+                    var geometryLikeMembers = unit.Members.Count(x =>
+                        x != null &&
+                        !x.Bounds.IsEmpty &&
+                        !x.IsBlockReference &&
+                        x.IsGeometryLike &&
+                        !x.IsTextLike &&
+                        !x.IsDimensionLike);
+
+                    var acceptedMembers = CountAcceptedGeometryMembers(unit, sheetBounds);
+
+                    ed.WriteMessage(
+                        $"\n  [Unit] pack={pack.PackIndex}, id={unit.UnitId}, " +
+                        $"members={totalMembers}, geomLike={geometryLikeMembers}, accepted={acceptedMembers}, " +
+                        $"rawSeeds={clusterResult.RawGeometrySeedCount}, filteredSeeds={clusterResult.GeometrySeedCount}, " +
+                        $"clusters={clusterResult.Clusters.Count}");
+                    // 핵심 변경:
+                    // occupancy 입력은 cluster.GeometryMembers가 아니라
+                    // 선택된 unit 전체 멤버 중 geometry primitive를 사용
+                    foreach (var member in unit.Members)
+                    {
+                        if (member == null)
+                            continue;
+
+                        if (member.Bounds.IsEmpty)
+                            continue;
+
+                        if (member.IsBlockReference)
+                            continue;
+
+                        if (!member.IsGeometryLike)
+                            continue;
+
+                        if (member.IsTextLike || member.IsDimensionLike)
+                            continue;
+
+                        if (IsInBottomMetadataBand(member, sheetBounds))
+                            continue;
+
+                        finalEntities.Add(member);
+                    }
+                }
+            }
+
+            // 6) handle 기준 dedupe
+            finalEntities = finalEntities
+                .GroupBy(x => string.IsNullOrWhiteSpace(x.Handle) ? Guid.NewGuid().ToString() : x.Handle)
+                .Select(g => g.First())
+                .Where(x => !x.Bounds.IsEmpty)
+                .ToList();
+
+            ed.WriteMessage($"\n[FluxCAD] OccupancyInput primitives={finalEntities.Count}");
+
+            return finalEntities;
+        }
+
+        private static int CountAcceptedGeometryMembers(
+    StructuralUnit unit,
+    Bounds2D sheetBounds)
+        {
+            int count = 0;
+
+            foreach (var member in unit.Members)
+            {
+                if (member == null)
+                    continue;
+
+                if (member.Bounds.IsEmpty)
+                    continue;
+
+                if (member.IsBlockReference)
+                    continue;
+
+                if (!member.IsGeometryLike)
+                    continue;
+
+                if (member.IsTextLike || member.IsDimensionLike)
+                    continue;
+
+                if (IsInBottomMetadataBand(member, sheetBounds))
+                    continue;
+
+                count++;
+            }
+
+            return count;
+        }
+
+        private static bool IsInBottomMetadataBand(
+    SheetEntity entity,
+    Bounds2D sheetBounds)
+        {
+            if (entity == null || entity.Bounds.IsEmpty)
+                return false;
+
+            var bandTop = sheetBounds.MinY + (sheetBounds.Height * 0.18);
+
+            return entity.Bounds.MaxY <= bandTop;
+        }
+
+        private static bool IsTinyNoiseIsland(
+    OccupancyIsland island,
+    OccupancyGridBuildResult buildResult)
+        {
+            if (island == null)
+                return true;
+
+            // 1) 아주 작은 셀 수는 바로 제거
+            if (island.CellCount <= 3)
+                return true;
+
+            // 2) 화면상 매우 작은 직사각형 조각 제거
+            var minVisualWidth = buildResult.CellWidth * 2.0;
+            var minVisualHeight = buildResult.CellHeight * 2.0;
+
+            if (island.CellCount <= 6 &&
+                island.Width <= minVisualWidth &&
+                island.Height <= minVisualHeight)
+                return true;
+
+            // 3) 전체 면적이 극소인 것 제거
+            if (island.Area <= (buildResult.CellWidth * buildResult.CellHeight * 4.0))
+                return true;
+
+            return false;
+        }
+
+        private List<SheetEntity> PrepareOccupancyInput_old2(
+    IReadOnlyList<SheetEntity> entities,
+    Bounds2D sheetBounds,
+    Bricscad.EditorInput.Editor ed)
+        {
+            if (entities == null)
+                throw new ArgumentNullException(nameof(entities));
+
+            // 0) 기존 scene partition 결과도 참고 로그로 남깁니다.
+            var partitioner = new ScenePartitioner();
+            var partition = partitioner.Partition(entities);
+
+            ed.WriteMessage(
+                $"\n[FluxCAD] ScenePartition geometry={partition.GeometryCoreEntities.Count}, " +
+                $"annotation={partition.AnnotationEntities.Count}, metadata={partition.MetadataEntities.Count}, " +
+                $"unknown={partition.UnknownEntities.Count}");
+
+            // 1) 구조 단위 구축 + post-process
+            var structuralBuilder = new StructuralUnitBuilder();
+            var structuralModel = structuralBuilder.Build(
+                entities,
+                sheetBounds,
+                options: null);
+
+            ed.WriteMessage($"\n[FluxCAD] StructuralUnits total={structuralModel.Units.Count}");
+
+            // 2) 역할별 분리
+            var separator = new StructuralSeparator();
+            var separation = separator.Separate(structuralModel);
+
+            ed.WriteMessage(
+                $"\n[FluxCAD] Separation geometry={separation.GeometryUnits.Count}, " +
+                $"annotation={separation.AnnotationUnits.Count}, table={separation.TableUnits.Count}, " +
+                $"frame={separation.FrameUnits.Count}, metadata={separation.MetadataUnits.Count}, " +
+                $"mixed={separation.MixedUnits.Count}");
+
+            // 3) geometry view input 구축
+            var viewInputBuilder = new GeometryViewInputBuilder(
+                new GeometryViewInputBuildOptions
+                {
+                    IncludeMixedUnits = false
+                });
+
+            var viewInput = viewInputBuilder.Build(separation);
+
+            ed.WriteMessage(
+                $"\n[FluxCAD] GeometryViewInput included={viewInput.GeometryUnitCount}, " +
+                $"rejected={viewInput.RejectedUnitCount}");
+
+            if (viewInput.GeometryUnits.Count == 0)
+                return new List<SheetEntity>();
+
+            // 4) geometry pack 분석
+            var packAnalyzer = new GeometryUnitPackAnalyzer();
+            var packResult = packAnalyzer.Build(
+                viewInput.GeometryUnits,
+                sheetBounds,
+                new GeometryUnitPackOptions
+                {
+                    ExcludeMetadataHeavyUnits = true,
+                    ExcludeOuterFrameLikeUnits = true
+                });
+
+            ed.WriteMessage(
+                $"\n[FluxCAD] GeometryPack input={packResult.InputUnitCount}, candidate={packResult.CandidateUnitCount}, " +
+                $"excluded={packResult.ExcludedUnitCount}, packs={packResult.Packs.Count}, " +
+                $"connectGap={packResult.ConnectGap:0.##}");
+
+            if (packResult.Packs.Count == 0)
+                return new List<SheetEntity>();
+
+            var bestPack = packResult.Packs
+                .OrderByDescending(x => x.Score)
+                .ThenByDescending(x => x.TotalGeometryMemberCount)
+                .ThenByDescending(x => x.Units.Count)
+                .First();
+
+            ed.WriteMessage(
+                $"\n[FluxCAD] BestPack index={bestPack.PackIndex}, units={bestPack.Units.Count}, " +
+                $"geomMembers={bestPack.TotalGeometryMemberCount}, textMembers={bestPack.TotalTextMemberCount}, " +
+                $"metaHits={bestPack.MetadataHitCount}");
+
+            // 5) pack 내부 unit 을 다시 spatial cluster 분석
+            var spatialAnalyzer = new GeometryUnitSpatialClusterAnalyzer();
+            var finalEntities = new List<SheetEntity>();
+
+            foreach (var unit in bestPack.Units)
+            {
+                if (unit == null || unit.Members == null || unit.Members.Count == 0)
+                    continue;
+
+                var clusterResult = spatialAnalyzer.Build(
+                    unit,
+                    new GeometryUnitSpatialClusterOptions
+                    {
+                        EnableSeedFiltering = true
+                    });
+
+                ed.WriteMessage(
+                    $"\n  [Unit] id={unit.UnitId}, rawSeeds={clusterResult.RawGeometrySeedCount}, " +
+                    $"filteredSeeds={clusterResult.GeometrySeedCount}, clusters={clusterResult.Clusters.Count}");
+
+                if (clusterResult.Clusters.Count == 0)
+                    continue;
+
+                foreach (var cluster in clusterResult.Clusters)
+                {
+                    foreach (var member in cluster.GeometryMembers)
+                    {
+                        if (member == null)
+                            continue;
+
+                        if (member.Bounds.IsEmpty)
+                            continue;
+
+                        // occupancy 입력은 primitive geometry 위주
+                        if (member.IsBlockReference)
+                            continue;
+
+                        if (!member.IsGeometryLike)
+                            continue;
+
+                        if (member.IsTextLike || member.IsDimensionLike)
+                            continue;
+
+                        finalEntities.Add(member);
+                    }
+                }
+            }
+
+            // 6) handle 기준 dedupe
+            finalEntities = finalEntities
+                .GroupBy(x => string.IsNullOrWhiteSpace(x.Handle) ? Guid.NewGuid().ToString() : x.Handle)
+                .Select(g => g.First())
+                .Where(x => !x.Bounds.IsEmpty)
+                .ToList();
+
+            ed.WriteMessage($"\n[FluxCAD] OccupancyInput primitives={finalEntities.Count}");
+
+            return finalEntities;
+        }
+
+
+        private List<SheetEntity> PrepareOccupancyInput_old(
+    IReadOnlyList<SheetEntity> entities,
+    Bounds2D sheetBounds,
+    Bricscad.EditorInput.Editor ed)
+        {
+            if (entities == null)
+                throw new ArgumentNullException(nameof(entities));
+
+            // 0) 기존 scene partition 결과도 참고 로그로 남깁니다.
+            var partitioner = new ScenePartitioner();
+            var partition = partitioner.Partition(entities);
+
+            ed.WriteMessage(
+                $"\n[FluxCAD] ScenePartition geometry={partition.GeometryCoreEntities.Count}, " +
+                $"annotation={partition.AnnotationEntities.Count}, metadata={partition.MetadataEntities.Count}, " +
+                $"unknown={partition.UnknownEntities.Count}");
+
+            // 1) 구조 단위 구축 + post-process
+            var structuralBuilder = new StructuralUnitBuilder();
+            var structuralModel = structuralBuilder.Build(
+                entities,
+                sheetBounds,
+                options: null);
+
+            ed.WriteMessage($"\n[FluxCAD] StructuralUnits total={structuralModel.Units.Count}");
+
+            // 2) 역할별 분리
+            var separator = new StructuralSeparator();
+            var separation = separator.Separate(structuralModel);
+
+            ed.WriteMessage(
+                $"\n[FluxCAD] Separation geometry={separation.GeometryUnits.Count}, " +
+                $"annotation={separation.AnnotationUnits.Count}, table={separation.TableUnits.Count}, " +
+                $"frame={separation.FrameUnits.Count}, metadata={separation.MetadataUnits.Count}, " +
+                $"mixed={separation.MixedUnits.Count}");
+
+            // 3) geometry view input 구축
+            var viewInputBuilder = new GeometryViewInputBuilder(
+                new GeometryViewInputBuildOptions
+                {
+                    IncludeMixedUnits = false
+                });
+
+            var viewInput = viewInputBuilder.Build(separation);
+
+            ed.WriteMessage(
+                $"\n[FluxCAD] GeometryViewInput included={viewInput.GeometryUnitCount}, " +
+                $"rejected={viewInput.RejectedUnitCount}");
+
+            if (viewInput.GeometryUnits.Count == 0)
+                return new List<SheetEntity>();
+
+            // 4) geometry pack 분석
+            var packAnalyzer = new GeometryUnitPackAnalyzer();
+            var packResult = packAnalyzer.Build(
+                viewInput.GeometryUnits,
+                sheetBounds,
+                new GeometryUnitPackOptions
+                {
+                    ExcludeMetadataHeavyUnits = true,
+                    ExcludeOuterFrameLikeUnits = true
+                });
+
+            ed.WriteMessage(
+                $"\n[FluxCAD] GeometryPack input={packResult.InputUnitCount}, candidate={packResult.CandidateUnitCount}, " +
+                $"excluded={packResult.ExcludedUnitCount}, packs={packResult.Packs.Count}, " +
+                $"connectGap={packResult.ConnectGap:0.##}");
+
+            if (packResult.Packs.Count == 0)
+                return new List<SheetEntity>();
+
+            var bestPack = packResult.Packs
+                .OrderByDescending(x => x.Score)
+                .ThenByDescending(x => x.TotalGeometryMemberCount)
+                .ThenByDescending(x => x.Units.Count)
+                .First();
+
+            ed.WriteMessage(
+                $"\n[FluxCAD] BestPack index={bestPack.PackIndex}, units={bestPack.Units.Count}, " +
+                $"geomMembers={bestPack.TotalGeometryMemberCount}, textMembers={bestPack.TotalTextMemberCount}, " +
+                $"metaHits={bestPack.MetadataHitCount}");
+
+            // 5) pack 내부 unit 을 다시 spatial cluster 분석
+            var spatialAnalyzer = new GeometryUnitSpatialClusterAnalyzer();
+            var finalEntities = new List<SheetEntity>();
+
+            foreach (var unit in bestPack.Units)
+            {
+                if (unit == null || unit.Members == null || unit.Members.Count == 0)
+                    continue;
+
+                var clusterResult = spatialAnalyzer.Build(
+                    unit,
+                    new GeometryUnitSpatialClusterOptions
+                    {
+                        EnableSeedFiltering = true
+                    });
+
+                ed.WriteMessage(
+                    $"\n  [Unit] id={unit.UnitId}, rawSeeds={clusterResult.RawGeometrySeedCount}, " +
+                    $"filteredSeeds={clusterResult.GeometrySeedCount}, clusters={clusterResult.Clusters.Count}");
+
+                if (clusterResult.Clusters.Count == 0)
+                    continue;
+
+                foreach (var cluster in clusterResult.Clusters)
+                {
+                    foreach (var member in cluster.GeometryMembers)
+                    {
+                        if (member == null)
+                            continue;
+
+                        if (member.Bounds.IsEmpty)
+                            continue;
+
+                        // occupancy 입력은 primitive geometry 위주
+                        if (member.IsBlockReference)
+                            continue;
+
+                        if (!member.IsGeometryLike)
+                            continue;
+
+                        if (member.IsTextLike || member.IsDimensionLike)
+                            continue;
+
+                        finalEntities.Add(member);
+                    }
+                }
+            }
+
+            // 6) handle 기준 dedupe
+            finalEntities = finalEntities
+                .GroupBy(x => string.IsNullOrWhiteSpace(x.Handle) ? Guid.NewGuid().ToString() : x.Handle)
+                .Select(g => g.First())
+                .Where(x => !x.Bounds.IsEmpty)
+                .ToList();
+
+            ed.WriteMessage($"\n[FluxCAD] OccupancyInput primitives={finalEntities.Count}");
+
+            return finalEntities;
+        }
+
+
+        public void FluxDebugOccupancyIslandsWithCells_old()
+        {
+            var doc = Application.DocumentManager.MdiActiveDocument;
+            var db = doc.Database;
+            var ed = doc.Editor;
+
+            try
+            {
+                var sheetFilePath = db.Filename;
+                if (string.IsNullOrWhiteSpace(sheetFilePath))
+                {
+                    ed.WriteMessage("\n[FluxCAD] 저장된 DWG 파일이 아닙니다.");
+                    return;
+                }
+
+                IEntitySnapshotBuilder snapshotBuilder = new SimpleSheetFileSnapshotBuilder();
+                var entities = snapshotBuilder.Build(sheetFilePath);
+
+                if (entities == null || entities.Count == 0)
+                {
+                    ed.WriteMessage("\n[FluxCAD] snapshot이 비어 있습니다.");
+                    return;
+                }
+
+                var sheetBounds = Bounds2DHelper.FromEntities(entities);
+
+                var gridInput = PrepareOccupancyInput(entities, sheetBounds, ed);
+                if (gridInput.Count == 0)
+                {
+                    ed.WriteMessage("\n[FluxCAD] occupancy input이 비어 있습니다.");
+                    return;
+                }
+
+                var gridBuilder = new OccupancyGridBuilder();
+                var buildResult = gridBuilder.Build(
+                    gridInput,
+                    sheetBounds,
+                    rows: 120,
+                    cols: 120);
 
                 var islandFinder = new OccupancyIslandFinder();
                 var islands = islandFinder.Find(buildResult.Grid)
@@ -151,16 +789,10 @@ namespace FluxCAD.BricsCAD.Plugin26
 
                 var sheetBounds = Bounds2DHelper.FromEntities(entities);
 
-                var partitioner = new ScenePartitioner();
-                var partition = partitioner.Partition(entities);
-
-                var gridInput = partition.GeometryCoreEntities
-                    .Where(x => !x.Bounds.IsEmpty)
-                    .ToList();
-
+                var gridInput = PrepareOccupancyInput(entities, sheetBounds, ed);
                 if (gridInput.Count == 0)
                 {
-                    ed.WriteMessage("\n[FluxCAD] geometry core entities가 비어 있습니다.");
+                    ed.WriteMessage("\n[FluxCAD] occupancy input이 비어 있습니다.");
                     return;
                 }
 
@@ -168,8 +800,82 @@ namespace FluxCAD.BricsCAD.Plugin26
                 var buildResult = gridBuilder.Build(
                     gridInput,
                     sheetBounds,
-                    rows: 200,
-                    cols: 200);
+                    rows: 120,
+                    cols: 120);
+
+                var islandFinder = new OccupancyIslandFinder();
+                var rawIslands = islandFinder.Find(buildResult.Grid);
+
+                var islands = rawIslands
+                    .Where(x => !IsTinyNoiseIsland(x, buildResult))
+                    .OrderByDescending(x => x.CellCount)
+                    .ThenByDescending(x => x.Area)
+                    .ToList();
+
+                using (doc.LockDocument())
+                using (var tr = db.TransactionManager.StartTransaction())
+                {
+                    var drawer = new OccupancyDebugDrawer();
+
+                    drawer.DrawIslands(
+                        db,
+                        tr,
+                        islands,
+                        buildResult.SheetBounds,
+                        clearLayerFirst: true,
+                        drawLabels: true);
+
+                    tr.Commit();
+                }
+
+                ed.WriteMessage(
+    $"\n[FluxCAD] Occupancy islands raw={rawIslands.Count}, filtered={islands.Count}, occupiedCells={buildResult.OccupiedCount}");
+            }
+            catch (System.Exception ex)
+            {
+                ed.WriteMessage($"\n[FluxCAD] FLUX_DEBUG_OCCUPANCY_ISLANDS failed: {ex}");
+            }
+        }
+
+        public void FluxDebugOccupancyIslands_old()
+        {
+            var doc = Application.DocumentManager.MdiActiveDocument;
+            var db = doc.Database;
+            var ed = doc.Editor;
+
+            try
+            {
+                var sheetFilePath = db.Filename;
+                if (string.IsNullOrWhiteSpace(sheetFilePath))
+                {
+                    ed.WriteMessage("\n[FluxCAD] 저장된 DWG 파일이 아닙니다.");
+                    return;
+                }
+
+                IEntitySnapshotBuilder snapshotBuilder = new SimpleSheetFileSnapshotBuilder();
+                var entities = snapshotBuilder.Build(sheetFilePath);
+
+                if (entities == null || entities.Count == 0)
+                {
+                    ed.WriteMessage("\n[FluxCAD] snapshot이 비어 있습니다.");
+                    return;
+                }
+
+                var sheetBounds = Bounds2DHelper.FromEntities(entities);
+
+                var gridInput = PrepareOccupancyInput(entities, sheetBounds, ed);
+                if (gridInput.Count == 0)
+                {
+                    ed.WriteMessage("\n[FluxCAD] occupancy input이 비어 있습니다.");
+                    return;
+                }
+
+                var gridBuilder = new OccupancyGridBuilder();
+                var buildResult = gridBuilder.Build(
+                    gridInput,
+                    sheetBounds,
+                    rows: 120,
+                    cols: 120);
 
                 var islandFinder = new OccupancyIslandFinder();
                 var islands = islandFinder.Find(buildResult.Grid)

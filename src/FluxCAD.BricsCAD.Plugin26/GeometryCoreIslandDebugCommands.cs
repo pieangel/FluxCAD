@@ -9,6 +9,11 @@ using FluxCAD.SheetAnalysis;
 using FluxCAD.SheetAnalysis.ViewIsolation;
 using TeighaColor = Teigha.Colors.Color;
 using TeighaColorMethod = Teigha.Colors.ColorMethod;
+using FluxCAD.SheetAnalysis.Structure.Analysis;
+using FluxCAD.SheetAnalysis.Structure.Builders;
+using FluxCAD.SheetAnalysis.Structure.Classifiers;
+using FluxCAD.SheetAnalysis.Structure.Models;
+using FluxCAD.SheetAnalysis.Structure.Results;
 
 
 namespace FluxCAD.BricsCAD.Plugin26
@@ -126,6 +131,151 @@ namespace FluxCAD.BricsCAD.Plugin26
             {
                 ed.WriteMessage($"\n[FluxCAD] FLUX_MARK_GEOMETRY_CORE_ISLANDS failed: {ex}");
             }
+        }
+
+        private List<SheetEntity> PrepareOccupancyInput(
+    IReadOnlyList<SheetEntity> entities,
+    Bounds2D sheetBounds,
+    Bricscad.EditorInput.Editor ed)
+        {
+            if (entities == null)
+                throw new ArgumentNullException(nameof(entities));
+
+            var partitioner = new ScenePartitioner();
+            var partition = partitioner.Partition(entities);
+
+            ed.WriteMessage(
+                $"\n[FluxCAD] ScenePartition geometry={partition.GeometryCoreEntities.Count}, " +
+                $"annotation={partition.AnnotationEntities.Count}, metadata={partition.MetadataEntities.Count}, " +
+                $"unknown={partition.UnknownEntities.Count}");
+
+            var structuralBuilder = new StructuralUnitBuilder();
+            var structuralModel = structuralBuilder.Build(
+                entities,
+                sheetBounds,
+                options: null);
+
+            ed.WriteMessage($"\n[FluxCAD] StructuralUnits total={structuralModel.Units.Count}");
+
+            var separator = new StructuralSeparator();
+            var separation = separator.Separate(structuralModel);
+
+            ed.WriteMessage(
+                $"\n[FluxCAD] Separation geometry={separation.GeometryUnits.Count}, " +
+                $"annotation={separation.AnnotationUnits.Count}, table={separation.TableUnits.Count}, " +
+                $"frame={separation.FrameUnits.Count}, metadata={separation.MetadataUnits.Count}, " +
+                $"mixed={separation.MixedUnits.Count}");
+
+            var viewInputBuilder = new GeometryViewInputBuilder(
+                new GeometryViewInputBuildOptions
+                {
+                    IncludeMixedUnits = false
+                });
+
+            var viewInput = viewInputBuilder.Build(separation);
+
+            ed.WriteMessage(
+                $"\n[FluxCAD] GeometryViewInput included={viewInput.GeometryUnitCount}, " +
+                $"rejected={viewInput.RejectedUnitCount}");
+
+            if (viewInput.GeometryUnits.Count == 0)
+                return new List<SheetEntity>();
+
+            var packAnalyzer = new GeometryUnitPackAnalyzer();
+            var packResult = packAnalyzer.Build(
+                viewInput.GeometryUnits,
+                sheetBounds,
+                new GeometryUnitPackOptions
+                {
+                    ExcludeMetadataHeavyUnits = true,
+                    ExcludeOuterFrameLikeUnits = true
+                });
+
+            ed.WriteMessage(
+                $"\n[FluxCAD] GeometryPack input={packResult.InputUnitCount}, candidate={packResult.CandidateUnitCount}, " +
+                $"excluded={packResult.ExcludedUnitCount}, packs={packResult.Packs.Count}, " +
+                $"connectGap={packResult.ConnectGap:0.##}");
+
+            if (packResult.Packs.Count == 0)
+                return new List<SheetEntity>();
+
+            var selectedPacks = packResult.Packs
+                .OrderByDescending(x => x.Score)
+                .ThenByDescending(x => x.TotalGeometryMemberCount)
+                .ThenByDescending(x => x.Units.Count)
+                .Take(2)
+                .ToList();
+
+            ed.WriteMessage(
+                $"\n[FluxCAD] SelectedPacks count={selectedPacks.Count}, " +
+                $"indices={string.Join(",", selectedPacks.Select(x => x.PackIndex))}");
+
+            foreach (var pack in selectedPacks)
+            {
+                ed.WriteMessage(
+                    $"\n[FluxCAD] Pack index={pack.PackIndex}, units={pack.Units.Count}, " +
+                    $"geomMembers={pack.TotalGeometryMemberCount}, textMembers={pack.TotalTextMemberCount}, " +
+                    $"metaHits={pack.MetadataHitCount}, score={pack.Score:0.##}");
+            }
+
+            var spatialAnalyzer = new GeometryUnitSpatialClusterAnalyzer();
+            var finalEntities = new List<SheetEntity>();
+
+            foreach (var pack in selectedPacks)
+            {
+                foreach (var unit in pack.Units)
+                {
+                    if (unit == null || unit.Members == null || unit.Members.Count == 0)
+                        continue;
+
+                    var clusterResult = spatialAnalyzer.Build(
+                        unit,
+                        new GeometryUnitSpatialClusterOptions
+                        {
+                            EnableSeedFiltering = true
+                        });
+
+                    ed.WriteMessage(
+                        $"\n  [Unit] pack={pack.PackIndex}, id={unit.UnitId}, rawSeeds={clusterResult.RawGeometrySeedCount}, " +
+                        $"filteredSeeds={clusterResult.GeometrySeedCount}, clusters={clusterResult.Clusters.Count}");
+
+                    if (clusterResult.Clusters.Count == 0)
+                        continue;
+
+                    foreach (var cluster in clusterResult.Clusters)
+                    {
+                        foreach (var member in cluster.GeometryMembers)
+                        {
+                            if (member == null)
+                                continue;
+
+                            if (member.Bounds.IsEmpty)
+                                continue;
+
+                            if (member.IsBlockReference)
+                                continue;
+
+                            if (!member.IsGeometryLike)
+                                continue;
+
+                            if (member.IsTextLike || member.IsDimensionLike)
+                                continue;
+
+                            finalEntities.Add(member);
+                        }
+                    }
+                }
+            }
+
+            finalEntities = finalEntities
+                .GroupBy(x => string.IsNullOrWhiteSpace(x.Handle) ? Guid.NewGuid().ToString() : x.Handle)
+                .Select(g => g.First())
+                .Where(x => !x.Bounds.IsEmpty)
+                .ToList();
+
+            ed.WriteMessage($"\n[FluxCAD] OccupancyInput primitives={finalEntities.Count}");
+
+            return finalEntities;
         }
 
         [CommandMethod("FLUX_CLEAR_GEOMETRY_CORE_MARKS")]

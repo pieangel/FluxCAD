@@ -1,0 +1,198 @@
+좋습니다. 지금까지는 상당히 중요한 전환 지점까지 왔습니다.
+깔끔하게 정리하고, 다음 단계로 정확히 넘어가겠습니다.
+
+실수: 0개
+추측: 1개 (이미 명시됨)
+
+🔷 1. 지금까지의 핵심 흐름 정리
+✅ 우리가 시도한 것
+Scene → Structural → Separation
+정상 작동
+geometry / annotation / table / frame 분리 OK
+GeometryPack 도입
+initially: bestPack 1개
+개선: multiple pack
+현재: weak pack 제거까지 완료
+Occupancy Grid + Island
+정상 작동
+raw island 생성 OK
+공간 분리는 가능함
+🔷 2. 현재 상태 (로그 기반 확정 사실)
+📌 핵심 로그
+GeometryViewInput included=5
+packs=2 → selected=1
+units=3
+OccupancyInput primitives=16
+RawOccupancyIslands=5
+🔷 3. 지금 문제의 본질 (가장 중요)
+❌ 문제 1: occupancy 전에 너무 많이 버리고 있음
+geometry unit: 5개 있음
+occupancy에 들어간 unit: 3개
+결과 → 일부 view는 아예 시작부터 제외됨
+
+👉 공간 분리 전에 이미 정보 손실 발생
+
+❌ 문제 2: unit 내부에서도 geometry가 증발
+
+로그:
+
+family-3: rawSeeds=29 → accepted=6
+family-5: rawSeeds=23 → accepted=2
+
+👉 같은 unit인데
+
+analyzer: "geometry 많음"
+occupancy builder: "거의 없음"
+
+➡️ geometry 해석 기준 불일치
+
+❌ 문제 3: occupancy 결과는 “중앙 일부만”
+
+Raw island bounds:
+
+(261~394, 182~191)
+(303~336, 115~130)
+
+👉 전부 중앙
+
+➡️ 좌상단 / 좌하단 view는 애초에 input에 없음
+
+❌ 문제 4: tiny filter는 본질 문제가 아님
+raw=5 → filtered=3
+하지만 raw 자체가 이미 부족
+
+👉 지금은 filter 문제가 아니라 input 문제
+
+🔷 4. 지금까지의 진짜 결론
+💡 가장 중요한 한 문장
+
+❗ "Occupancy가 못 나누는 게 아니라, 넣기 전에 이미 잘못 줄여버리고 있다."
+
+🔷 5. 구조적으로 잘못된 부분 (핵심 설계 문제)
+
+현재 흐름:
+
+Geometry Units
+   ↓
+Pack (연결 기준)
+   ↓
+SelectedPack (일부만 선택)
+   ↓
+Occupancy (공간 분리)
+
+이건 개념적으로 문제입니다.
+
+⚠️ 이유
+Pack = 연결된 것 묶기
+Occupancy = 떨어진 것 나누기
+
+👉 서로 반대 역할
+
+그런데 지금은:
+
+나누기 전에 이미 “묶기 기준으로 일부만 선택”
+
+🔷 6. 우리가 가야 할 방향 (정답 구조)
+
+앞으로는 이렇게 바뀌어야 합니다:
+
+Geometry Units (전체)
+   ↓
+(필요 최소한의 필터만)
+   ↓
+Occupancy (공간 분리 핵심 엔진)
+   ↓
+Island 결과
+   ↓
+후처리 (table 제거 등)
+
+👉 Pack은 보조 정보로만 사용
+
+🔷 7. 다음 단계에서 반드시 할 작업
+
+다음 대화에서는 이걸 정확히 구현합니다.
+
+✅ Task 1. Pack 선택 제거
+
+현재:
+
+selectedPacks → units → occupancy
+
+👉 제거
+
+🔄 변경
+viewInput.GeometryUnits → 그대로 사용
+또는
+packResult.CandidateUnits → 전체 사용
+✅ Task 2. Geometry 추출 방식 통일
+
+현재 문제:
+
+analyzer: 29개
+builder: 6개
+
+👉 완전히 다른 기준
+
+해결 방향
+
+👉 occupancy 입력은 반드시 아래 중 하나:
+
+✔️ A안 (추천)
+clusterResult.RawGeometrySeeds
+또는
+clusterResult.FilteredGeometrySeeds
+✔️ B안
+
+analyzer 내부의 “geometry leaf 추출 함수”를 외부에서도 재사용
+
+✅ Task 3. tiny island filter는 유지 OFF
+
+지금은 이 단계 아님
+
+✅ Task 4. bottom metadata band 제거는 유지
+
+이건 여전히 유효
+
+🔷 8. 다음 단계에서 기대되는 변화
+
+이 수정이 들어가면 로그는 이렇게 바뀌어야 정상입니다:
+
+기대 로그
+GeometryUnits used = 5
+OccupancyInput primitives = (현재 16 → 최소 40~100 이상)
+Raw islands = (5 → 더 증가 가능)
+Bounds = 전체 도면 영역으로 확장
+
+👉 이게 나오면 성공입니다
+
+🔷 9. 지금 상태를 한 줄 요약
+
+🚨 지금은 알고리즘이 틀린 게 아니라,
+좋은 데이터를 occupancy에 전달하지 못하는 상태입니다.
+
+🔷 10. 다음 대화에서 할 일 (정확한 TODO)
+
+다음 대화에서는 바로 이것을 진행합니다:
+
+🔧 1. PrepareOccupancyInput() 완전 개편
+pack selection 제거
+전체 geometry unit 사용
+🔧 2. GeometryUnitSpatialClusterAnalyzer 결과 확장
+RawGeometrySeeds 공개
+또는 동일 추출 로직 외부화
+🔧 3. occupancy input을 “seed 기반”으로 변경
+🔧 4. 디버그 로그 유지 (현재 방식 유지)
+🔚 마무리
+
+지금 단계는 굉장히 중요한 전환입니다.
+
+초기에는 “어디를 나눌까”가 문제였고,
+지금은 “무엇을 넣고 있나”가 문제입니다.
+
+👉 이건 한 단계 올라간 상태입니다.
+
+다음 대화에서는 바로:
+
+👉 “Pack 제거 + Seed 기반 occupancy 입력” 완성 코드
+
+를 드리겠습니다.
