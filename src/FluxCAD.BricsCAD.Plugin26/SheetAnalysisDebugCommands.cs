@@ -1,6 +1,12 @@
 ﻿using Bricscad.ApplicationServices;
 using FluxCAD.SheetAnalysis;
+using FluxCAD.SheetAnalysis.Structure.Analysis;
+using FluxCAD.SheetAnalysis.Structure.Builders;
+using FluxCAD.SheetAnalysis.Structure.Classifiers;
+using FluxCAD.SheetAnalysis.Structure.Models;
+using FluxCAD.SheetAnalysis.Structure.Results;
 using FluxCAD.SheetAnalysis.ViewIsolation;
+using FluxCAD.SheetAnalysis.ViewProjection;
 using System;
 using System.Collections.Generic;
 using System.IO;
@@ -8,18 +14,363 @@ using System.Text;
 using Teigha.DatabaseServices;
 //using Teigha.EditorInput;
 using Teigha.Geometry;
+using Teigha.GraphicsInterface;
 using Teigha.Runtime;
-using FluxCAD.SheetAnalysis.Structure.Analysis;
-using FluxCAD.SheetAnalysis.Structure.Builders;
-using FluxCAD.SheetAnalysis.Structure.Classifiers;
-using FluxCAD.SheetAnalysis.Structure.Models;
-using FluxCAD.SheetAnalysis.Structure.Results;
 
 namespace FluxCAD.BricsCAD.Plugin26
 {
     public sealed class SheetAnalysisDebugCommands
     {
-        
+        private enum OccupancyInputMode
+        {
+            StrictCandidateClusters,
+            LooseAllGeometrySeeds,
+            RawAllGeometrySeeds
+        }
+
+        [CommandMethod("FLUX_DEBUG_OCC_GRID_STROKE_RAW")]
+        public void FluxDebugOccGridStrokeRaw()
+        {
+            var doc = Application.DocumentManager.MdiActiveDocument;
+            if (doc == null)
+                return;
+
+            var db = doc.Database;
+            var ed = doc.Editor;
+
+            try
+            {
+                var sheetFilePath = db.Filename;
+                if (string.IsNullOrWhiteSpace(sheetFilePath))
+                {
+                    ed.WriteMessage("\n[FluxCAD] 저장된 DWG 파일이 아닙니다.");
+                    return;
+                }
+
+                IEntitySnapshotBuilder snapshotBuilder = new SimpleSheetFileSnapshotBuilder();
+                var entities = snapshotBuilder.Build(sheetFilePath);
+
+                if (entities == null || entities.Count == 0)
+                {
+                    ed.WriteMessage("\n[FluxCAD] snapshot이 비어 있습니다.");
+                    return;
+                }
+
+                var sheetBounds = Bounds2DHelper.FromEntities(entities);
+                if (sheetBounds.IsEmpty)
+                {
+                    ed.WriteMessage("\n[FluxCAD] sheet bounds가 비어 있습니다.");
+                    return;
+                }
+
+                var gridInput = PrepareOccupancyInput(
+                    entities,
+                    sheetBounds,
+                    ed,
+                    OccupancyInputMode.RawAllGeometrySeeds);
+
+                if (gridInput == null || gridInput.Count == 0)
+                {
+                    ed.WriteMessage("\n[FluxCAD] occupancy stroke input이 비어 있습니다.");
+                    return;
+                }
+
+                const int rows = 120;
+                const int cols = 120;
+
+                var hitMapBuilder = new StrokeOccupancyGridHitMapBuilder();
+                var hitMap = hitMapBuilder.Build(
+                    gridInput,
+                    sheetBounds,
+                    rows,
+                    cols);
+
+                using (doc.LockDocument())
+                using (var tr = db.TransactionManager.StartTransaction())
+                {
+                    var drawer = new OccupancyDebugDrawer();
+
+                    drawer.DrawHitMap(
+                        db,
+                        tr,
+                        hitMap,
+                        clearLayerFirst: true);
+
+                    tr.Commit();
+                }
+
+                ed.WriteMessage(
+                    $"\n[FluxCAD] StrokeHitMap(Raw) rows={hitMap.Rows}, cols={hitMap.Cols}, input={gridInput.Count}, " +
+                    $"on={hitMap.OnCount}, both={hitMap.BothCount}, boundsOnly={hitMap.BoundsOnlyCount}, repOnly={hitMap.RepOnlyCount}");
+            }
+            catch (System.Exception ex)
+            {
+                ed.WriteMessage($"\n[FluxCAD] FLUX_DEBUG_OCC_GRID_STROKE_RAW failed: {ex}");
+            }
+        }
+
+        [CommandMethod("FLUX_DEBUG_OCC_GRID_HITMAP_RAW")]
+        public void FluxDebugOccGridHitMapRaw()
+        {
+            var doc = Application.DocumentManager.MdiActiveDocument;
+            if (doc == null)
+                return;
+
+            var db = doc.Database;
+            var ed = doc.Editor;
+
+            try
+            {
+                var sheetFilePath = db.Filename;
+                if (string.IsNullOrWhiteSpace(sheetFilePath))
+                {
+                    ed.WriteMessage("\n[FluxCAD] 저장된 DWG 파일이 아닙니다.");
+                    return;
+                }
+
+                IEntitySnapshotBuilder snapshotBuilder = new SimpleSheetFileSnapshotBuilder();
+                var entities = snapshotBuilder.Build(sheetFilePath);
+
+                if (entities == null || entities.Count == 0)
+                {
+                    ed.WriteMessage("\n[FluxCAD] snapshot이 비어 있습니다.");
+                    return;
+                }
+
+                var sheetBounds = Bounds2DHelper.FromEntities(entities);
+                if (sheetBounds.IsEmpty)
+                {
+                    ed.WriteMessage("\n[FluxCAD] sheet bounds가 비어 있습니다.");
+                    return;
+                }
+
+                var gridInput = PrepareOccupancyInput(
+                    entities,
+                    sheetBounds,
+                    ed,
+                    OccupancyInputMode.RawAllGeometrySeeds);
+
+                if (gridInput == null || gridInput.Count == 0)
+                {
+                    ed.WriteMessage("\n[FluxCAD] occupancy raw hitmap input이 비어 있습니다.");
+                    return;
+                }
+
+                const int rows = 120;
+                const int cols = 120;
+
+                var hitMapBuilder = new OccupancyGridHitMapBuilder();
+                var hitMap = hitMapBuilder.Build(
+                    gridInput,
+                    sheetBounds,
+                    rows,
+                    cols);
+
+                using (doc.LockDocument())
+                using (var tr = db.TransactionManager.StartTransaction())
+                {
+                    var drawer = new OccupancyDebugDrawer();
+
+                    drawer.DrawHitMap(
+                        db,
+                        tr,
+                        hitMap,
+                        clearLayerFirst: true);
+
+                    tr.Commit();
+                }
+
+                ed.WriteMessage(
+                    $"\n[FluxCAD] HitMap(Raw) rows={hitMap.Rows}, cols={hitMap.Cols}, input={gridInput.Count}, " +
+                    $"on={hitMap.OnCount}, both={hitMap.BothCount}, boundsOnly={hitMap.BoundsOnlyCount}, repOnly={hitMap.RepOnlyCount}");
+            }
+            catch (System.Exception ex)
+            {
+                ed.WriteMessage($"\n[FluxCAD] FLUX_DEBUG_OCC_GRID_HITMAP_RAW failed: {ex}");
+            }
+        }
+
+        [CommandMethod("FLUX_DEBUG_OCC_GRID_HITMAP_LOOSE")]
+        public void FluxDebugOccGridHitMapLoose()
+        {
+            var doc = Application.DocumentManager.MdiActiveDocument;
+            if (doc == null)
+                return;
+
+            var db = doc.Database;
+            var ed = doc.Editor;
+
+            try
+            {
+                var sheetFilePath = db.Filename;
+                if (string.IsNullOrWhiteSpace(sheetFilePath))
+                {
+                    ed.WriteMessage("\n[FluxCAD] 저장된 DWG 파일이 아닙니다.");
+                    return;
+                }
+
+                IEntitySnapshotBuilder snapshotBuilder = new SimpleSheetFileSnapshotBuilder();
+                var entities = snapshotBuilder.Build(sheetFilePath);
+
+                if (entities == null || entities.Count == 0)
+                {
+                    ed.WriteMessage("\n[FluxCAD] snapshot이 비어 있습니다.");
+                    return;
+                }
+
+                var sheetBounds = Bounds2DHelper.FromEntities(entities);
+                if (sheetBounds.IsEmpty)
+                {
+                    ed.WriteMessage("\n[FluxCAD] sheet bounds가 비어 있습니다.");
+                    return;
+                }
+
+                var gridInput = PrepareOccupancyInput(
+                    entities,
+                    sheetBounds,
+                    ed,
+                    OccupancyInputMode.LooseAllGeometrySeeds);
+
+                if (gridInput == null || gridInput.Count == 0)
+                {
+                    ed.WriteMessage("\n[FluxCAD] occupancy hitmap input이 비어 있습니다.");
+                    return;
+                }
+
+                const int rows = 120;
+                const int cols = 120;
+
+                var hitMapBuilder = new OccupancyGridHitMapBuilder();
+                var hitMap = hitMapBuilder.Build(
+                    gridInput,
+                    sheetBounds,
+                    rows,
+                    cols);
+
+                using (doc.LockDocument())
+                using (var tr = db.TransactionManager.StartTransaction())
+                {
+                    var drawer = new OccupancyDebugDrawer();
+
+                    drawer.DrawHitMap(
+                        db,
+                        tr,
+                        hitMap,
+                        clearLayerFirst: true);
+
+                    tr.Commit();
+                }
+
+                ed.WriteMessage(
+                    $"\n[FluxCAD] HitMap(Loose) rows={hitMap.Rows}, cols={hitMap.Cols}, input={gridInput.Count}, " +
+                    $"on={hitMap.OnCount}, both={hitMap.BothCount}, boundsOnly={hitMap.BoundsOnlyCount}, repOnly={hitMap.RepOnlyCount}");
+            }
+            catch (System.Exception ex)
+            {
+                ed.WriteMessage($"\n[FluxCAD] FLUX_DEBUG_OCC_GRID_HITMAP_LOOSE failed: {ex}");
+            }
+        }
+
+        private static bool IsValidOccupancyPrimitiveRaw(SheetEntity member)
+        {
+            if (member == null)
+                return false;
+
+            if (member.Bounds.IsEmpty)
+                return false;
+
+            if (member.IsBlockReference)
+                return false;
+
+            if (!member.IsGeometryLike)
+                return false;
+
+            if (member.IsTextLike || member.IsDimensionLike)
+                return false;
+
+            return true;
+        }
+
+        [CommandMethod("FLUX_DEBUG_OCC_GRID_HITMAP")]
+        public void FluxDebugOccGridHitMap()
+        {
+            var doc = Application.DocumentManager.MdiActiveDocument;
+            if (doc == null)
+                return;
+
+            var db = doc.Database;
+            var ed = doc.Editor;
+
+            try
+            {
+                var sheetFilePath = db.Filename;
+                if (string.IsNullOrWhiteSpace(sheetFilePath))
+                {
+                    ed.WriteMessage("\n[FluxCAD] 저장된 DWG 파일이 아닙니다.");
+                    return;
+                }
+
+                IEntitySnapshotBuilder snapshotBuilder = new SimpleSheetFileSnapshotBuilder();
+                var entities = snapshotBuilder.Build(sheetFilePath);
+
+                if (entities == null || entities.Count == 0)
+                {
+                    ed.WriteMessage("\n[FluxCAD] snapshot이 비어 있습니다.");
+                    return;
+                }
+
+                var sheetBounds = Bounds2DHelper.FromEntities(entities);
+                if (sheetBounds.IsEmpty)
+                {
+                    ed.WriteMessage("\n[FluxCAD] sheet bounds가 비어 있습니다.");
+                    return;
+                }
+
+                var gridInput = PrepareOccupancyInput(
+                    entities,
+                    sheetBounds,
+                    ed,
+                    OccupancyInputMode.StrictCandidateClusters);
+                if (gridInput == null || gridInput.Count == 0)
+                {
+                    ed.WriteMessage("\n[FluxCAD] occupancy hitmap input이 비어 있습니다.");
+                    return;
+                }
+
+                const int rows = 120;
+                const int cols = 120;
+
+                var hitMapBuilder = new OccupancyGridHitMapBuilder();
+                var hitMap = hitMapBuilder.Build(
+                    gridInput,
+                    sheetBounds,
+                    rows,
+                    cols);
+
+                using (doc.LockDocument())
+                using (var tr = db.TransactionManager.StartTransaction())
+                {
+                    var drawer = new OccupancyDebugDrawer();
+
+                    drawer.DrawHitMap(
+                        db,
+                        tr,
+                        hitMap,
+                        clearLayerFirst: true);
+
+                    tr.Commit();
+                }
+
+                ed.WriteMessage(
+                    $"\n[FluxCAD] HitMap rows={hitMap.Rows}, cols={hitMap.Cols}, input={gridInput.Count}, " +
+                    $"on={hitMap.OnCount}, both={hitMap.BothCount}, boundsOnly={hitMap.BoundsOnlyCount}, repOnly={hitMap.RepOnlyCount}");
+            }
+            catch (System.Exception ex)
+            {
+                ed.WriteMessage($"\n[FluxCAD] FLUX_DEBUG_OCC_GRID_HITMAP failed: {ex}");
+            }
+        }
+
         [CommandMethod("FLUX_CLEAR_OCCUPANCY_MARKS")]
         public void FluxClearOccupancyMarks()
         {
@@ -298,9 +649,10 @@ namespace FluxCAD.BricsCAD.Plugin26
 
 
         private List<SheetEntity> PrepareOccupancyInput(
-            IReadOnlyList<SheetEntity> entities,
-            Bounds2D sheetBounds,
-            Bricscad.EditorInput.Editor ed)
+     IReadOnlyList<SheetEntity> entities,
+     Bounds2D sheetBounds,
+     Bricscad.EditorInput.Editor ed,
+     OccupancyInputMode mode = OccupancyInputMode.StrictCandidateClusters)
         {
             if (entities == null)
                 throw new ArgumentNullException(nameof(entities));
@@ -394,7 +746,8 @@ namespace FluxCAD.BricsCAD.Plugin26
                 if (unit == null || unit.Members == null || unit.Members.Count == 0)
                     continue;
 
-                if (!string.IsNullOrWhiteSpace(unit.UnitId) &&
+                if (mode != OccupancyInputMode.RawAllGeometrySeeds &&
+    !string.IsNullOrWhiteSpace(unit.UnitId) &&
     unit.UnitId.StartsWith("loose-", StringComparison.OrdinalIgnoreCase))
                 {
                     ed.WriteMessage($"\n  [Unit] id={unit.UnitId} skipped: loose unit");
@@ -407,7 +760,7 @@ namespace FluxCAD.BricsCAD.Plugin26
                     unit,
                     new GeometryUnitSpatialClusterOptions
                     {
-                        EnableSeedFiltering = true
+                        EnableSeedFiltering = mode != OccupancyInputMode.RawAllGeometrySeeds
                     });
 
                 totalRawSeedCount += clusterResult.RawGeometrySeedCount;
@@ -418,10 +771,34 @@ namespace FluxCAD.BricsCAD.Plugin26
                     .Where(x => IsCandidateViewCluster(x, sheetBounds))
                     .ToList();
 
-                var acceptedSeeds = candidateClusters
-                    .SelectMany(x => x.GeometryMembers)
-                    .Where(x => IsValidOccupancyPrimitive(x, sheetBounds))
-                    .ToList();
+                List<SheetEntity> acceptedSeeds;
+                string selectionModeLabel;
+
+                if (mode == OccupancyInputMode.StrictCandidateClusters)
+                {
+                    acceptedSeeds = candidateClusters
+                        .SelectMany(x => x.GeometryMembers ?? Enumerable.Empty<SheetEntity>())
+                        .Where(x => IsValidOccupancyPrimitive(x, sheetBounds))
+                        .ToList();
+
+                    selectionModeLabel = "strict-candidate-clusters";
+                }
+                else if (mode == OccupancyInputMode.LooseAllGeometrySeeds)
+                {
+                    acceptedSeeds = (clusterResult.RawGeometrySeeds ?? Enumerable.Empty<SheetEntity>())
+                        .Where(IsValidOccupancyPrimitiveRaw)
+                        .ToList();
+
+                    selectionModeLabel = "loose-all-geometry-seeds";
+                }
+                else
+                {
+                    acceptedSeeds = (clusterResult.GeometrySeeds ?? Enumerable.Empty<SheetEntity>())
+                        .Where(IsValidOccupancyPrimitiveRaw)
+                        .ToList();
+
+                    selectionModeLabel = "raw-all-geometry-seeds";
+                }
 
                 totalAcceptedSeedCount += acceptedSeeds.Count;
                 finalEntities.AddRange(acceptedSeeds);
@@ -433,7 +810,8 @@ namespace FluxCAD.BricsCAD.Plugin26
                     $"filteredOut={clusterResult.FilteredOutGeometrySeedCount}, " +
                     $"candidateClusters={candidateClusters.Count}, " +
                     $"acceptedGeometrySeeds={acceptedSeeds.Count}, " +
-                    $"clusters={clusterResult.Clusters.Count}");
+                    $"clusters={clusterResult.Clusters.Count}, " +
+                    $"mode={selectionModeLabel}");
 
                 foreach (var cluster in clusterResult.Clusters
                              .OrderByDescending(x => x.GeometryMembers.Count)
@@ -457,7 +835,7 @@ namespace FluxCAD.BricsCAD.Plugin26
                 .ToList();
 
             ed.WriteMessage(
-    $"\n[FluxCAD] OccupancyInput unitsUsed={usedUnitCount}, " +
+    $"\n[FluxCAD] OccupancyInput mode={mode}, unitsUsed={usedUnitCount}, " +
     $"rawSeeds={totalRawSeedCount}, geometrySeeds={totalGeometrySeedCount}, " +
     $"filteredOut={totalFilteredOutSeedCount}, acceptedGeometrySeeds={totalAcceptedSeedCount}, " +
     $"primitives={finalEntities.Count}");

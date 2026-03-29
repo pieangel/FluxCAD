@@ -1,4 +1,5 @@
 ﻿using System;
+using System.Collections.Generic;
 
 namespace FluxCAD.SheetAnalysis
 {
@@ -11,9 +12,9 @@ namespace FluxCAD.SheetAnalysis
         public string? BlockName { get; set; }
 
         public Bounds2D Bounds { get; set; }
-        public Point2D Anchor { get; set; }   // insert point / text position / center 등 대표점
+        public Point2D Anchor { get; set; }
 
-        public string? Text { get; set; }     // DBText/MText/Attribute 등
+        public string? Text { get; set; }
         public string? TextNormalized { get; set; }
 
         public double RotationDeg { get; set; }
@@ -37,9 +38,48 @@ namespace FluxCAD.SheetAnalysis
 
         public bool IsVisible { get; set; } = true;
 
+        // =========================
+        // Stroke sampling용 최소 기하 정보
+        // =========================
+
+        // Line
+        public Point2D? StartPoint { get; set; }
+        public Point2D? EndPoint { get; set; }
+
+        // Polyline / Spline fallback
+        public IReadOnlyList<Point2D> Vertices { get; set; } = Array.Empty<Point2D>();
+        public bool IsClosed { get; set; }
+
+        // Circle / Arc / Ellipse
+        public Point2D? CenterPoint { get; set; }
+        public double? Radius { get; set; }
+
+        // Arc
+        public double? StartAngleDeg2D { get; set; }
+        public double? EndAngleDeg2D { get; set; }
+
+        // Ellipse
+        public double? MajorRadius { get; set; }
+        public double? MinorRadius { get; set; }
+
+
+        // Line
+
+
+        // Circle
+        public Point2D? Center { get; set; }
+
+        // Arc
+        public double StartAngleDeg { get; set; }
+        public double EndAngleDeg { get; set; }
+
+
+        public double? EllipseRotationDeg2D { get; set; }
+
         // 호환용 계산 속성
         public string EntityTypeName => EntityType ?? string.Empty;
         public Point2D RepresentativePoint => Anchor;
+
         public bool HasText =>
             !string.IsNullOrWhiteSpace(TextNormalized) ||
             !string.IsNullOrWhiteSpace(Text);

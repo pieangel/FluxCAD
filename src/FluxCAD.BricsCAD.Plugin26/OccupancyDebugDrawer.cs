@@ -1,12 +1,13 @@
-﻿using System;
+﻿using FluxCAD.SheetAnalysis;
+using FluxCAD.SheetAnalysis.ViewIsolation;
+using System;
 using System.Collections.Generic;
 using System.Linq;
+using Teigha.Colors;
 using Teigha.DatabaseServices;
 using Teigha.Geometry;
 using TeighaColor = Teigha.Colors.Color;
 using TeighaColorMethod = Teigha.Colors.ColorMethod;
-using FluxCAD.SheetAnalysis;
-using FluxCAD.SheetAnalysis.ViewIsolation;
 
 namespace FluxCAD.BricsCAD.Plugin26
 {
@@ -15,7 +16,114 @@ namespace FluxCAD.BricsCAD.Plugin26
         public const string IslandLayerName = "FLUX_DEBUG_OCC_ISLAND";
         public const string OccupiedLayerName = "FLUX_DEBUG_OCC_CELL";
 
-        public void DrawIslands(
+    private const string HitMapLayerName = "FLUX_OCC_HITMAP";
+
+    public void DrawHitMap(
+        Database db,
+        Transaction tr,
+        OccupancyGridHitMapResult hitMap,
+        bool clearLayerFirst)
+    {
+        if (db == null)
+            throw new ArgumentNullException(nameof(db));
+
+        if (tr == null)
+            throw new ArgumentNullException(nameof(tr));
+
+        if (hitMap == null)
+            throw new ArgumentNullException(nameof(hitMap));
+
+        var hitMapLayerId = EnsureLayer(db, tr, HitMapLayerName, colorIndex: 1); // red base
+
+        if (clearLayerFirst)
+            ClearEntitiesOnLayer(db, tr, HitMapLayerName);
+
+        var blockTable = (BlockTable)tr.GetObject(db.BlockTableId, OpenMode.ForRead);
+        var modelSpace = (BlockTableRecord)tr.GetObject(blockTable[BlockTableRecord.ModelSpace], OpenMode.ForWrite);
+
+        foreach (var cell in hitMap.Cells.Where(x => x.IsOn))
+        {
+            var colorIndex = GetHitMapColorIndex(cell);
+            var transparency = GetHitMapTransparency(cell);
+
+            var polyId = CreateCellPolyline(modelSpace, tr, cell.Bounds, HitMapLayerName, colorIndex);
+            CreateSolidHatch(modelSpace, tr, polyId, HitMapLayerName, colorIndex, transparency);
+        }
+    }
+
+    private static short GetHitMapColorIndex(OccupancyGridHitCell cell)
+    {
+        if (cell.IsBoth)
+            return 1; // red
+
+        if (cell.IsBoundsOnly)
+            return 2; // yellow
+
+        if (cell.IsRepOnly)
+            return 4; // cyan
+
+        return 8; // gray fallback
+    }
+
+    private static Transparency GetHitMapTransparency(OccupancyGridHitCell cell)
+    {
+        // 0 = opaque, 90 = max transparent
+        return cell.IsBoth
+            ? new Transparency(60)
+            : new Transparency(75);
+    }
+
+    private static ObjectId CreateCellPolyline(
+        BlockTableRecord modelSpace,
+        Transaction tr,
+        Bounds2D bounds,
+        string layerName,
+        short colorIndex)
+    {
+        var pl = new Polyline();
+        pl.SetDatabaseDefaults();
+        pl.Layer = layerName;
+        pl.Color = Color.FromColorIndex(ColorMethod.ByAci, colorIndex);
+        pl.Closed = true;
+
+        pl.AddVertexAt(0, new Point2d(bounds.MinX, bounds.MinY), 0, 0, 0);
+        pl.AddVertexAt(1, new Point2d(bounds.MaxX, bounds.MinY), 0, 0, 0);
+        pl.AddVertexAt(2, new Point2d(bounds.MaxX, bounds.MaxY), 0, 0, 0);
+        pl.AddVertexAt(3, new Point2d(bounds.MinX, bounds.MaxY), 0, 0, 0);
+
+        modelSpace.AppendEntity(pl);
+        tr.AddNewlyCreatedDBObject(pl, true);
+
+        return pl.ObjectId;
+    }
+
+    private static void CreateSolidHatch(
+        BlockTableRecord modelSpace,
+        Transaction tr,
+        ObjectId polyId,
+        string layerName,
+        short colorIndex,
+        Transparency transparency)
+    {
+        var hatch = new Hatch();
+        hatch.SetDatabaseDefaults();
+        hatch.Layer = layerName;
+        hatch.Color = Color.FromColorIndex(ColorMethod.ByAci, colorIndex);
+        hatch.Transparency = transparency;
+        hatch.SetHatchPattern(HatchPatternType.PreDefined, "SOLID");
+        hatch.Associative = true;
+
+        modelSpace.AppendEntity(hatch);
+        tr.AddNewlyCreatedDBObject(hatch, true);
+
+        var loops = new ObjectIdCollection { polyId };
+        hatch.AppendLoop(HatchLoopTypes.External, loops);
+        hatch.EvaluateHatch(true);
+    }
+        
+    
+
+    public void DrawIslands(
             Database db,
             Transaction tr,
             IReadOnlyList<OccupancyIsland> islands,
@@ -139,6 +247,7 @@ namespace FluxCAD.BricsCAD.Plugin26
 
             ClearEntitiesOnLayer(db, tr, IslandLayerName);
             ClearEntitiesOnLayer(db, tr, OccupiedLayerName);
+            ClearEntitiesOnLayer(db, tr, HitMapLayerName);
         }
 
         private static short GetIslandColorIndex(OccupancyIsland island)

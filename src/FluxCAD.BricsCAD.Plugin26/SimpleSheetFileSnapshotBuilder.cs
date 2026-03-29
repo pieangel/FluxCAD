@@ -216,11 +216,14 @@ namespace FluxCAD.BricsCAD.Plugin26
                     IsVisible = !sourceEnt.IsErased
                 };
 
+                PopulateGeometryFields(sheetEntity, wcsEnt);
+
                 // SheetEntity에 해당 속성이 있으면 기록
                 TrySetOptionalProperty(sheetEntity, "BlockPath", blockPath);
                 TrySetOptionalProperty(sheetEntity, "Depth", depth);
 
                 return sheetEntity;
+
             }
             catch
             {
@@ -231,6 +234,80 @@ namespace FluxCAD.BricsCAD.Plugin26
                 wcsEnt?.Dispose();
             }
         }
+
+        private static void PopulateGeometryFields(SheetEntity target, Entity ent)
+        {
+            if (target == null || ent == null)
+                return;
+
+            try
+            {
+                switch (ent)
+                {
+                    case Line ln:
+                        {
+                            target.StartPoint = new Point2D(ln.StartPoint.X, ln.StartPoint.Y);
+                            target.EndPoint = new Point2D(ln.EndPoint.X, ln.EndPoint.Y);
+                            break;
+                        }
+
+                    case Polyline pl:
+                        {
+                            var pts = new List<Point2D>();
+
+                            for (int i = 0; i < pl.NumberOfVertices; i++)
+                            {
+                                var p = pl.GetPoint2dAt(i);
+                                pts.Add(new Point2D(p.X, p.Y));
+                            }
+
+                            target.Vertices = pts;
+                            target.IsClosed = pl.Closed;
+                            break;
+                        }
+
+                    case Circle c:
+                        {
+                            target.CenterPoint = new Point2D(c.Center.X, c.Center.Y);
+                            target.Radius = c.Radius;
+                            break;
+                        }
+
+                    case Arc a:
+                        {
+                            target.CenterPoint = new Point2D(a.Center.X, a.Center.Y);
+                            target.Radius = a.Radius;
+                            target.StartAngleDeg2D = RadToDeg(a.StartAngle);
+                            target.EndAngleDeg2D = RadToDeg(a.EndAngle);
+                            break;
+                        }
+
+                    case Ellipse e:
+                        {
+                            target.CenterPoint = new Point2D(e.Center.X, e.Center.Y);
+
+                            var major = e.MajorAxis;
+                            var majorRadius = Math.Sqrt(
+                                major.X * major.X +
+                                major.Y * major.Y +
+                                major.Z * major.Z);
+
+                            var minorRadius = majorRadius * e.RadiusRatio;
+
+                            target.MajorRadius = majorRadius;
+                            target.MinorRadius = minorRadius;
+                            target.EllipseRotationDeg2D = RadToDeg(Math.Atan2(major.Y, major.X));
+                            break;
+                        }
+                }
+            }
+            catch
+            {
+                // geometry field 추출 실패는 전체 snapshot 실패로 보지 않음
+            }
+        }
+
+        
 
         private static void ApplyTransforms(Entity ent, IReadOnlyList<Matrix3d> transformsToWcs)
         {

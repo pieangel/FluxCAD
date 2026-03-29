@@ -60,6 +60,10 @@ namespace FluxCAD.SheetAnalysis.Structure.Analysis
                 .Where(x => !ContainsEntity(geometrySeeds, x))
                 .ToList();
 
+            FillKindCounts(rawGeometrySeeds, result.RawGeometrySeedKindCounts);
+            FillKindCounts(geometrySeeds, result.GeometrySeedKindCounts);
+            FillKindCounts(filteredOutGeometrySeeds, result.FilteredGeometrySeedKindCounts);
+
             result.RawGeometrySeedCount = rawGeometrySeeds.Count;
             result.GeometrySeedCount = geometrySeeds.Count;
             result.FilteredOutGeometrySeedCount = filteredOutGeometrySeeds.Count;
@@ -188,7 +192,20 @@ namespace FluxCAD.SheetAnalysis.Structure.Analysis
             if (member.IsDimensionLike)
                 return false;
 
+            if (member.Bounds.IsEmpty && member.Kind != SheetEntityKind.Point)
+                return false;
+
             return true;
+        }
+
+        private static void FillKindCounts(
+    IEnumerable<SheetEntity> source,
+    Dictionary<SheetEntityKind, int> target)
+        {
+            target.Clear();
+
+            foreach (var g in source.GroupBy(x => x.Kind))
+                target[g.Key] = g.Count();
         }
 
         private static bool IsTextCandidate(SheetEntity member)
@@ -333,10 +350,13 @@ namespace FluxCAD.SheetAnalysis.Structure.Analysis
             if (IsLargeOuterRectangle(member, targetBounds, marginX, marginY))
                 return true;
 
-            if (longHorizontal && (nearTop || nearBottom || nearLeft || nearRight))
+            var nearHorizontalBorder = nearTop || nearBottom;
+            var nearVerticalBorder = nearLeft || nearRight;
+
+            if (longHorizontal && nearHorizontalBorder)
                 return true;
 
-            if (longVertical && (nearLeft || nearRight || nearTop || nearBottom))
+            if (longVertical && nearVerticalBorder)
                 return true;
 
             if (bottomBandHorizontal || bottomBandVertical)

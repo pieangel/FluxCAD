@@ -29,5 +29,9 @@ namespace FluxCAD.SheetAnalysis.Structure.Analysis
 
         public List<SheetEntity> FilteredGeometrySeeds { get; } = new();
 
+        public Dictionary<SheetEntityKind, int> RawGeometrySeedKindCounts { get; } = new();
+        public Dictionary<SheetEntityKind, int> GeometrySeedKindCounts { get; } = new();
+        public Dictionary<SheetEntityKind, int> FilteredGeometrySeedKindCounts { get; } = new();
+
     }
 }
