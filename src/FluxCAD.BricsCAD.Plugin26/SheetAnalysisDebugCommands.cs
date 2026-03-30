@@ -655,10 +655,435 @@ namespace FluxCAD.BricsCAD.Plugin26
 
 
         private List<SheetEntity> PrepareOccupancyInput(
-     IReadOnlyList<SheetEntity> entities,
-     Bounds2D sheetBounds,
-     Bricscad.EditorInput.Editor ed,
-     OccupancyInputMode mode = OccupancyInputMode.StrictCandidateClusters)
+            IReadOnlyList<SheetEntity> entities,
+            Bounds2D sheetBounds,
+            Bricscad.EditorInput.Editor ed,
+            OccupancyInputMode mode = OccupancyInputMode.StrictCandidateClusters)
+        {
+            if (entities == null)
+                throw new ArgumentNullException(nameof(entities));
+
+            // ★ 핵심: RAW 모드는 구조 경로를 타지 않고 snapshot 전체를 직접 사용
+            if (mode == OccupancyInputMode.RawAllGeometrySeeds)
+            {
+                return PrepareOccupancyInput_RawAllGeometry(
+                    entities,
+                    sheetBounds,
+                    ed);
+            }
+
+            // 0) scene partition 로그
+            var partitioner = new ScenePartitioner();
+            var partition = partitioner.Partition(entities);
+
+            ed.WriteMessage(
+                $"\n[FluxCAD] ScenePartition geometry={partition.GeometryCoreEntities.Count}, " +
+                $"annotation={partition.AnnotationEntities.Count}, metadata={partition.MetadataEntities.Count}, " +
+                $"unknown={partition.UnknownEntities.Count}");
+
+            // 1) 구조 단위 구축
+            var structuralBuilder = new StructuralUnitBuilder();
+            var structuralModel = structuralBuilder.Build(
+                entities,
+                sheetBounds,
+                options: null);
+
+            ed.WriteMessage($"\n[FluxCAD] StructuralUnits total={structuralModel.Units.Count}");
+
+            // 2) 역할별 분리
+            var separator = new StructuralSeparator();
+            var separation = separator.Separate(structuralModel);
+
+            ed.WriteMessage(
+                $"\n[FluxCAD] Separation geometry={separation.GeometryUnits.Count}, " +
+                $"annotation={separation.AnnotationUnits.Count}, table={separation.TableUnits.Count}, " +
+                $"frame={separation.FrameUnits.Count}, metadata={separation.MetadataUnits.Count}, " +
+                $"mixed={separation.MixedUnits.Count}");
+
+            // 3) geometry input 구축
+            var viewInputBuilder = new GeometryViewInputBuilder(
+                new GeometryViewInputBuildOptions
+                {
+                    IncludeMixedUnits = false
+                });
+
+            var viewInput = viewInputBuilder.Build(separation);
+
+            ed.WriteMessage(
+                $"\n[FluxCAD] GeometryViewInput included={viewInput.GeometryUnitCount}, " +
+                $"rejected={viewInput.RejectedUnitCount}");
+
+            if (viewInput.GeometryUnits.Count == 0)
+                return new List<SheetEntity>();
+
+            // 참고용 debug 로그
+            var packAnalyzer = new GeometryUnitPackAnalyzer();
+            var packResult = packAnalyzer.Build(
+                viewInput.GeometryUnits,
+                sheetBounds,
+                new GeometryUnitPackOptions
+                {
+                    ExcludeMetadataHeavyUnits = true,
+                    ExcludeOuterFrameLikeUnits = true
+                });
+
+            ed.WriteMessage(
+                $"\n[FluxCAD] GeometryPack(debug-only) input={packResult.InputUnitCount}, " +
+                $"candidate={packResult.CandidateUnitCount}, excluded={packResult.ExcludedUnitCount}, " +
+                $"packs={packResult.Packs.Count}, connectGap={packResult.ConnectGap:0.##}");
+
+            foreach (var pack in packResult.Packs
+                         .OrderByDescending(x => x.Score)
+                         .ThenByDescending(x => x.TotalGeometryMemberCount)
+                         .Take(5))
+            {
+                ed.WriteMessage(
+                    $"\n  [Pack] index={pack.PackIndex}, units={pack.Units.Count}, " +
+                    $"geomMembers={pack.TotalGeometryMemberCount}, textMembers={pack.TotalTextMemberCount}, " +
+                    $"metaHits={pack.MetadataHitCount}, score={pack.Score:0.##}");
+            }
+
+            // 4) geometry unit 전체를 대상으로 spatial seed 수집
+            var spatialAnalyzer = new GeometryUnitSpatialClusterAnalyzer();
+            var finalEntities = new List<SheetEntity>();
+
+            int usedUnitCount = 0;
+            int totalRawSeedCount = 0;
+            int totalGeometrySeedCount = 0;
+            int totalFilteredOutSeedCount = 0;
+            int totalAcceptedSeedCount = 0;
+
+            foreach (var unit in viewInput.GeometryUnits)
+            {
+                if (unit == null || unit.Members == null || unit.Members.Count == 0)
+                    continue;
+
+                if (mode != OccupancyInputMode.RawAllGeometrySeeds &&
+                    !string.IsNullOrWhiteSpace(unit.UnitId) &&
+                    unit.UnitId.StartsWith("loose-", StringComparison.OrdinalIgnoreCase))
+                {
+                    ed.WriteMessage($"\n  [Unit] id={unit.UnitId} skipped: loose unit");
+                    continue;
+                }
+
+                usedUnitCount++;
+
+                var clusterResult = spatialAnalyzer.Build(
+                    unit,
+                    new GeometryUnitSpatialClusterOptions
+                    {
+                        EnableSeedFiltering = mode != OccupancyInputMode.RawAllGeometrySeeds
+                    });
+
+                if (clusterResult.MemberKindCounts.Count > 0)
+                {
+                    ed.WriteMessage("\n    [MemberKinds]");
+                    foreach (var kv in clusterResult.MemberKindCounts.OrderByDescending(x => x.Value).ThenBy(x => x.Key.ToString()))
+                    {
+                        ed.WriteMessage($"\n      {kv.Key} = {kv.Value}");
+                    }
+                }
+
+                if (clusterResult.SeedRejectReasonCounts.Count > 0)
+                {
+                    ed.WriteMessage("\n    [SeedRejectReasons]");
+                    foreach (var kv in clusterResult.SeedRejectReasonCounts.OrderByDescending(x => x.Value).ThenBy(x => x.Key))
+                    {
+                        ed.WriteMessage($"\n      {kv.Key} = {kv.Value}");
+                    }
+                }
+
+                totalRawSeedCount += clusterResult.RawGeometrySeedCount;
+                totalGeometrySeedCount += clusterResult.GeometrySeedCount;
+                totalFilteredOutSeedCount += clusterResult.FilteredOutGeometrySeedCount;
+
+                var candidateClusters = clusterResult.Clusters
+                    .Where(x => IsCandidateViewCluster(x, sheetBounds))
+                    .ToList();
+
+                List<SheetEntity> acceptedSeeds;
+                string selectionModeLabel;
+
+                if (mode == OccupancyInputMode.StrictCandidateClusters)
+                {
+                    acceptedSeeds = candidateClusters
+                        .SelectMany(x => x.GeometryMembers ?? Enumerable.Empty<SheetEntity>())
+                        .Select(CloneWithFallbackBounds)
+                        .Where(x => x != null)
+                        .Where(x => IsValidOccupancyPrimitive(x!, sheetBounds))
+                        .GroupBy(GetOccupancyDedupKey)
+                        .Select(g => g.First())
+                        .ToList()!;
+                    selectionModeLabel = "strict-candidate-clusters";
+                }
+                else
+                {
+                    // Loose 단계에서도 fallback을 먼저 적용해서 empty-bounds 탈락을 최소화
+                    acceptedSeeds = (clusterResult.RawGeometrySeeds ?? Enumerable.Empty<SheetEntity>())
+                        .Concat(clusterResult.GeometrySeeds ?? Enumerable.Empty<SheetEntity>())
+                        .Select(CloneWithFallbackBounds)
+                        .Where(x => x != null)
+                        .Where(x => IsValidOccupancyPrimitiveRaw(x!))
+                        .GroupBy(GetOccupancyDedupKey)
+                        .Select(g => g.First())
+                        .ToList()!;
+                    selectionModeLabel = "loose-all-geometry-seeds";
+                }
+
+                totalAcceptedSeedCount += acceptedSeeds.Count;
+                finalEntities.AddRange(acceptedSeeds);
+
+                ed.WriteMessage(
+                    $"\n  [Unit] id={unit.UnitId}, members={unit.Members.Count}, " +
+                    $"rawSeeds={clusterResult.RawGeometrySeedCount}, " +
+                    $"geometrySeeds={clusterResult.GeometrySeedCount}, " +
+                    $"filteredOut={clusterResult.FilteredOutGeometrySeedCount}, " +
+                    $"candidateClusters={candidateClusters.Count}, " +
+                    $"acceptedGeometrySeeds={acceptedSeeds.Count}, " +
+                    $"clusters={clusterResult.Clusters.Count}, " +
+                    $"mode={selectionModeLabel}");
+
+                foreach (var cluster in clusterResult.Clusters
+                             .OrderByDescending(x => x.GeometryMembers.Count)
+                             .ThenByDescending(x => x.Bounds.Area))
+                {
+                    ed.WriteMessage(
+                        $"\n    [Cluster] unit={unit.UnitId}, idx={cluster.ClusterIndex}, " +
+                        $"members={cluster.Members.Count}, " +
+                        $"geom={cluster.GeometryMembers.Count}, " +
+                        $"text={cluster.TextMembers.Count}, " +
+                        $"bounds=({cluster.Bounds.MinX:0.##},{cluster.Bounds.MinY:0.##})-({cluster.Bounds.MaxX:0.##},{cluster.Bounds.MaxY:0.##}), " +
+                        $"w={cluster.Bounds.Width:0.##}, h={cluster.Bounds.Height:0.##}, area={cluster.Bounds.Area:0.##}");
+                }
+            }
+
+            finalEntities = finalEntities
+                .Where(x => x != null && !x.Bounds.IsEmpty)
+                .GroupBy(GetOccupancyDedupKey)
+                .Select(g => g.First())
+                .ToList();
+
+            var grouped = finalEntities
+                .GroupBy(GetOccupancyDedupKey)
+                .OrderByDescending(g => g.Count())
+                .ToList();
+
+            ed.WriteMessage($"\n[FluxCAD] Dedupe groups={grouped.Count}");
+
+            foreach (var g in grouped.Where(x => x.Count() > 1).Take(30))
+            {
+                ed.WriteMessage(
+                    $"\n  [DedupeGroup] key={g.Key}, count={g.Count()}, " +
+                    $"types={string.Join(",", g.Select(x => x.EntityTypeName).Distinct())}");
+            }
+
+            ed.WriteMessage(
+                $"\n[FluxCAD] OccupancyInput mode={mode}, unitsUsed={usedUnitCount}, " +
+                $"rawSeeds={totalRawSeedCount}, geometrySeeds={totalGeometrySeedCount}, " +
+                $"filteredOut={totalFilteredOutSeedCount}, acceptedGeometrySeeds={totalAcceptedSeedCount}, " +
+                $"primitives={finalEntities.Count}");
+
+            var byKind = finalEntities
+                .GroupBy(x => x.Kind)
+                .OrderByDescending(g => g.Count());
+
+            ed.WriteMessage("\n[FluxCAD] OccupancyInput ByKind:");
+            foreach (var g in byKind)
+            {
+                ed.WriteMessage($"\n  [Kind] {g.Key} = {g.Count()}");
+            }
+
+            return finalEntities;
+        }
+
+
+
+        private List<SheetEntity> PrepareOccupancyInput_RawAllGeometry(
+    IReadOnlyList<SheetEntity> entities,
+    Bounds2D sheetBounds,
+    Bricscad.EditorInput.Editor ed)
+        {
+            if (entities == null)
+                throw new ArgumentNullException(nameof(entities));
+
+            var finalEntities = new List<SheetEntity>();
+
+            int total = 0;
+            int geometryLike = 0;
+            int blockRefSkipped = 0;
+            int textSkipped = 0;
+            int dimSkipped = 0;
+            int nonGeometrySkipped = 0;
+            int emptyBoundsRecovered = 0;
+            int emptyBoundsStillSkipped = 0;
+            int accepted = 0;
+
+            foreach (var entity in entities)
+            {
+                total++;
+
+                if (entity == null)
+                    continue;
+
+                if (entity.IsBlockReference)
+                {
+                    blockRefSkipped++;
+                    continue;
+                }
+
+                if (entity.IsTextLike)
+                {
+                    textSkipped++;
+                    continue;
+                }
+
+                if (entity.IsDimensionLike)
+                {
+                    dimSkipped++;
+                    continue;
+                }
+
+                if (!entity.IsGeometryLike)
+                {
+                    nonGeometrySkipped++;
+                    continue;
+                }
+
+                geometryLike++;
+
+                var candidate = CloneWithFallbackBounds(entity);
+                if (candidate == null)
+                {
+                    emptyBoundsStillSkipped++;
+                    continue;
+                }
+
+                if (entity.Bounds.IsEmpty && !candidate.Bounds.IsEmpty)
+                    emptyBoundsRecovered++;
+
+                if (candidate.Bounds.IsEmpty)
+                {
+                    emptyBoundsStillSkipped++;
+                    continue;
+                }
+
+                if (!IsValidOccupancyPrimitiveRaw(candidate))
+                    continue;
+
+                finalEntities.Add(candidate);
+                accepted++;
+            }
+
+            var beforeDedupe = finalEntities.Count;
+
+            finalEntities = finalEntities
+                .GroupBy(GetOccupancyDedupKey)
+                .Select(g => g.First())
+                .ToList();
+
+            var deduped = beforeDedupe - finalEntities.Count;
+
+            ed.WriteMessage(
+                $"\n[FluxCAD] RawOccupancyInput total={total}, geometryLike={geometryLike}, " +
+                $"accepted={accepted}, deduped={deduped}, final={finalEntities.Count}");
+
+            ed.WriteMessage(
+                $"\n[FluxCAD] RawOccupancyInput skipped: blockRef={blockRefSkipped}, text={textSkipped}, " +
+                $"dimension={dimSkipped}, nonGeometry={nonGeometrySkipped}, " +
+                $"emptyRecovered={emptyBoundsRecovered}, emptyStillSkipped={emptyBoundsStillSkipped}");
+
+            var byKind = finalEntities
+                .GroupBy(x => x.Kind)
+                .OrderByDescending(g => g.Count())
+                .ToList();
+
+            ed.WriteMessage("\n[FluxCAD] RawOccupancyInput ByKind:");
+            foreach (var g in byKind)
+            {
+                ed.WriteMessage($"\n  [Kind] {g.Key} = {g.Count()}");
+            }
+
+            return finalEntities;
+        }
+
+
+        private static SheetEntity? CloneWithFallbackBounds(SheetEntity entity)
+        {
+            if (entity == null)
+                return null;
+
+            var ensuredBounds = GeometryBoundsFallbackBuilder.EnsureBounds(entity);
+
+            if (ensuredBounds.IsEmpty)
+                return null;
+
+            // 원본 bounds가 이미 정상이면 그대로 반환해도 되지만
+            // 이후 side effect를 피하기 위해 항상 복제본 반환
+            return CloneSheetEntityWithBounds(entity, ensuredBounds);
+        }
+
+
+
+        private static SheetEntity CloneSheetEntityWithBounds(
+    SheetEntity source,
+    Bounds2D bounds)
+        {
+            if (source == null)
+                throw new ArgumentNullException(nameof(source));
+
+            return new SheetEntity
+            {
+                Handle = source.Handle,
+                Kind = source.Kind,
+                Layer = source.Layer,
+                BlockName = source.BlockName,
+                Bounds = bounds,
+                Anchor = source.Anchor,
+                Text = source.Text,
+                TextNormalized = source.TextNormalized,
+                RotationDeg = source.RotationDeg,
+                TextHeight = source.TextHeight,
+                ScaleX = source.ScaleX,
+                ScaleY = source.ScaleY,
+                EntityType = source.EntityType,
+                BlockPath = source.BlockPath,
+                Depth = source.Depth,
+                SourceKind = source.SourceKind,
+                Role = source.Role,
+                SnapshotKey = source.SnapshotKey,
+                OwnerStructureNodeId = source.OwnerStructureNodeId,
+                OwnerDirectChildCount = source.OwnerDirectChildCount,
+                OwnerDirectGeometryChildCount = source.OwnerDirectGeometryChildCount,
+                OwnerDirectTextChildCount = source.OwnerDirectTextChildCount,
+                OwnerDescendantLeafCount = source.OwnerDescendantLeafCount,
+                IsVisible = source.IsVisible,
+
+                StartPoint = source.StartPoint,
+                EndPoint = source.EndPoint,
+                Vertices = source.Vertices,
+                IsClosed = source.IsClosed,
+
+                CenterPoint = source.CenterPoint,
+                Radius = source.Radius,
+
+                StartAngleDeg2D = source.StartAngleDeg2D,
+                EndAngleDeg2D = source.EndAngleDeg2D,
+
+                MajorRadius = source.MajorRadius,
+                MinorRadius = source.MinorRadius,
+
+                Center = source.Center,
+                StartAngleDeg = source.StartAngleDeg,
+                EndAngleDeg = source.EndAngleDeg,
+                EllipseRotationDeg2D = source.EllipseRotationDeg2D
+            };
+        }
+
+        private List<SheetEntity> PrepareOccupancyInput_old(
+    IReadOnlyList<SheetEntity> entities,
+    Bounds2D sheetBounds,
+    Bricscad.EditorInput.Editor ed,
+    OccupancyInputMode mode = OccupancyInputMode.StrictCandidateClusters)
         {
             if (entities == null)
                 throw new ArgumentNullException(nameof(entities));
@@ -707,10 +1132,7 @@ namespace FluxCAD.BricsCAD.Plugin26
             if (viewInput.GeometryUnits.Count == 0)
                 return new List<SheetEntity>();
 
-            // -----------------------------------------------------------------
-            // Pack 분석은 occupancy 입력 선택에 사용하지 않는다.
-            // 오직 참고용 debug 로그로만 남긴다.
-            // -----------------------------------------------------------------
+            // 참고용 debug 로그
             var packAnalyzer = new GeometryUnitPackAnalyzer();
             var packResult = packAnalyzer.Build(
                 viewInput.GeometryUnits,
@@ -753,8 +1175,8 @@ namespace FluxCAD.BricsCAD.Plugin26
                     continue;
 
                 if (mode != OccupancyInputMode.RawAllGeometrySeeds &&
-    !string.IsNullOrWhiteSpace(unit.UnitId) &&
-    unit.UnitId.StartsWith("loose-", StringComparison.OrdinalIgnoreCase))
+                    !string.IsNullOrWhiteSpace(unit.UnitId) &&
+                    unit.UnitId.StartsWith("loose-", StringComparison.OrdinalIgnoreCase))
                 {
                     ed.WriteMessage($"\n  [Unit] id={unit.UnitId} skipped: loose unit");
                     continue;
@@ -768,6 +1190,24 @@ namespace FluxCAD.BricsCAD.Plugin26
                     {
                         EnableSeedFiltering = mode != OccupancyInputMode.RawAllGeometrySeeds
                     });
+
+                if (clusterResult.MemberKindCounts.Count > 0)
+                {
+                    ed.WriteMessage("\n    [MemberKinds]");
+                    foreach (var kv in clusterResult.MemberKindCounts.OrderByDescending(x => x.Value).ThenBy(x => x.Key.ToString()))
+                    {
+                        ed.WriteMessage($"\n      {kv.Key} = {kv.Value}");
+                    }
+                }
+
+                if (clusterResult.SeedRejectReasonCounts.Count > 0)
+                {
+                    ed.WriteMessage("\n    [SeedRejectReasons]");
+                    foreach (var kv in clusterResult.SeedRejectReasonCounts.OrderByDescending(x => x.Value).ThenBy(x => x.Key))
+                    {
+                        ed.WriteMessage($"\n      {kv.Key} = {kv.Value}");
+                    }
+                }
 
                 totalRawSeedCount += clusterResult.RawGeometrySeedCount;
                 totalGeometrySeedCount += clusterResult.GeometrySeedCount;
@@ -785,25 +1225,37 @@ namespace FluxCAD.BricsCAD.Plugin26
                     acceptedSeeds = candidateClusters
                         .SelectMany(x => x.GeometryMembers ?? Enumerable.Empty<SheetEntity>())
                         .Where(x => IsValidOccupancyPrimitive(x, sheetBounds))
+                        .GroupBy(GetOccupancyDedupKey)
+                        .Select(g => g.First())
                         .ToList();
 
                     selectionModeLabel = "strict-candidate-clusters";
                 }
                 else if (mode == OccupancyInputMode.LooseAllGeometrySeeds)
                 {
+                    // Loose 단계에서도 raw + filtered 둘 다 살립니다.
                     acceptedSeeds = (clusterResult.RawGeometrySeeds ?? Enumerable.Empty<SheetEntity>())
+                        .Concat(clusterResult.GeometrySeeds ?? Enumerable.Empty<SheetEntity>())
                         .Where(IsValidOccupancyPrimitiveRaw)
+                        .GroupBy(GetOccupancyDedupKey)
+                        .Select(g => g.First())
                         .ToList();
 
                     selectionModeLabel = "loose-all-geometry-seeds";
                 }
                 else
                 {
-                    acceptedSeeds = (clusterResult.GeometrySeeds ?? Enumerable.Empty<SheetEntity>())
-                        .Where(IsValidOccupancyPrimitiveRaw)
+                    // Raw 단계는 "절대 놓치지 않기"가 목적입니다.
+                    // raw seeds + filtered seeds + unit members 전체 geometry leaf를 합집합으로 가져갑니다.
+                    acceptedSeeds = (clusterResult.RawGeometrySeeds ?? Enumerable.Empty<SheetEntity>())
+                        .Concat(clusterResult.GeometrySeeds ?? Enumerable.Empty<SheetEntity>())
+                        .Concat(unit.Members ?? Enumerable.Empty<SheetEntity>())
+                        .Where(IsValidOccupancyPrimitiveRawExpanded)
+                        .GroupBy(GetOccupancyDedupKey)
+                        .Select(g => g.First())
                         .ToList();
 
-                    selectionModeLabel = "raw-all-geometry-seeds";
+                    selectionModeLabel = "raw-all-geometry-seeds-expanded";
                 }
 
                 totalAcceptedSeedCount += acceptedSeeds.Count;
@@ -833,21 +1285,16 @@ namespace FluxCAD.BricsCAD.Plugin26
                 }
             }
 
-            // 5) handle 기준 dedupe
-            /*
             finalEntities = finalEntities
+                .Where(x => x != null && !x.Bounds.IsEmpty)
                 .GroupBy(GetOccupancyDedupKey)
                 .Select(g => g.First())
-                .Where(x => x != null && !x.Bounds.IsEmpty)
                 .ToList();
-            */
-
-
 
             var grouped = finalEntities
-    .GroupBy(GetOccupancyDedupKey)
-    .OrderByDescending(g => g.Count())
-    .ToList();
+                .GroupBy(GetOccupancyDedupKey)
+                .OrderByDescending(g => g.Count())
+                .ToList();
 
             ed.WriteMessage($"\n[FluxCAD] Dedupe groups={grouped.Count}");
 
@@ -864,8 +1311,40 @@ namespace FluxCAD.BricsCAD.Plugin26
                 $"filteredOut={totalFilteredOutSeedCount}, acceptedGeometrySeeds={totalAcceptedSeedCount}, " +
                 $"primitives={finalEntities.Count}");
 
+            var byKind = finalEntities
+                .GroupBy(x => x.Kind)
+                .OrderByDescending(g => g.Count());
+
+            ed.WriteMessage("\n[FluxCAD] OccupancyInput ByKind:");
+            foreach (var g in byKind)
+            {
+                ed.WriteMessage($"\n  [Kind] {g.Key} = {g.Count()}");
+            }
 
             return finalEntities;
+        }
+
+        private static bool IsValidOccupancyPrimitiveRawExpanded(SheetEntity member)
+        {
+            if (member == null)
+                return false;
+
+            if (member.Bounds.IsEmpty)
+                return false;
+
+            if (member.IsBlockReference)
+                return false;
+
+            if (!member.IsGeometryLike)
+                return false;
+
+            if (member.IsTextLike || member.IsDimensionLike)
+                return false;
+
+            // Raw 단계는 최대한 보존합니다.
+            // 아래쪽 metadata band, long connector, large frame-like 같은
+            // 보수적 제거를 적용하지 않습니다.
+            return true;
         }
 
         private static bool IsCandidateViewCluster(

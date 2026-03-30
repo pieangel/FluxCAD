@@ -27,6 +27,10 @@ namespace FluxCAD.SheetAnalysis.ViewIsolation
                     AppendPolyline(entity, step, result);
                     break;
 
+                case SheetEntityKind.Spline:
+                    AppendSpline(entity, step, result);
+                    break;
+
                 case SheetEntityKind.Circle:
                     AppendCircle(entity, step, result);
                     break;
@@ -39,15 +43,21 @@ namespace FluxCAD.SheetAnalysis.ViewIsolation
                     AppendEllipse(entity, step, result);
                     break;
 
+                case SheetEntityKind.Hatch:
+                case SheetEntityKind.Solid:
+                case SheetEntityKind.Region:
+                    AppendBoundsOutline(entity, step, result);
+                    break;
 
                 case SheetEntityKind.Point:
                     result.Add(entity.RepresentativePoint);
                     break;
 
                 default:
-                    // fallback:
-                    // 아직 stroke 정보가 없는 엔티티는 representative point만 사용
-                    result.Add(entity.RepresentativePoint);
+                    // 기존에는 representative point 1개만 사용했는데,
+                    // 지금 단계에서는 누락 방지가 더 중요하므로
+                    // 최소한 bounds 외곽이라도 샘플링합니다.
+                    AppendBoundsOutline(entity, step, result);
                     break;
             }
 
@@ -58,9 +68,9 @@ namespace FluxCAD.SheetAnalysis.ViewIsolation
         }
 
         private static void AppendEllipse(
-    SheetEntity entity,
-    double step,
-    List<Point2D> output)
+            SheetEntity entity,
+            double step,
+            List<Point2D> output)
         {
             if (!entity.CenterPoint.HasValue ||
                 !entity.MajorRadius.HasValue ||
@@ -68,7 +78,7 @@ namespace FluxCAD.SheetAnalysis.ViewIsolation
                 entity.MajorRadius.Value <= 0 ||
                 entity.MinorRadius.Value <= 0)
             {
-                output.Add(entity.RepresentativePoint);
+                AppendBoundsOutline(entity, step, output);
                 return;
             }
 
@@ -76,7 +86,7 @@ namespace FluxCAD.SheetAnalysis.ViewIsolation
             var a = entity.MajorRadius.Value;
             var b = entity.MinorRadius.Value;
 
-            // 현재는 ellipse 전용 회전축 정보가 없으므로
+            // 현재는 ellipse 전용 회전축 정보가 불완전할 수 있으므로
             // 우선 axis-aligned ellipse로 근사합니다.
             var perimeterApprox = 2.0 * Math.PI * Math.Sqrt((a * a + b * b) * 0.5);
             var count = Math.Max(24, (int)Math.Ceiling(perimeterApprox / step));
@@ -97,7 +107,7 @@ namespace FluxCAD.SheetAnalysis.ViewIsolation
         {
             if (!entity.StartPoint.HasValue || !entity.EndPoint.HasValue)
             {
-                output.Add(entity.RepresentativePoint);
+                AppendBoundsOutline(entity, step, output);
                 return;
             }
 
@@ -118,7 +128,7 @@ namespace FluxCAD.SheetAnalysis.ViewIsolation
                     return;
                 }
 
-                output.Add(entity.RepresentativePoint);
+                AppendBoundsOutline(entity, step, output);
                 return;
             }
 
@@ -139,14 +149,40 @@ namespace FluxCAD.SheetAnalysis.ViewIsolation
             }
         }
 
+        private static void AppendSpline(
+            SheetEntity entity,
+            double step,
+            List<Point2D> output)
+        {
+            var pts = entity.Vertices;
+            if (pts != null && pts.Count >= 2)
+            {
+                for (int i = 0; i < pts.Count - 1; i++)
+                {
+                    AppendSegment(pts[i], pts[i + 1], step, output);
+                }
+
+                if (entity.IsClosed && pts.Count >= 3)
+                {
+                    AppendSegment(pts[pts.Count - 1], pts[0], step, output);
+                }
+
+                return;
+            }
+
+            AppendBoundsOutline(entity, step, output);
+        }
+
         private static void AppendCircle(
             SheetEntity entity,
             double step,
             List<Point2D> output)
         {
-            if (!entity.CenterPoint.HasValue || !entity.Radius.HasValue || entity.Radius.Value <= 0)
+            if (!entity.CenterPoint.HasValue ||
+                !entity.Radius.HasValue ||
+                entity.Radius.Value <= 0)
             {
-                output.Add(entity.RepresentativePoint);
+                AppendBoundsOutline(entity, step, output);
                 return;
             }
 
@@ -175,7 +211,7 @@ namespace FluxCAD.SheetAnalysis.ViewIsolation
                 !entity.EndAngleDeg2D.HasValue ||
                 entity.Radius.Value <= 0)
             {
-                output.Add(entity.RepresentativePoint);
+                AppendBoundsOutline(entity, step, output);
                 return;
             }
 
@@ -200,11 +236,34 @@ namespace FluxCAD.SheetAnalysis.ViewIsolation
             }
         }
 
+        private static void AppendBoundsOutline(
+            SheetEntity entity,
+            double step,
+            List<Point2D> output)
+        {
+            var b = entity.Bounds;
+            if (b.IsEmpty)
+            {
+                output.Add(entity.RepresentativePoint);
+                return;
+            }
+
+            var p1 = new Point2D(b.MinX, b.MinY);
+            var p2 = new Point2D(b.MaxX, b.MinY);
+            var p3 = new Point2D(b.MaxX, b.MaxY);
+            var p4 = new Point2D(b.MinX, b.MaxY);
+
+            AppendSegment(p1, p2, step, output);
+            AppendSegment(p2, p3, step, output);
+            AppendSegment(p3, p4, step, output);
+            AppendSegment(p4, p1, step, output);
+        }
+
         private static void AppendSegment(
-    Point2D a,
-    Point2D b,
-    double step,
-    List<Point2D> output)
+            Point2D a,
+            Point2D b,
+            double step,
+            List<Point2D> output)
         {
             var dx = b.X - a.X;
             var dy = b.Y - a.Y;

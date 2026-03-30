@@ -23,7 +23,6 @@ namespace FluxCAD.SheetAnalysis.Structure.Classifiers
 
             var result = new StructuralSeparationResult();
 
-            // GeometryCarrier는 먼저 모아서 logical dedupe 후 대표만 채택
             var geometryCandidates = new List<StructuralUnit>();
 
             foreach (var unit in units)
@@ -81,8 +80,9 @@ namespace FluxCAD.SheetAnalysis.Structure.Classifiers
             foreach (var group in groups)
             {
                 var best = group
-                    .OrderByDescending(GetMemberCount)
-                    .ThenByDescending(GetGeometryMemberCount)
+                    .OrderByDescending(GetGeometryMemberCount)
+                    .ThenByDescending(GetGeometryPurityScore)
+                    .ThenByDescending(GetMemberCount)
                     .ThenBy(GetTextMemberCount)
                     .ThenBy(GetUnitPriority)
                     .ThenBy(x => x.UnitId ?? string.Empty, StringComparer.OrdinalIgnoreCase)
@@ -98,7 +98,6 @@ namespace FluxCAD.SheetAnalysis.Structure.Classifiers
             if (unit == null)
                 return Guid.NewGuid().ToString();
 
-            // 1순위: 멤버 handle 집합
             var handles = unit.Members?
                 .Where(x => x != null && !string.IsNullOrWhiteSpace(x.Handle))
                 .Select(x => x.Handle!.Trim())
@@ -111,7 +110,6 @@ namespace FluxCAD.SheetAnalysis.Structure.Classifiers
                 return "H:" + string.Join("|", handles);
             }
 
-            // 2순위 fallback: 타입 분포 + bounds + 멤버 수
             var typeSignature = unit.Members?
                 .Where(x => x != null)
                 .GroupBy(x => x.EntityType ?? x.Kind.ToString(), StringComparer.OrdinalIgnoreCase)
@@ -160,6 +158,15 @@ namespace FluxCAD.SheetAnalysis.Structure.Classifiers
                 ));
         }
 
+        private static double GetGeometryPurityScore(StructuralUnit unit)
+        {
+            var total = GetMemberCount(unit);
+            if (total <= 0)
+                return 0.0;
+
+            return (double)GetGeometryMemberCount(unit) / total;
+        }
+
         private static bool IsGeometryLikeEntity(SheetEntity entity)
         {
             if (entity == null)
@@ -173,7 +180,10 @@ namespace FluxCAD.SheetAnalysis.Structure.Classifiers
                 || string.Equals(type, "Polyline", StringComparison.OrdinalIgnoreCase)
                 || string.Equals(type, "LwPolyline", StringComparison.OrdinalIgnoreCase)
                 || string.Equals(type, "Ellipse", StringComparison.OrdinalIgnoreCase)
-                || string.Equals(type, "Spline", StringComparison.OrdinalIgnoreCase);
+                || string.Equals(type, "Spline", StringComparison.OrdinalIgnoreCase)
+                || string.Equals(type, "Hatch", StringComparison.OrdinalIgnoreCase)
+                || string.Equals(type, "Solid", StringComparison.OrdinalIgnoreCase)
+                || string.Equals(type, "Region", StringComparison.OrdinalIgnoreCase);
         }
 
         private static int GetUnitPriority(StructuralUnit unit)

@@ -1,8 +1,9 @@
-﻿using System;
-using System.Collections.Generic;
-using System.Linq;
-using FluxCAD.SheetAnalysis;
+﻿using FluxCAD.SheetAnalysis;
 using FluxCAD.SheetAnalysis.Structure.Models;
+using System;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.Linq;
 
 namespace FluxCAD.SheetAnalysis.Structure.Analysis
 {
@@ -42,13 +43,48 @@ namespace FluxCAD.SheetAnalysis.Structure.Analysis
                 TotalMembers = members.Count
             };
 
-            var rawGeometrySeeds = members
-                .Where(IsGeometrySeed)
-                .ToList();
+            FillKindCounts(members.Where(x => x != null), result.MemberKindCounts);
 
-            var textCandidates = members
-                .Where(IsTextCandidate)
-                .ToList();
+            var rejectReasonCounts = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+            var rawGeometrySeeds = new List<SheetEntity>();
+            var textCandidates = new List<SheetEntity>();
+
+            foreach (var member in members)
+            {
+                var rejectReason = GetSeedRejectReason(member);
+                IncrementRejectReason(rejectReasonCounts, rejectReason);
+
+                if (IsGeometrySeed(member))
+                    rawGeometrySeeds.Add(member);
+
+                if (IsTextCandidate(member))
+                    textCandidates.Add(member);
+            }
+
+            int fallbackCount = rawGeometrySeeds.Count(x => x.Bounds.IsEmpty);
+
+            Debug.WriteLine($"[BoundsFallback] applied={fallbackCount}");
+
+            // ✅ 여기부터 추가
+            int fallbackBoundsApplied = 0;
+
+            foreach (var seed in rawGeometrySeeds)
+            {
+                if (seed == null)
+                    continue;
+
+                if (!seed.Bounds.IsEmpty)
+                    continue;
+
+                var fallbackBounds = GeometryBoundsFallbackBuilder.EnsureBounds(seed);
+                if (!fallbackBounds.IsEmpty)
+                {
+                    seed.Bounds = fallbackBounds;
+                    fallbackBoundsApplied++;
+                }
+            }
+            // ✅ 여기까지 추가
+
 
             var geometrySeeds = options.EnableSeedFiltering
                 ? rawGeometrySeeds
@@ -64,12 +100,14 @@ namespace FluxCAD.SheetAnalysis.Structure.Analysis
             FillKindCounts(geometrySeeds, result.GeometrySeedKindCounts);
             FillKindCounts(filteredOutGeometrySeeds, result.FilteredGeometrySeedKindCounts);
 
+            foreach (var kv in rejectReasonCounts.OrderByDescending(x => x.Value).ThenBy(x => x.Key, StringComparer.OrdinalIgnoreCase))
+                result.SeedRejectReasonCounts[kv.Key] = kv.Value;
+
             result.RawGeometrySeedCount = rawGeometrySeeds.Count;
             result.GeometrySeedCount = geometrySeeds.Count;
             result.FilteredOutGeometrySeedCount = filteredOutGeometrySeeds.Count;
             result.TextCandidateCount = textCandidates.Count;
 
-            // 핵심 추가
             result.RawGeometrySeeds.AddRange(rawGeometrySeeds);
             result.GeometrySeeds.AddRange(geometrySeeds);
             result.FilteredGeometrySeeds.AddRange(filteredOutGeometrySeeds);
@@ -151,9 +189,57 @@ namespace FluxCAD.SheetAnalysis.Structure.Analysis
             return result;
         }
 
+        private static void IncrementRejectReason(
+            Dictionary<string, int> counts,
+            string reason)
+        {
+            if (string.IsNullOrWhiteSpace(reason))
+                reason = "unknown";
+
+            if (!counts.TryGetValue(reason, out var value))
+                counts[reason] = 1;
+            else
+                counts[reason] = value + 1;
+        }
+
+        private static string GetSeedRejectReason(SheetEntity member)
+        {
+            if (member == null)
+                return "null";
+
+            if (member.IsBlockReference)
+                return "blockref";
+
+            if (!member.IsGeometryLike)
+            {
+                if (member.IsTextLike)
+                    return "text";
+
+                if (member.IsDimensionLike)
+                    return "dimension";
+
+                return "non-geometry";
+            }
+
+            if (member.IsTextLike)
+                return "text";
+
+            if (member.IsDimensionLike)
+                return "dimension";
+
+            var effectiveBounds = member.Bounds.IsEmpty
+                ? GeometryBoundsFallbackBuilder.EnsureBounds(member)
+                : member.Bounds;
+
+            if (effectiveBounds.IsEmpty && member.Kind != SheetEntityKind.Point)
+                return "empty-bounds";
+
+            return "accepted";
+        }
+
         private static bool ContainsEntity(
-    IReadOnlyList<SheetEntity> list,
-    SheetEntity target)
+            IReadOnlyList<SheetEntity> list,
+            SheetEntity target)
         {
             if (list == null || target == null)
                 return false;
@@ -192,15 +278,19 @@ namespace FluxCAD.SheetAnalysis.Structure.Analysis
             if (member.IsDimensionLike)
                 return false;
 
-            if (member.Bounds.IsEmpty && member.Kind != SheetEntityKind.Point)
+            var effectiveBounds = member.Bounds.IsEmpty
+                ? GeometryBoundsFallbackBuilder.EnsureBounds(member)
+                : member.Bounds;
+
+            if (effectiveBounds.IsEmpty && member.Kind != SheetEntityKind.Point)
                 return false;
 
             return true;
         }
 
         private static void FillKindCounts(
-    IEnumerable<SheetEntity> source,
-    Dictionary<SheetEntityKind, int> target)
+            IEnumerable<SheetEntity> source,
+            Dictionary<SheetEntityKind, int> target)
         {
             target.Clear();
 
