@@ -1,6 +1,7 @@
 ﻿using FluxCAD.SheetAnalysis;
 using System;
 using System.Collections.Generic;
+using System.Linq;
 using Teigha.DatabaseServices;
 using Teigha.Geometry;
 
@@ -10,6 +11,9 @@ namespace FluxCAD.BricsCAD.Plugin26
     {
         public IReadOnlyList<SheetEntity> Build(string sheetFilePath)
         {
+            var ed = Bricscad.ApplicationServices.Application.DocumentManager.MdiActiveDocument.Editor;
+            ed.WriteMessage("\n[SnapshotBuilder] Build entered");
+
             if (string.IsNullOrWhiteSpace(sheetFilePath))
                 throw new ArgumentException("sheetFilePath is null or empty.", nameof(sheetFilePath));
 
@@ -30,7 +34,13 @@ namespace FluxCAD.BricsCAD.Plugin26
                     var msId = SymbolUtilityServices.GetBlockModelSpaceId(db);
                     var ms = (BlockTableRecord)tr.GetObject(msId, OpenMode.ForRead);
 
-                    var transformsToWcs = Array.Empty<Matrix3d>();
+                    var rootContext = new SnapshotExpansionContext(
+                        transformsToWcs: Array.Empty<Matrix3d>(),
+                        blockPath: Array.Empty<string>(),
+                        ownerBlockName: null,
+                        depth: 0,
+                        isInsideBlock: false);
+
                     var blockStack = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
                     foreach (ObjectId id in ms)
@@ -39,18 +49,15 @@ namespace FluxCAD.BricsCAD.Plugin26
                             continue;
 
                         var ent = tr.GetObject(id, OpenMode.ForRead) as Entity;
-                        if (ent == null)
+                        if (ent == null || ent.IsErased)
                             continue;
 
                         ExpandEntityRecursive(
                             ent,
                             tr,
                             result,
-                            transformsToWcs,
-                            blockPath: null,
-                            ownerBlockName: null,
-                            depth: 0,
-                            blockStack: blockStack);
+                            rootContext,
+                            blockStack);
                     }
 
                     tr.Commit();
@@ -64,10 +71,7 @@ namespace FluxCAD.BricsCAD.Plugin26
             Entity ent,
             Transaction tr,
             List<SheetEntity> result,
-            IReadOnlyList<Matrix3d> transformsToWcs,
-            string? blockPath,
-            string? ownerBlockName,
-            int depth,
+            SnapshotExpansionContext context,
             HashSet<string> blockStack)
         {
             if (ent == null || ent.IsErased)
@@ -75,41 +79,65 @@ namespace FluxCAD.BricsCAD.Plugin26
 
             if (ent is not BlockReference br)
             {
-                var sheetEntity = BuildLeafSheetEntity(
-                    ent,
-                    transformsToWcs,
-                    ownerBlockName,
-                    blockPath,
-                    depth);
-
-                if (sheetEntity != null)
-                    result.Add(sheetEntity);
+                var leaf = BuildLeafSheetEntity(ent, context);
+                if (leaf != null)
+                    result.Add(leaf);
 
                 return;
             }
 
-            var currentBlockName = TryGetBlockName(br, tr);
-            var nextBlockPath = AppendBlockPath(blockPath, br, currentBlockName);
+            ExpandBlockReference(br, tr, result, context, blockStack);
+        }
 
-            // AttributeReference는 block definition 안이 아니라 insert instance 쪽에 존재하므로 별도 처리
+        private static void ExpandBlockReference(
+            BlockReference br,
+            Transaction tr,
+            List<SheetEntity> result,
+            SnapshotExpansionContext parentContext,
+            HashSet<string> blockStack)
+        {
+
+            if (br == null || br.IsErased)
+                return;
+
+            var currentBlockName = TryGetBlockName(br, tr);
+
+            var ed = Bricscad.ApplicationServices.Application.DocumentManager.MdiActiveDocument.Editor;
+            ed.WriteMessage(
+                $"\n[BlockExpand] handle={br.Handle}, name={currentBlockName ?? "(null)"}, depth={parentContext.Depth}");
+
+            var nextBlockPath = AppendBlockPath(parentContext.BlockPath, br, currentBlockName);
+
+            // 1) BlockReference 자체를 container snapshot으로 남긴다.
+            var container = BuildContainerSheetEntity(
+                br,
+                parentContext,
+                currentBlockName,
+                nextBlockPath);
+
+            if (container != null)
+                result.Add(container);
+
+            // 2) AttributeReference는 insert instance 쪽에 있으므로 별도 leaf로 남긴다.
             foreach (ObjectId attrId in br.AttributeCollection)
             {
                 if (!attrId.IsValid || attrId.IsErased)
                     continue;
 
                 var attr = tr.GetObject(attrId, OpenMode.ForRead) as AttributeReference;
-                if (attr == null)
+                if (attr == null || attr.IsErased)
                     continue;
 
-                var attrEntity = BuildLeafSheetEntity(
-                    attr,
-                    transformsToWcs,
-                    currentBlockName,
-                    nextBlockPath,
-                    depth + 1);
+                var attrContext = new SnapshotExpansionContext(
+                    transformsToWcs: parentContext.TransformsToWcs,
+                    blockPath: nextBlockPath,
+                    ownerBlockName: currentBlockName,
+                    depth: parentContext.Depth + 1,
+                    isInsideBlock: true);
 
-                if (attrEntity != null)
-                    result.Add(attrEntity);
+                var attrLeaf = BuildLeafSheetEntity(attr, attrContext);
+                if (attrLeaf != null)
+                    result.Add(attrLeaf);
             }
 
             BlockTableRecord? btr = null;
@@ -125,13 +153,14 @@ namespace FluxCAD.BricsCAD.Plugin26
             if (btr == null)
                 return;
 
-            var recursionKey = GetRecursionKey(btr, currentBlockName);
-            if (!blockStack.Add(recursionKey))
-                return;
+            // ===== 여기부터 디버그 로그 1 =====
+            var brHandle = br.Handle.ToString();
 
-            try
+            if (brHandle.Equals("10B", StringComparison.OrdinalIgnoreCase))
             {
-                var childTransformsToWcs = PrependTransform(transformsToWcs, br.BlockTransform);
+                int total = 0;
+                int refs = 0;
+                int leafs = 0;
 
                 foreach (ObjectId childId in btr)
                 {
@@ -139,17 +168,70 @@ namespace FluxCAD.BricsCAD.Plugin26
                         continue;
 
                     var child = tr.GetObject(childId, OpenMode.ForRead) as Entity;
-                    if (child == null)
+                    if (child == null || child.IsErased)
                         continue;
+
+                    total++;
+
+                    if (child is BlockReference)
+                        refs++;
+                    else
+                        leafs++;
+                }
+
+                //var ed = Bricscad.ApplicationServices.Application.DocumentManager.MdiActiveDocument.Editor;
+                ed.WriteMessage(
+                    $"\n[Block10B] depth={parentContext.Depth}, name={currentBlockName ?? "(null)"}, total={total}, refs={refs}, leafs={leafs}");
+            }
+
+
+            var recursionKey = GetRecursionKey(btr, currentBlockName);
+
+            if (!blockStack.Add(recursionKey))
+            {
+                if (br.Handle.ToString().Equals("10B", StringComparison.OrdinalIgnoreCase))
+                {
+                    //var ed = Bricscad.ApplicationServices.Application.DocumentManager.MdiActiveDocument.Editor;
+                    ed.WriteMessage(
+                        $"\n[Block10B-SKIP] depth={parentContext.Depth}, name={currentBlockName ?? "(null)"}, key={recursionKey}");
+                }
+
+                return;
+            }
+
+            try
+            {
+                var childTransformsToWcs = PrependTransform(parentContext.TransformsToWcs, br.BlockTransform);
+
+                var childContext = new SnapshotExpansionContext(
+                    transformsToWcs: childTransformsToWcs,
+                    blockPath: nextBlockPath,
+                    ownerBlockName: currentBlockName,
+                    depth: parentContext.Depth + 1,
+                    isInsideBlock: true);
+
+                foreach (ObjectId childId in btr)
+                {
+                    if (!childId.IsValid || childId.IsErased)
+                        continue;
+
+                    var child = tr.GetObject(childId, OpenMode.ForRead) as Entity;
+                    if (child == null || child.IsErased)
+                        continue;
+
+                    if (br.Handle.ToString().Equals("10B", StringComparison.OrdinalIgnoreCase))
+                    {
+                        //var ed = Bricscad.ApplicationServices.Application.DocumentManager.MdiActiveDocument.Editor;
+                        ed.WriteMessage(
+                            $"\n[Block10B-Child] type={child.GetType().Name}, handle={child.Handle}");
+                    }
+
 
                     ExpandEntityRecursive(
                         child,
                         tr,
                         result,
-                        childTransformsToWcs,
-                        nextBlockPath,
-                        currentBlockName,
-                        depth + 1,
+                        childContext,
                         blockStack);
                 }
             }
@@ -159,27 +241,90 @@ namespace FluxCAD.BricsCAD.Plugin26
             }
         }
 
+
+
+        private static SheetEntity? BuildContainerSheetEntity(
+            BlockReference sourceBr,
+            SnapshotExpansionContext parentContext,
+            string? currentBlockName,
+            IReadOnlyList<string> nextBlockPath)
+        {
+            Entity? wcsEnt = null;
+
+            try
+            {
+                wcsEnt = (Entity)sourceBr.Clone();
+                ApplyTransforms(wcsEnt, parentContext.TransformsToWcs);
+
+                var bounds = TryGetBounds(wcsEnt, out var b)
+                    ? b
+                    : Bounds2D.Empty;
+
+                var anchor = TryGetAnchor(wcsEnt, out var a)
+                    ? a
+                    : bounds.Center;
+
+                var scaleX = SafeNonZero(sourceBr.ScaleFactors.X);
+                var scaleY = SafeNonZero(sourceBr.ScaleFactors.Y);
+
+                var entity = new SheetEntity
+                {
+                    Handle = sourceBr.Handle.ToString(),
+                    Kind = SheetEntityKind.BlockReference,
+                    EntityType = sourceBr.GetType().Name,
+                    Layer = sourceBr.Layer ?? string.Empty,
+                    BlockName = currentBlockName,
+                    BlockPath = nextBlockPath,
+                    Bounds = bounds,
+                    Anchor = anchor,
+                    Role = ResolveRole(sourceBr),
+                    RotationDeg = TryGetRotationDeg(sourceBr),
+                    TextHeight = 0.0,
+                    ScaleX = scaleX,
+                    ScaleY = scaleY,
+                    IsVisible = !sourceBr.IsErased,
+                    Depth = parentContext.Depth,
+                    SourceKind = ResolveBlockContainerSourceKind(),
+                    SnapshotKey = BuildSnapshotKey(
+                        prefix: "C",
+                        handle: sourceBr.Handle.ToString(),
+                        depth: parentContext.Depth,
+                        entityType: sourceBr.GetType().Name,
+                        blockPath: nextBlockPath)
+                };
+
+                PopulateGeometryFields(entity, wcsEnt);
+                return entity;
+            }
+            catch
+            {
+                return null;
+            }
+            finally
+            {
+                wcsEnt?.Dispose();
+            }
+        }
+
+
         private static SheetEntity? BuildLeafSheetEntity(
-            Entity sourceEnt,
-            IReadOnlyList<Matrix3d> transformsToWcs,
-            string? ownerBlockName,
-            string? blockPath,
-            int depth)
+    Entity sourceEnt,
+    SnapshotExpansionContext context)
         {
             Entity? wcsEnt = null;
 
             try
             {
                 wcsEnt = (Entity)sourceEnt.Clone();
-
-                ApplyTransforms(wcsEnt, transformsToWcs);
+                ApplyTransforms(wcsEnt, context.TransformsToWcs);
 
                 var kind = ResolveKind(wcsEnt);
                 var role = ResolveRole(wcsEnt);
+                var sourceKind = ResolveLeafSourceKind(wcsEnt, context.IsInsideBlock);
 
                 var bounds = TryGetBounds(wcsEnt, out var b)
                     ? b
-                    : new Bounds2D(0, 0, 0, 0);
+                    : Bounds2D.Empty;
 
                 var anchor = TryGetAnchor(wcsEnt, out var a)
                     ? a
@@ -187,8 +332,10 @@ namespace FluxCAD.BricsCAD.Plugin26
 
                 string? text = ExtractText(wcsEnt);
                 string? normalized = NormalizeText(text);
+
                 double rotationDeg = TryGetRotationDeg(wcsEnt);
                 double textHeight = TryGetTextHeight(wcsEnt);
+
                 double scaleX = 1.0;
                 double scaleY = 1.0;
 
@@ -202,8 +349,10 @@ namespace FluxCAD.BricsCAD.Plugin26
                 {
                     Handle = sourceEnt.Handle.ToString(),
                     Kind = kind,
+                    EntityType = wcsEnt.GetType().Name,
                     Layer = sourceEnt.Layer ?? string.Empty,
-                    BlockName = ownerBlockName,
+                    BlockName = context.OwnerBlockName,
+                    BlockPath = context.BlockPath,
                     Bounds = bounds,
                     Anchor = anchor,
                     Role = role,
@@ -213,17 +362,19 @@ namespace FluxCAD.BricsCAD.Plugin26
                     TextHeight = textHeight,
                     ScaleX = scaleX,
                     ScaleY = scaleY,
-                    IsVisible = !sourceEnt.IsErased
+                    IsVisible = !sourceEnt.IsErased,
+                    Depth = context.Depth,
+                    SourceKind = sourceKind,
+                    SnapshotKey = BuildSnapshotKey(
+                        prefix: "L",
+                        handle: sourceEnt.Handle.ToString(),
+                        depth: context.Depth,
+                        entityType: wcsEnt.GetType().Name,
+                        blockPath: context.BlockPath)
                 };
 
                 PopulateGeometryFields(sheetEntity, wcsEnt);
-
-                // SheetEntity에 해당 속성이 있으면 기록
-                TrySetOptionalProperty(sheetEntity, "BlockPath", blockPath);
-                TrySetOptionalProperty(sheetEntity, "Depth", depth);
-
                 return sheetEntity;
-
             }
             catch
             {
@@ -233,6 +384,17 @@ namespace FluxCAD.BricsCAD.Plugin26
             {
                 wcsEnt?.Dispose();
             }
+        }
+
+        private static SheetEntitySourceKind ResolveLeafSourceKind(Entity ent, bool isInsideBlock)
+        {
+            if (ent == null)
+                return SheetEntitySourceKind.Unknown;
+
+            if (IsAnnotationLike(ent))
+                return SheetEntitySourceKind.AnnotationLeaf;
+
+            return SheetEntitySourceKind.GeometryLeaf;
         }
 
         private static void PopulateGeometryFields(SheetEntity target, Entity ent)
@@ -253,7 +415,7 @@ namespace FluxCAD.BricsCAD.Plugin26
 
                     case Polyline pl:
                         {
-                            var pts = new List<Point2D>();
+                            var pts = new List<Point2D>(pl.NumberOfVertices);
 
                             for (int i = 0; i < pl.NumberOfVertices; i++)
                             {
@@ -268,23 +430,34 @@ namespace FluxCAD.BricsCAD.Plugin26
 
                     case Circle c:
                         {
-                            target.CenterPoint = new Point2D(c.Center.X, c.Center.Y);
+                            var center = new Point2D(c.Center.X, c.Center.Y);
+                            target.CenterPoint = center;
+                            target.Center = center;
                             target.Radius = c.Radius;
                             break;
                         }
 
                     case Arc a:
                         {
-                            target.CenterPoint = new Point2D(a.Center.X, a.Center.Y);
+                            var center = new Point2D(a.Center.X, a.Center.Y);
+                            var startDeg = RadToDeg(a.StartAngle);
+                            var endDeg = RadToDeg(a.EndAngle);
+
+                            target.CenterPoint = center;
+                            target.Center = center;
                             target.Radius = a.Radius;
-                            target.StartAngleDeg2D = RadToDeg(a.StartAngle);
-                            target.EndAngleDeg2D = RadToDeg(a.EndAngle);
+                            target.StartAngleDeg2D = startDeg;
+                            target.EndAngleDeg2D = endDeg;
+                            target.StartAngleDeg = startDeg;
+                            target.EndAngleDeg = endDeg;
                             break;
                         }
 
                     case Ellipse e:
                         {
-                            target.CenterPoint = new Point2D(e.Center.X, e.Center.Y);
+                            var center = new Point2D(e.Center.X, e.Center.Y);
+                            target.CenterPoint = center;
+                            target.Center = center;
 
                             var major = e.MajorAxis;
                             var majorRadius = Math.Sqrt(
@@ -299,6 +472,18 @@ namespace FluxCAD.BricsCAD.Plugin26
                             target.EllipseRotationDeg2D = RadToDeg(Math.Atan2(major.Y, major.X));
                             break;
                         }
+
+                    // Spline은 occupancy seed 확장을 위해 fallback vertex를 남기는 것이 유리하다.
+                    case Spline sp:
+                        {
+                            var pts = TrySampleSpline(sp);
+                            if (pts.Count > 0)
+                            {
+                                target.Vertices = pts;
+                                target.IsClosed = sp.Closed;
+                            }
+                            break;
+                        }
                 }
             }
             catch
@@ -307,11 +492,39 @@ namespace FluxCAD.BricsCAD.Plugin26
             }
         }
 
-        
+        private static IReadOnlyList<Point2D> TrySampleSpline(Spline sp)
+        {
+            var result = new List<Point2D>();
+
+            if (sp == null)
+                return result;
+
+            try
+            {
+                // 현재 Teigha 환경에서는 GetPointAtParam 사용 불가.
+                // 우선은 GeometricExtents 기반 fallback만 사용한다.
+                var ext = sp.GeometricExtents;
+
+                var min = new Point2D(ext.MinPoint.X, ext.MinPoint.Y);
+                var max = new Point2D(ext.MaxPoint.X, ext.MaxPoint.Y);
+
+                // 완전히 비워두기보다 최소한의 범위 정보라도 남긴다.
+                result.Add(min);
+                result.Add(new Point2D(ext.MaxPoint.X, ext.MinPoint.Y));
+                result.Add(max);
+                result.Add(new Point2D(ext.MinPoint.X, ext.MaxPoint.Y));
+
+                return result;
+            }
+            catch
+            {
+                return result;
+            }
+        }
 
         private static void ApplyTransforms(Entity ent, IReadOnlyList<Matrix3d> transformsToWcs)
         {
-            if (transformsToWcs == null)
+            if (transformsToWcs == null || transformsToWcs.Count == 0)
                 return;
 
             for (int i = 0; i < transformsToWcs.Count; i++)
@@ -320,8 +533,6 @@ namespace FluxCAD.BricsCAD.Plugin26
             }
         }
 
-        // 현재 block의 transform을 맨 앞에 넣는다.
-        // leaf에 적용할 때는 [inner, outer, outerouter...] 순서로 TransformBy 된다.
         private static IReadOnlyList<Matrix3d> PrependTransform(
             IReadOnlyList<Matrix3d> transformsToWcs,
             Matrix3d currentBlockTransform)
@@ -344,10 +555,21 @@ namespace FluxCAD.BricsCAD.Plugin26
         {
             return ent switch
             {
-                Line or Polyline or Arc or Circle or Ellipse or Hatch or Solid => SheetEntityRole.Geometry,
-                AttributeReference or DBText or MText => SheetEntityRole.Text,
-                Leader => SheetEntityRole.Leader,
-                Dimension => SheetEntityRole.Dimension,
+                Line or Polyline or Arc or Circle or Ellipse or Hatch or Solid or Spline
+                    => SheetEntityRole.Geometry,
+
+                AttributeReference or DBText or MText
+                    => SheetEntityRole.Text,
+
+                Leader
+                    => SheetEntityRole.Leader,
+
+                Dimension
+                    => SheetEntityRole.Dimension,
+
+//                 BlockReference
+//                     => SheetEntityRole.Unknown,
+
                 _ => SheetEntityRoleClassifier.Classify(ent.GetType().Name)
             };
         }
@@ -363,6 +585,7 @@ namespace FluxCAD.BricsCAD.Plugin26
                 Ellipse => SheetEntityKind.Ellipse,
                 Hatch => SheetEntityKind.Hatch,
                 Solid => SheetEntityKind.Solid,
+                Spline => SheetEntityKind.Spline,
 
                 AttributeReference => SheetEntityKind.InsertAttribute,
                 DBText => SheetEntityKind.Text,
@@ -391,7 +614,7 @@ namespace FluxCAD.BricsCAD.Plugin26
             }
             catch
             {
-                bounds = new Bounds2D(0, 0, 0, 0);
+                bounds = Bounds2D.Empty;
                 return false;
             }
         }
@@ -402,6 +625,10 @@ namespace FluxCAD.BricsCAD.Plugin26
             {
                 switch (ent)
                 {
+                    case AttributeReference ar:
+                        anchor = new Point2D(ar.Position.X, ar.Position.Y);
+                        return true;
+
                     case DBText t:
                         anchor = new Point2D(t.Position.X, t.Position.Y);
                         return true;
@@ -410,12 +637,17 @@ namespace FluxCAD.BricsCAD.Plugin26
                         anchor = new Point2D(mt.Location.X, mt.Location.Y);
                         return true;
 
+
                     case Circle c:
                         anchor = new Point2D(c.Center.X, c.Center.Y);
                         return true;
 
                     case Arc a:
                         anchor = new Point2D(a.Center.X, a.Center.Y);
+                        return true;
+
+                    case Ellipse e:
+                        anchor = new Point2D(e.Center.X, e.Center.Y);
                         return true;
 
                     case BlockReference br:
@@ -429,18 +661,31 @@ namespace FluxCAD.BricsCAD.Plugin26
                         return true;
 
                     case Polyline pl:
-                        var ext = pl.GeometricExtents;
-                        anchor = new Point2D(
-                            (ext.MinPoint.X + ext.MaxPoint.X) * 0.5,
-                            (ext.MinPoint.Y + ext.MaxPoint.Y) * 0.5);
-                        return true;
+                        {
+                            var ext = pl.GeometricExtents;
+                            anchor = new Point2D(
+                                (ext.MinPoint.X + ext.MaxPoint.X) * 0.5,
+                                (ext.MinPoint.Y + ext.MaxPoint.Y) * 0.5);
+                            return true;
+                        }
+
+                    case Spline sp:
+                        {
+                            var ext = sp.GeometricExtents;
+                            anchor = new Point2D(
+                                (ext.MinPoint.X + ext.MaxPoint.X) * 0.5,
+                                (ext.MinPoint.Y + ext.MaxPoint.Y) * 0.5);
+                            return true;
+                        }
 
                     case Dimension dim:
-                        var dext = dim.GeometricExtents;
-                        anchor = new Point2D(
-                            (dext.MinPoint.X + dext.MaxPoint.X) * 0.5,
-                            (dext.MinPoint.Y + dext.MaxPoint.Y) * 0.5);
-                        return true;
+                        {
+                            var dext = dim.GeometricExtents;
+                            anchor = new Point2D(
+                                (dext.MinPoint.X + dext.MaxPoint.X) * 0.5,
+                                (dext.MinPoint.Y + dext.MaxPoint.Y) * 0.5);
+                            return true;
+                        }
                 }
 
                 if (TryGetBounds(ent, out var b))
@@ -537,15 +782,22 @@ namespace FluxCAD.BricsCAD.Plugin26
             }
         }
 
-        private static string AppendBlockPath(string? currentPath, BlockReference br, string? blockName)
+        private static IReadOnlyList<string> AppendBlockPath(
+            IReadOnlyList<string>? currentPath,
+            BlockReference br,
+            string? blockName)
         {
             var segment = string.IsNullOrWhiteSpace(blockName)
                 ? br.Handle.ToString()
-                : blockName + ":" + br.Handle.ToString();
+                : $"{blockName}:{br.Handle}";
 
-            return string.IsNullOrWhiteSpace(currentPath)
-                ? segment
-                : currentPath + "/" + segment;
+            if (currentPath == null || currentPath.Count == 0)
+                return new[] { segment };
+
+            var list = new List<string>(currentPath.Count + 1);
+            list.AddRange(currentPath);
+            list.Add(segment);
+            return list;
         }
 
         private static string GetRecursionKey(BlockTableRecord btr, string? blockName)
@@ -553,19 +805,18 @@ namespace FluxCAD.BricsCAD.Plugin26
             return btr.Handle.ToString() + "|" + (blockName ?? string.Empty);
         }
 
-        private static void TrySetOptionalProperty(SheetEntity entity, string propertyName, object? value)
+        private static string BuildSnapshotKey(
+            string prefix,
+            string handle,
+            int depth,
+            string entityType,
+            IReadOnlyList<string>? blockPath)
         {
-            try
-            {
-                var prop = entity.GetType().GetProperty(propertyName);
-                if (prop == null || !prop.CanWrite)
-                    return;
+            var path = (blockPath == null || blockPath.Count == 0)
+                ? "-"
+                : string.Join(">", blockPath);
 
-                prop.SetValue(entity, value, null);
-            }
-            catch
-            {
-            }
+            return $"{prefix}|{handle}|D{depth}|{entityType}|{path}";
         }
 
         private static double SafeNonZero(double value)
@@ -576,6 +827,62 @@ namespace FluxCAD.BricsCAD.Plugin26
         private static double RadToDeg(double rad)
         {
             return rad * 180.0 / Math.PI;
+        }
+
+        private static SheetEntitySourceKind ResolveModelSpaceSourceKind(Entity ent)
+        {
+            return IsAnnotationLike(ent)
+                ? SheetEntitySourceKind.AnnotationLeaf
+                : SheetEntitySourceKind.GeometryLeaf;
+        }
+
+        private static SheetEntitySourceKind ResolveExpandedBlockLeafSourceKind(Entity ent)
+        {
+            return IsAnnotationLike(ent)
+                ? SheetEntitySourceKind.AnnotationLeaf
+                : SheetEntitySourceKind.GeometryLeaf;
+        }
+
+        private static SheetEntitySourceKind ResolveInsertAttributeSourceKind()
+        {
+            return SheetEntitySourceKind.AnnotationLeaf;
+        }
+
+        private static SheetEntitySourceKind ResolveBlockContainerSourceKind()
+        {
+            return SheetEntitySourceKind.ContainerBlock;
+        }
+
+        private static bool IsAnnotationLike(Entity ent)
+        {
+            return ent is AttributeReference
+                || ent is DBText
+                || ent is MText
+                || ent is Leader
+                || ent is Dimension;
+        }
+
+        private sealed class SnapshotExpansionContext
+        {
+            public SnapshotExpansionContext(
+                IReadOnlyList<Matrix3d> transformsToWcs,
+                IReadOnlyList<string> blockPath,
+                string? ownerBlockName,
+                int depth,
+                bool isInsideBlock)
+            {
+                TransformsToWcs = transformsToWcs ?? Array.Empty<Matrix3d>();
+                BlockPath = blockPath ?? Array.Empty<string>();
+                OwnerBlockName = ownerBlockName;
+                Depth = depth;
+                IsInsideBlock = isInsideBlock;
+            }
+
+            public IReadOnlyList<Matrix3d> TransformsToWcs { get; }
+            public IReadOnlyList<string> BlockPath { get; }
+            public string? OwnerBlockName { get; }
+            public int Depth { get; }
+            public bool IsInsideBlock { get; }
         }
     }
 }

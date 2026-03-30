@@ -396,6 +396,7 @@ namespace FluxCAD.BricsCAD.Plugin26
             }
         }
 
+
         [CommandMethod("FLUX_DEBUG_OCCUPANCY_ISLANDS_WITH_CELLS")]
         public void FluxDebugOccupancyIslandsWithCells()
         {
@@ -423,7 +424,12 @@ namespace FluxCAD.BricsCAD.Plugin26
 
                 var sheetBounds = Bounds2DHelper.FromEntities(entities);
 
-                var gridInput = PrepareOccupancyInput(entities, sheetBounds, ed);
+                var gridInput = PrepareOccupancyInput(
+                    entities,
+                    sheetBounds,
+                    ed,
+                    OccupancyInputMode.RawAllGeometrySeeds);
+
                 if (gridInput.Count == 0)
                 {
                     ed.WriteMessage("\n[FluxCAD] occupancy input이 비어 있습니다.");
@@ -828,17 +834,37 @@ namespace FluxCAD.BricsCAD.Plugin26
             }
 
             // 5) handle 기준 dedupe
+            /*
             finalEntities = finalEntities
                 .GroupBy(GetOccupancyDedupKey)
                 .Select(g => g.First())
                 .Where(x => x != null && !x.Bounds.IsEmpty)
                 .ToList();
+            */
+
+
+
+            var grouped = finalEntities
+    .GroupBy(GetOccupancyDedupKey)
+    .OrderByDescending(g => g.Count())
+    .ToList();
+
+            ed.WriteMessage($"\n[FluxCAD] Dedupe groups={grouped.Count}");
+
+            foreach (var g in grouped.Where(x => x.Count() > 1).Take(30))
+            {
+                ed.WriteMessage(
+                    $"\n  [DedupeGroup] key={g.Key}, count={g.Count()}, " +
+                    $"types={string.Join(",", g.Select(x => x.EntityTypeName).Distinct())}");
+            }
 
             ed.WriteMessage(
-    $"\n[FluxCAD] OccupancyInput mode={mode}, unitsUsed={usedUnitCount}, " +
-    $"rawSeeds={totalRawSeedCount}, geometrySeeds={totalGeometrySeedCount}, " +
-    $"filteredOut={totalFilteredOutSeedCount}, acceptedGeometrySeeds={totalAcceptedSeedCount}, " +
-    $"primitives={finalEntities.Count}");
+                $"\n[FluxCAD] OccupancyInput mode={mode}, unitsUsed={usedUnitCount}, " +
+                $"rawSeeds={totalRawSeedCount}, geometrySeeds={totalGeometrySeedCount}, " +
+                $"filteredOut={totalFilteredOutSeedCount}, acceptedGeometrySeeds={totalAcceptedSeedCount}, " +
+                $"primitives={finalEntities.Count}");
+
+
             return finalEntities;
         }
 
@@ -968,6 +994,27 @@ namespace FluxCAD.BricsCAD.Plugin26
         }
 
         private static string GetOccupancyDedupKey(SheetEntity entity)
+        {
+            if (entity == null)
+                return Guid.NewGuid().ToString();
+
+            var type = entity.EntityType ?? entity.Kind.ToString();
+            var layer = entity.Layer ?? "";
+            var block = entity.BlockName ?? "";
+            var handle = entity.Handle ?? "";
+
+            return string.Join("|",
+                type,
+                layer,
+                block,
+                handle,
+                Math.Round(entity.Bounds.MinX, 4).ToString(),
+                Math.Round(entity.Bounds.MinY, 4).ToString(),
+                Math.Round(entity.Bounds.MaxX, 4).ToString(),
+                Math.Round(entity.Bounds.MaxY, 4).ToString());
+        }
+
+        private static string GetOccupancyDedupKey_old(SheetEntity entity)
         {
             if (entity == null)
                 return Guid.NewGuid().ToString();
@@ -1463,7 +1510,12 @@ namespace FluxCAD.BricsCAD.Plugin26
 
                 var sheetBounds = Bounds2DHelper.FromEntities(entities);
 
-                var gridInput = PrepareOccupancyInput(entities, sheetBounds, ed);
+                var gridInput = PrepareOccupancyInput(
+                    entities,
+                    sheetBounds,
+                    ed,
+                    OccupancyInputMode.RawAllGeometrySeeds);
+
                 if (gridInput.Count == 0)
                 {
                     ed.WriteMessage("\n[FluxCAD] occupancy input이 비어 있습니다.");
@@ -1486,6 +1538,17 @@ namespace FluxCAD.BricsCAD.Plugin26
                     .ThenByDescending(x => x.Area)
                     .ToList();
 
+                ed.WriteMessage($"\n[FluxCAD] OccupancyIslands count={islands.Count}");
+
+                foreach (var island in islands.OrderByDescending(x => x.CellCount))
+                {
+                    ed.WriteMessage(
+                        $"\n  [Island] id={island.Id}, cells={island.CellCount}, " +
+                        $"rows={island.MinRow}-{island.MaxRow}, cols={island.MinCol}-{island.MaxCol}, " +
+                        $"bounds=({island.Bounds.MinX:0.##},{island.Bounds.MinY:0.##})-({island.Bounds.MaxX:0.##},{island.Bounds.MaxY:0.##}), " +
+                        $"w={island.Bounds.Width:0.##}, h={island.Bounds.Height:0.##}, area={island.Bounds.Area:0.##}");
+                }
+
                 using (doc.LockDocument())
                 using (var tr = db.TransactionManager.StartTransaction())
                 {
@@ -1503,7 +1566,7 @@ namespace FluxCAD.BricsCAD.Plugin26
                 }
 
                 ed.WriteMessage(
-    $"\n[FluxCAD] Occupancy islands raw={rawIslands.Count}, filtered={islands.Count}, occupiedCells={buildResult.OccupiedCount}");
+                    $"\n[FluxCAD] Occupancy islands raw={rawIslands.Count}, filtered={islands.Count}, occupiedCells={buildResult.OccupiedCount}");
             }
             catch (System.Exception ex)
             {
