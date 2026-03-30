@@ -1,14 +1,15 @@
 ﻿using System;
 using System.Collections.Generic;
 using System.Linq;
+using FluxCAD.SheetAnalysis;
 
 namespace FluxCAD.SheetAnalysis.ViewIsolation
 {
-    public sealed class OccupancyIsland
+    public sealed class OccupancyHitIsland
     {
         public int Id { get; init; }
 
-        public List<OccupancyGridCell> Cells { get; } = new();
+        public List<OccupancyGridHitCell> Cells { get; } = new();
 
         public Bounds2D Bounds { get; private set; } = Bounds2D.Empty;
 
@@ -23,14 +24,24 @@ namespace FluxCAD.SheetAnalysis.ViewIsolation
         public double Height => Bounds.Height;
         public double Area => Bounds.Area;
 
-        // =========================
-        // Geometry-content 판정용
-        // =========================
         public bool OverlapsDimension { get; set; }
         public int OverlapDimensionCount { get; set; }
-        public bool IsStrongGeometryContent => OverlapsDimension;
 
-        public void AddCell(OccupancyGridCell cell)
+        public int RowSpan => CellCount == 0 ? 0 : (MaxRow - MinRow + 1);
+        public int ColSpan => CellCount == 0 ? 0 : (MaxCol - MinCol + 1);
+        public int BoundingCellCapacity => RowSpan * ColSpan;
+
+        public double FillRatio =>
+            BoundingCellCapacity <= 0 ? 0 : (double)CellCount / BoundingCellCapacity;
+
+        public bool IsSparseBridgeLike { get; set; }
+
+        public ViewIslandSemanticRole SemanticRole { get; set; } = ViewIslandSemanticRole.Unknown;
+        public string SemanticReason { get; set; } = string.Empty;
+
+        public bool IsStrongGeometryContent => OverlapsDimension && !IsSparseBridgeLike;
+
+        public void AddCell(OccupancyGridHitCell cell)
         {
             if (cell == null)
                 throw new ArgumentNullException(nameof(cell));
@@ -47,14 +58,6 @@ namespace FluxCAD.SheetAnalysis.ViewIsolation
             }
 
             Bounds = Bounds2DHelper.Union(Cells.Select(x => x.Bounds));
-        }
-
-        public override string ToString()
-        {
-            return
-                $"Island[{Id}] Cells={CellCount}, " +
-                $"Bounds=({Bounds.MinX},{Bounds.MinY})-({Bounds.MaxX},{Bounds.MaxY}), " +
-                $"DimOverlap={OverlapsDimension}, DimCount={OverlapDimensionCount}";
         }
     }
 }

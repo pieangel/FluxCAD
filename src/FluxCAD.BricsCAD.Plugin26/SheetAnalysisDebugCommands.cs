@@ -28,6 +28,697 @@ namespace FluxCAD.BricsCAD.Plugin26
             RawAllGeometrySeeds
         }
 
+        [CommandMethod("FLUX_DEBUG_VIEW_ISLAND_ENTITIES")]
+        public void FluxDebugViewIslandEntities()
+        {
+            var doc = Application.DocumentManager.MdiActiveDocument;
+            if (doc == null)
+                return;
+
+            var db = doc.Database;
+            var ed = doc.Editor;
+
+            try
+            {
+                var sheetFilePath = db.Filename;
+                if (string.IsNullOrWhiteSpace(sheetFilePath))
+                {
+                    ed.WriteMessage("\n[FluxCAD] 저장된 DWG 파일이 아닙니다.");
+                    return;
+                }
+
+                IEntitySnapshotBuilder snapshotBuilder = new SimpleSheetFileSnapshotBuilder();
+                var entities = snapshotBuilder.Build(sheetFilePath);
+
+                if (entities == null || entities.Count == 0)
+                {
+                    ed.WriteMessage("\n[FluxCAD] snapshot이 비어 있습니다.");
+                    return;
+                }
+
+                var sheetBounds = Bounds2DHelper.FromEntities(entities);
+                if (sheetBounds.IsEmpty)
+                {
+                    ed.WriteMessage("\n[FluxCAD] sheet bounds가 비어 있습니다.");
+                    return;
+                }
+
+                var gridInput = PrepareOccupancyInput(
+                    entities,
+                    sheetBounds,
+                    ed,
+                    OccupancyInputMode.RawAllGeometrySeeds);
+
+                if (gridInput == null || gridInput.Count == 0)
+                {
+                    ed.WriteMessage("\n[FluxCAD] view island stroke input이 비어 있습니다.");
+                    return;
+                }
+
+                const int rows = 120;
+                const int cols = 120;
+
+                var hitMapBuilder = new StrokeOccupancyGridHitMapBuilder();
+                var hitMap = hitMapBuilder.Build(
+                    gridInput,
+                    sheetBounds,
+                    rows,
+                    cols);
+
+                var islandFinder = new OccupancyHitIslandFinder();
+                var hitGrid = BuildHitGrid(hitMap);
+
+                var islands = islandFinder.Find(hitGrid)
+                    .Where(x => x.CellCount > 2)
+                    .ToList();
+
+                var matcher = new DimensionOverlapMatcherForHitIslands();
+                matcher.Apply(islands, entities, tolerance: 0);
+
+                foreach (var island in islands)
+                    island.IsSparseBridgeLike = IsSparseGiantHitIsland(island, hitMap);
+
+                var collector = new ViewIslandEntityCollector();
+                var groups = collector.Collect(islands, entities, tolerance: 0);
+
+                var classifier = new ViewIslandSemanticClassifier();
+                var semanticResults = groups
+                    .Select(g => classifier.Classify(g, sheetBounds))
+                    .ToList();
+
+                foreach (var result in semanticResults)
+                {
+                    result.Island.SemanticRole = result.Role;
+                    result.Island.SemanticReason = result.Reason;
+                }
+
+                var rankedGroups = groups
+                    .OrderByDescending(g => g.Island.SemanticRole == ViewIslandSemanticRole.GeometryView)
+                    .ThenByDescending(g => g.Island.IsStrongGeometryContent)
+                    .ThenBy(g => g.Island.SemanticRole == ViewIslandSemanticRole.SparseBridge)
+                    .ThenByDescending(g => g.Island.OverlapDimensionCount)
+                    .ThenByDescending(g => g.Island.CellCount)
+                    .ToList();
+
+                WriteViewIslandEntityGroups(ed, rankedGroups);
+
+                using (doc.LockDocument())
+                using (var tr = db.TransactionManager.StartTransaction())
+                {
+                    DrawSemanticHitIslandOverlays(
+                        db,
+                        tr,
+                        rankedGroups,
+                        clearLayerFirst: true,
+                        drawLabels: true);
+
+                    tr.Commit();
+                }
+
+                ed.WriteMessage(
+                    $"\n[FluxCAD] ViewIslandEntities count={rankedGroups.Count}, " +
+                    $"on={hitMap.OnCount}, both={hitMap.BothCount}, " +
+                    $"boundsOnly={hitMap.BoundsOnlyCount}, repOnly={hitMap.RepOnlyCount}");
+            }
+            catch (System.Exception ex)
+            {
+                ed.WriteMessage($"\n[FluxCAD] FLUX_DEBUG_VIEW_ISLAND_ENTITIES failed: {ex}");
+            }
+        }
+
+        private static void DrawSemanticHitIslandOverlays(
+    Teigha.DatabaseServices.Database db,
+    Teigha.DatabaseServices.Transaction tr,
+    IReadOnlyList<ViewIslandEntityGroup> groups,
+    bool clearLayerFirst,
+    bool drawLabels)
+        {
+            if (db == null)
+                throw new ArgumentNullException(nameof(db));
+
+            if (tr == null)
+                throw new ArgumentNullException(nameof(tr));
+
+            if (groups == null || groups.Count == 0)
+                return;
+
+            const string layerName = "FLUX_VIEW_ISLAND_SEMANTICS";
+
+            EnsureDebugLayer(db, tr, layerName, clearLayerFirst);
+
+            var bt = (Teigha.DatabaseServices.BlockTable)tr.GetObject(
+                db.BlockTableId,
+                Teigha.DatabaseServices.OpenMode.ForRead);
+
+            var ms = (Teigha.DatabaseServices.BlockTableRecord)tr.GetObject(
+                bt[Teigha.DatabaseServices.BlockTableRecord.ModelSpace],
+                Teigha.DatabaseServices.OpenMode.ForWrite);
+
+            foreach (var group in groups)
+            {
+                if (group == null || group.Island == null)
+                    continue;
+
+                var island = group.Island;
+                var bounds = island.Bounds;
+                if (bounds.IsEmpty)
+                    continue;
+
+                short colorIndex = GetSemanticColorIndex(island.SemanticRole);
+
+                var pl = new Teigha.DatabaseServices.Polyline();
+                pl.SetDatabaseDefaults();
+                pl.Layer = layerName;
+                pl.ColorIndex = colorIndex;
+
+                pl.AddVertexAt(0, new Teigha.Geometry.Point2d(bounds.MinX, bounds.MinY), 0, 0, 0);
+                pl.AddVertexAt(1, new Teigha.Geometry.Point2d(bounds.MaxX, bounds.MinY), 0, 0, 0);
+                pl.AddVertexAt(2, new Teigha.Geometry.Point2d(bounds.MaxX, bounds.MaxY), 0, 0, 0);
+                pl.AddVertexAt(3, new Teigha.Geometry.Point2d(bounds.MinX, bounds.MaxY), 0, 0, 0);
+                pl.Closed = true;
+
+                ms.AppendEntity(pl);
+                tr.AddNewlyCreatedDBObject(pl, true);
+
+                if (!drawLabels)
+                    continue;
+
+                var label = new Teigha.DatabaseServices.DBText();
+                label.SetDatabaseDefaults();
+                label.Layer = layerName;
+                label.ColorIndex = colorIndex;
+                label.Height = Math.Max(bounds.Height * 0.08, 2.5);
+                label.Position = new Teigha.Geometry.Point3d(bounds.MinX, bounds.MaxY, 0);
+
+                label.TextString =
+                    $"I{island.Id} {island.SemanticRole} " +
+                    $"C={island.CellCount} D={island.OverlapDimensionCount}";
+
+                ms.AppendEntity(label);
+                tr.AddNewlyCreatedDBObject(label, true);
+            }
+        }
+
+        private static short GetSemanticColorIndex(ViewIslandSemanticRole role)
+        {
+            return role switch
+            {
+                ViewIslandSemanticRole.GeometryView => 3,   // green
+                ViewIslandSemanticRole.BadgeMarker => 5,    // blue
+                ViewIslandSemanticRole.AnnotationLike => 2, // yellow
+                ViewIslandSemanticRole.SparseBridge => 1,   // red
+                _ => 8                                      // gray
+            };
+        }
+
+        private static void EnsureDebugLayer(
+    Teigha.DatabaseServices.Database db,
+    Teigha.DatabaseServices.Transaction tr,
+    string layerName,
+    bool clearLayerFirst)
+        {
+            var lt = (Teigha.DatabaseServices.LayerTable)tr.GetObject(
+                db.LayerTableId,
+                Teigha.DatabaseServices.OpenMode.ForRead);
+
+            if (!lt.Has(layerName))
+            {
+                lt.UpgradeOpen();
+
+                var ltr = new Teigha.DatabaseServices.LayerTableRecord
+                {
+                    Name = layerName
+                };
+
+                lt.Add(ltr);
+                tr.AddNewlyCreatedDBObject(ltr, true);
+            }
+
+            if (!clearLayerFirst)
+                return;
+
+            var bt = (Teigha.DatabaseServices.BlockTable)tr.GetObject(
+                db.BlockTableId,
+                Teigha.DatabaseServices.OpenMode.ForRead);
+
+            var ms = (Teigha.DatabaseServices.BlockTableRecord)tr.GetObject(
+                bt[Teigha.DatabaseServices.BlockTableRecord.ModelSpace],
+                Teigha.DatabaseServices.OpenMode.ForWrite);
+
+            var idsToErase = new List<Teigha.DatabaseServices.ObjectId>();
+
+            foreach (Teigha.DatabaseServices.ObjectId id in ms)
+            {
+                var ent = tr.GetObject(id, Teigha.DatabaseServices.OpenMode.ForRead, false)
+                    as Teigha.DatabaseServices.Entity;
+
+                if (ent == null)
+                    continue;
+
+                if (!string.Equals(ent.Layer, layerName, StringComparison.OrdinalIgnoreCase))
+                    continue;
+
+                idsToErase.Add(id);
+            }
+
+            foreach (var id in idsToErase)
+            {
+                var ent = tr.GetObject(id, Teigha.DatabaseServices.OpenMode.ForWrite, false)
+                    as Teigha.DatabaseServices.Entity;
+
+                ent?.Erase();
+            }
+        }
+
+        private static void WriteViewIslandEntityGroups(
+    Bricscad.EditorInput.Editor ed,
+    IEnumerable<ViewIslandEntityGroup> groups)
+        {
+            var list = groups.ToList();
+
+            ed.WriteMessage($"\n[FluxCAD] ViewIslandEntityGroups count={list.Count}");
+
+            for (int i = 0; i < list.Count; i++)
+            {
+                var group = list[i];
+                var island = group.Island;
+                var b = island.Bounds;
+
+                ed.WriteMessage(
+                    $"\n  [IslandGroup {i + 1}] " +
+                    $"Id={island.Id}, " +
+                    $"Role={island.SemanticRole}, " +
+                    $"Cells={island.CellCount}, " +
+                    $"Bounds=({b.MinX:0.##},{b.MinY:0.##})-({b.MaxX:0.##},{b.MaxY:0.##}), " +
+                    $"Fill={island.FillRatio:0.###}, " +
+                    $"DimOverlap={island.OverlapsDimension}, " +
+                    $"DimCount={island.OverlapDimensionCount}, " +
+                    $"Geo={group.GeometryCount}, " +
+                    $"Curve={group.CurveCount}, " +
+                    $"Text={group.TextCount}, " +
+                    $"NumericText={group.NumericTextCount}, " +
+                    $"Other={group.OtherCount}, " +
+                    $"Reason={island.SemanticReason}");
+            }
+        }
+
+        [CommandMethod("FLUX_DEBUG_VIEW_ISLANDS_STROKE")]
+        public void FluxDebugViewIslandsStroke()
+        {
+            var doc = Application.DocumentManager.MdiActiveDocument;
+            if (doc == null)
+                return;
+
+            var db = doc.Database;
+            var ed = doc.Editor;
+
+            try
+            {
+                var sheetFilePath = db.Filename;
+                if (string.IsNullOrWhiteSpace(sheetFilePath))
+                {
+                    ed.WriteMessage("\n[FluxCAD] 저장된 DWG 파일이 아닙니다.");
+                    return;
+                }
+
+                IEntitySnapshotBuilder snapshotBuilder = new SimpleSheetFileSnapshotBuilder();
+                var entities = snapshotBuilder.Build(sheetFilePath);
+
+                if (entities == null || entities.Count == 0)
+                {
+                    ed.WriteMessage("\n[FluxCAD] snapshot이 비어 있습니다.");
+                    return;
+                }
+
+                var sheetBounds = Bounds2DHelper.FromEntities(entities);
+                if (sheetBounds.IsEmpty)
+                {
+                    ed.WriteMessage("\n[FluxCAD] sheet bounds가 비어 있습니다.");
+                    return;
+                }
+
+                var gridInput = PrepareOccupancyInput(
+                    entities,
+                    sheetBounds,
+                    ed,
+                    OccupancyInputMode.RawAllGeometrySeeds);
+
+                if (gridInput == null || gridInput.Count == 0)
+                {
+                    ed.WriteMessage("\n[FluxCAD] view island stroke input이 비어 있습니다.");
+                    return;
+                }
+
+                const int rows = 120;
+                const int cols = 120;
+
+                var hitMapBuilder = new StrokeOccupancyGridHitMapBuilder();
+                var hitMap = hitMapBuilder.Build(
+                    gridInput,
+                    sheetBounds,
+                    rows,
+                    cols);
+
+                var islandFinder = new OccupancyHitIslandFinder();
+                var hitGrid = BuildHitGrid(hitMap);
+
+                var islands = islandFinder.Find(hitGrid)
+                    .Where(x => x.CellCount > 2)
+                    .ToList();
+
+                var matcher = new DimensionOverlapMatcherForHitIslands();
+                matcher.Apply(islands, entities, tolerance: 0);
+
+                var collector = new ViewIslandEntityCollector();
+                var groups = collector.Collect(islands, entities, tolerance: 0);
+
+                var classifier = new ViewIslandSemanticClassifier();
+                var semanticResults = groups
+                    .Select(g => classifier.Classify(g, sheetBounds))
+                    .ToList();
+
+                foreach (var result in semanticResults)
+                {
+                    result.Island.SemanticRole = result.Role;
+                    result.Island.SemanticReason = result.Reason;
+                }
+
+                foreach (var island in islands)
+                {
+                    island.IsSparseBridgeLike = IsSparseGiantHitIsland(island, hitMap);
+                }
+
+                var ranked = islands
+                    .OrderByDescending(x => x.IsStrongGeometryContent)
+                    .ThenBy(x => x.IsSparseBridgeLike)
+                    .ThenByDescending(x => x.OverlapDimensionCount)
+                    .ThenByDescending(x => x.CellCount)
+                    .ToList();
+
+                WriteHitIslandDetails(ed, ranked, "StrokeViewIslands");
+
+                ed.WriteMessage(
+                    $"\n[FluxCAD] StrokeViewIslands count={ranked.Count}, " +
+                    $"on={hitMap.OnCount}, both={hitMap.BothCount}, " +
+                    $"boundsOnly={hitMap.BoundsOnlyCount}, repOnly={hitMap.RepOnlyCount}");
+            }
+            catch (System.Exception ex)
+            {
+                ed.WriteMessage($"\n[FluxCAD] FLUX_DEBUG_VIEW_ISLANDS_STROKE failed: {ex}");
+            }
+        }
+
+        private static bool IsSparseGiantHitIsland(OccupancyHitIsland island, OccupancyGridHitMapResult hitMap)
+        {
+            if (island == null)
+                return false;
+
+            var sheetArea = Math.Max(hitMap.SheetBounds.Area, 1e-6);
+            var widthRatio = island.Width / Math.Max(hitMap.SheetBounds.Width, 1e-6);
+            var heightRatio = island.Height / Math.Max(hitMap.SheetBounds.Height, 1e-6);
+            var areaRatio = island.Area / sheetArea;
+
+            return
+                widthRatio >= 0.70 &&
+                heightRatio >= 0.70 &&
+                areaRatio >= 0.45 &&
+                island.FillRatio <= 0.16;
+        }
+
+        private static OccupancyGridHitCell[,] BuildHitGrid(OccupancyGridHitMapResult hitMap)
+        {
+            if (hitMap == null)
+                throw new ArgumentNullException(nameof(hitMap));
+
+            if (hitMap.Rows <= 0 || hitMap.Cols <= 0)
+                return new OccupancyGridHitCell[0, 0];
+
+            var grid = new OccupancyGridHitCell[hitMap.Rows, hitMap.Cols];
+
+            // 먼저 기존 hit cell 채우기
+            foreach (var cell in hitMap.Cells)
+            {
+                if (cell == null)
+                    continue;
+
+                if (cell.Row < 0 || cell.Row >= hitMap.Rows)
+                    continue;
+
+                if (cell.Col < 0 || cell.Col >= hitMap.Cols)
+                    continue;
+
+                grid[cell.Row, cell.Col] = cell;
+            }
+
+            // 비어 있는 칸은 빈 cell로 채움
+            for (int r = 0; r < hitMap.Rows; r++)
+            {
+                for (int c = 0; c < hitMap.Cols; c++)
+                {
+                    if (grid[r, c] != null)
+                        continue;
+
+                    var bounds = GetCellBounds(hitMap, r, c);
+
+                    grid[r, c] = new OccupancyGridHitCell
+                    {
+                        Row = r,
+                        Col = c,
+                        Bounds = bounds,
+                        BoundsHitCount = 0,
+                        RepHitCount = 0
+                    };
+                }
+            }
+
+            return grid;
+        }
+
+        private static Bounds2D GetCellBounds(
+    OccupancyGridHitMapResult hitMap,
+    int row,
+    int col)
+        {
+            var minX = hitMap.SheetBounds.MinX + (col * hitMap.CellWidth);
+            var minY = hitMap.SheetBounds.MinY + (row * hitMap.CellHeight);
+            var maxX = minX + hitMap.CellWidth;
+            var maxY = minY + hitMap.CellHeight;
+
+            return new Bounds2D(minX, minY, maxX, maxY);
+        }
+
+
+        private static void WriteHitIslandDetails(
+    Bricscad.EditorInput.Editor ed,
+    IEnumerable<OccupancyHitIsland> islands,
+    string title)
+        {
+            var list = islands
+                .OrderByDescending(x => x.SemanticRole == ViewIslandSemanticRole.GeometryView)
+                .ThenByDescending(x => x.IsStrongGeometryContent)
+                .ThenBy(x => x.IsSparseBridgeLike)
+                .ThenByDescending(x => x.OverlapDimensionCount)
+                .ThenByDescending(x => x.CellCount)
+                .ThenByDescending(x => x.Area)
+                .ToList();
+
+            ed.WriteMessage($"\n[FluxCAD] {title} count={list.Count}");
+
+            for (int i = 0; i < list.Count; i++)
+            {
+                var island = list[i];
+                var b = island.Bounds;
+
+                ed.WriteMessage(
+                    $"\n  [HitIsland {i + 1}] " +
+                    $"Id={island.Id}, " +
+                    $"Role={island.SemanticRole}, " +
+                    $"Cells={island.CellCount}, " +
+                    $"Rows={island.MinRow}-{island.MaxRow}, " +
+                    $"Cols={island.MinCol}-{island.MaxCol}, " +
+                    $"Bounds=({b.MinX:0.##},{b.MinY:0.##})-({b.MaxX:0.##},{b.MaxY:0.##}), " +
+                    $"W={island.Width:0.##}, H={island.Height:0.##}, Area={island.Area:0.##}, " +
+                    $"Fill={island.FillRatio:0.###}, " +
+                    $"SparseBridge={island.IsSparseBridgeLike}, " +
+                    $"DimOverlap={island.OverlapsDimension}, " +
+                    $"DimCount={island.OverlapDimensionCount}, " +
+                    $"Strong={island.IsStrongGeometryContent}, " +
+                    $"Reason={island.SemanticReason}");
+            }
+        }
+
+        [CommandMethod("FLUX_DEBUG_VIEW_ISLANDS")]
+        public void FluxDebugViewIslands()
+        {
+            var doc = Application.DocumentManager.MdiActiveDocument;
+            if (doc == null)
+                return;
+
+            var db = doc.Database;
+            var ed = doc.Editor;
+
+            try
+            {
+                var sheetFilePath = db.Filename;
+                if (string.IsNullOrWhiteSpace(sheetFilePath))
+                {
+                    ed.WriteMessage("\n[FluxCAD] 저장된 DWG 파일이 아닙니다.");
+                    return;
+                }
+
+                IEntitySnapshotBuilder snapshotBuilder = new SimpleSheetFileSnapshotBuilder();
+                var entities = snapshotBuilder.Build(sheetFilePath);
+
+                if (entities == null || entities.Count == 0)
+                {
+                    ed.WriteMessage("\n[FluxCAD] snapshot이 비어 있습니다.");
+                    return;
+                }
+
+                var sheetBounds = Bounds2DHelper.FromEntities(entities);
+                if (sheetBounds.IsEmpty)
+                {
+                    ed.WriteMessage("\n[FluxCAD] sheet bounds가 비어 있습니다.");
+                    return;
+                }
+
+                // 1) RAW geometry occupancy input
+                var gridInput = PrepareOccupancyInput(
+                    entities,
+                    sheetBounds,
+                    ed,
+                    OccupancyInputMode.RawAllGeometrySeeds);
+
+                if (gridInput == null || gridInput.Count == 0)
+                {
+                    ed.WriteMessage("\n[FluxCAD] view island occupancy input이 비어 있습니다.");
+                    return;
+                }
+
+                const int rows = 120;
+                const int cols = 120;
+
+                // 2) 원본 occupancy grid
+                var gridBuilder = new OccupancyGridBuilder();
+                var buildResult = gridBuilder.Build(
+                    gridInput,
+                    sheetBounds,
+                    rows,
+                    cols);
+
+                // 3) frame 연결 차단용 탐색 grid
+                var frameDisconnectedBuilder = new FrameDisconnectedGridBuilder();
+                var searchGrid = frameDisconnectedBuilder.Build(buildResult);
+
+                // 4) raw island / disconnected island 비교
+                var islandFinder = new OccupancyIslandFinder();
+                var rawIslands = islandFinder.Find(buildResult.Grid);
+                var disconnectedIslands = islandFinder.Find(searchGrid);
+
+                // 5) tiny noise 제거
+                var filteredIslands = disconnectedIslands
+                    .Where(x => !IsTinyNoiseIsland(x, buildResult))
+                    .OrderByDescending(x => x.CellCount)
+                    .ThenByDescending(x => x.Area)
+                    .ToList();
+
+                // 6) dimension overlap 적용
+                var matcher = new DimensionOverlapMatcher();
+                matcher.Apply(filteredIslands, entities, tolerance: 0);
+
+                // 7) strong geometry 우선 정렬
+                var finalIslands = filteredIslands
+                    .OrderByDescending(x => x.IsStrongGeometryContent)
+                    .ThenByDescending(x => x.OverlapDimensionCount)
+                    .ThenByDescending(x => x.CellCount)
+                    .ThenByDescending(x => x.Area)
+                    .ToList();
+
+                WriteViewIslandDetails(ed, rawIslands, "RawViewIslands");
+                WriteViewIslandDetails(ed, finalIslands, "FrameDisconnectedViewIslands");
+
+                using (doc.LockDocument())
+                using (var tr = db.TransactionManager.StartTransaction())
+                {
+                    var drawer = new OccupancyDebugDrawer();
+
+                    drawer.DrawOccupiedCells(
+                        db,
+                        tr,
+                        buildResult,
+                        clearLayerFirst: true,
+                        maxCellsToDraw: 0);
+
+                    drawer.DrawIslands(
+                        db,
+                        tr,
+                        finalIslands,
+                        buildResult.SheetBounds,
+                        clearLayerFirst: true,
+                        drawLabels: true);
+
+                    tr.Commit();
+                }
+
+                var strongCount = finalIslands.Count(x => x.IsStrongGeometryContent);
+
+                ed.WriteMessage(
+                    $"\n[FluxCAD] ViewIslands raw={rawIslands.Count}, " +
+                    $"afterDisconnect={disconnectedIslands.Count}, " +
+                    $"filtered={finalIslands.Count}, strong={strongCount}, " +
+                    $"occupiedCells={buildResult.OccupiedCount}");
+            }
+            catch (System.Exception ex)
+            {
+                ed.WriteMessage($"\n[FluxCAD] FLUX_DEBUG_VIEW_ISLANDS failed: {ex}");
+            }
+        }
+
+        private static void WriteViewIslandDetails(
+    Bricscad.EditorInput.Editor ed,
+    IEnumerable<OccupancyIsland> islands,
+    string title)
+        {
+            var list = islands
+                .Where(x => x != null)
+                .OrderByDescending(x => x.IsStrongGeometryContent)
+                .ThenByDescending(x => x.OverlapDimensionCount)
+                .ThenByDescending(x => x.CellCount)
+                .ThenByDescending(x => x.Area)
+                .ToList();
+
+            ed.WriteMessage($"\n[FluxCAD] {title} count={list.Count}");
+
+            for (int i = 0; i < list.Count; i++)
+            {
+                var island = list[i];
+                var b = island.Bounds;
+
+                ed.WriteMessage(
+                    $"\n  [ViewIsland {i + 1}] " +
+                    $"Id={island.Id}, " +
+                    $"Cells={island.CellCount}, " +
+                    $"Rows={island.MinRow}-{island.MaxRow}, " +
+                    $"Cols={island.MinCol}-{island.MaxCol}, " +
+                    $"Bounds=({b.MinX:0.##},{b.MinY:0.##})-({b.MaxX:0.##},{b.MaxY:0.##}), " +
+                    $"W={island.Width:0.##}, H={island.Height:0.##}, Area={island.Area:0.##}, " +
+                    $"DimOverlap={island.OverlapsDimension}, DimCount={island.OverlapDimensionCount}, " +
+                    $"Strong={island.IsStrongGeometryContent}");
+            }
+        }
+
+        private static string BuildViewIslandLabel(OccupancyIsland island)
+        {
+            if (island == null)
+                return "Island(null)";
+
+            return
+                $"I{island.Id} " +
+                $"C={island.CellCount} " +
+                $"D={island.OverlapDimensionCount} " +
+                $"{(island.IsStrongGeometryContent ? "[G]" : "[?]")}";
+        }
+        // 의미 있는 성공 : 뷰 영역들이 그리드로 잘 분리됨. 나중에 진짜 사용할 함수. 
         [CommandMethod("FLUX_DEBUG_OCC_GRID_STROKE_RAW")]
         public void FluxDebugOccGridStrokeRaw()
         {
