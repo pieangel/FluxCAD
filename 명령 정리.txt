@@ -19,5 +19,5 @@ FLUX_DEBUG_OCC_GRID_HITMAP_LOOSE
 // 형상 컨텐츠 그리드 표시 성공
 FLUX_DEBUG_OCC_GRID_STROKE_RAW
 
-// 완벽한 뷰 영역 분리
+// 완벽한 뷰 영역 분리 성공 - 뷰들 간의 관계 추가 알고리즘 필요. 
 FLUX_DEBUG_VIEW_ISLAND_ENTITIES
