@@ -56,16 +56,128 @@ namespace FluxCAD.BricsCAD.Plugin26
                     return;
                 }
 
-                var sheetBounds = Bounds2DHelper.FromEntities(entities);
-                if (sheetBounds.IsEmpty)
+                // 참고용 전체 bounds
+                var allBounds = Bounds2DHelper.FromEntities(entities);
+                if (allBounds.IsEmpty)
                 {
                     ed.WriteMessage("\n[FluxCAD] sheet bounds가 비어 있습니다.");
                     return;
                 }
 
+                // ==============================
+                // DEBUG: out-of-sheet detector
+                // ==============================
+
+                double thresholdY = allBounds.Height * 0.5;
+                double thresholdX = allBounds.Width * 0.5;
+
+                var suspicious = entities
+                    .Where(e => !Bounds2DHelper.IsEmpty(e.Bounds))
+                    .Where(e =>
+                        Math.Abs(e.Bounds.MinY - allBounds.MinY) > thresholdY ||
+                        Math.Abs(e.Bounds.MaxY - allBounds.MaxY) > thresholdY ||
+                        Math.Abs(e.Bounds.MinX - allBounds.MinX) > thresholdX ||
+                        Math.Abs(e.Bounds.MaxX - allBounds.MaxX) > thresholdX)
+                    .Take(20)
+                    .ToList();
+
+                ed.WriteMessage("\n[DEBUG] ---- Suspicious Outliers ----");
+
+                foreach (var e in suspicious)
+                {
+                    ed.WriteMessage(
+                        $"\n  Handle={e.Handle}, Kind={e.Kind}, " +
+                        $"Bounds=({e.Bounds.MinX:F2},{e.Bounds.MinY:F2})-({e.Bounds.MaxX:F2},{e.Bounds.MaxY:F2}), " +
+                        $"Visible={e.IsVisible}, Block={e.BlockName}, Depth={e.Depth}");
+                }
+
+                var blockOutliers = suspicious
+                .GroupBy(e => e.BlockName)
+                .Select(g => new { Block = g.Key, Count = g.Count() })
+                .OrderByDescending(x => x.Count)
+                .ToList();
+
+                ed.WriteMessage("\n[DEBUG] ---- Outlier By Block ----");
+
+                foreach (var b in blockOutliers)
+                {
+                    ed.WriteMessage($"\n  Block={b.Block}, Count={b.Count}");
+                }
+
+                // ==============================
+                // DEBUG: extreme bounds detector
+                // ==============================
+
+                var extremeMinY = entities.OrderBy(x => x.Bounds.MinY).Take(10).ToList();
+                var extremeMaxY = entities.OrderByDescending(x => x.Bounds.MaxY).Take(10).ToList();
+                var extremeMinX = entities.OrderBy(x => x.Bounds.MinX).Take(10).ToList();
+                var extremeMaxX = entities.OrderByDescending(x => x.Bounds.MaxX).Take(10).ToList();
+
+                ed.WriteMessage("\n[DEBUG] ---- Extreme MinY ----");
+                foreach (var e in extremeMinY)
+                {
+                    ed.WriteMessage(
+                        $"\n  Handle={e.Handle}, Kind={e.Kind}, " +
+                        $"Bounds=({e.Bounds.MinX:F2},{e.Bounds.MinY:F2})-({e.Bounds.MaxX:F2},{e.Bounds.MaxY:F2}), " +
+                        $"Visible={e.IsVisible}, Block={e.BlockName}, Depth={e.Depth}");
+                }
+
+                ed.WriteMessage("\n[DEBUG] ---- Extreme MaxY ----");
+                foreach (var e in extremeMaxY)
+                {
+                    ed.WriteMessage(
+                        $"\n  Handle={e.Handle}, Kind={e.Kind}, " +
+                        $"Bounds=({e.Bounds.MinX:F2},{e.Bounds.MinY:F2})-({e.Bounds.MaxX:F2},{e.Bounds.MaxY:F2}), " +
+                        $"Visible={e.IsVisible}, Block={e.BlockName}, Depth={e.Depth}");
+                }
+
+                ed.WriteMessage("\n[DEBUG] ---- Extreme MinX ----");
+                foreach (var e in extremeMinX)
+                {
+                    ed.WriteMessage(
+                        $"\n  Handle={e.Handle}, Kind={e.Kind}, " +
+                        $"Bounds=({e.Bounds.MinX:F2},{e.Bounds.MinY:F2})-({e.Bounds.MaxX:F2},{e.Bounds.MaxY:F2}), " +
+                        $"Visible={e.IsVisible}, Block={e.BlockName}, Depth={e.Depth}");
+                }
+
+                ed.WriteMessage("\n[DEBUG] ---- Extreme MaxX ----");
+                foreach (var e in extremeMaxX)
+                {
+                    ed.WriteMessage(
+                        $"\n  Handle={e.Handle}, Kind={e.Kind}, " +
+                        $"Bounds=({e.Bounds.MinX:F2},{e.Bounds.MinY:F2})-({e.Bounds.MaxX:F2},{e.Bounds.MaxY:F2}), " +
+                        $"Visible={e.IsVisible}, Block={e.BlockName}, Depth={e.Depth}");
+                }
+
+                // 실제 형상 후보만 사용해서 robust bounds 계산
+                var geometryEntities = entities
+                    .Where(x => x != null)
+                    .Where(x => x.IsVisible)
+                    .Where(x => x.IsGeometryLike)
+                    .Where(x => !x.IsTextLike)
+                    .Where(x => !x.IsDimensionLike)
+                    .Where(x => !x.IsBlockReference)
+                    .Where(x => !Bounds2DHelper.IsEmpty(x.Bounds))
+                    .ToList();
+
+                if (geometryEntities.Count == 0)
+                {
+                    ed.WriteMessage("\n[FluxCAD] geometry entity가 비어 있습니다.");
+                    return;
+                }
+
+                var robustBounds = ComputeRobustGeometryBounds(
+                    geometryEntities,
+                    out var rejectedOutliers,
+                    trimRatio: 0.02,
+                    minKeepCount: 20);
+
+                if (robustBounds.IsEmpty)
+                    robustBounds = allBounds;
+
                 var gridInput = PrepareOccupancyInput(
                     entities,
-                    sheetBounds,
+                    robustBounds,
                     ed,
                     OccupancyInputMode.RawAllGeometrySeeds);
 
@@ -75,13 +187,41 @@ namespace FluxCAD.BricsCAD.Plugin26
                     return;
                 }
 
-                const int rows = 120;
-                const int cols = 120;
+                // adaptive grid
+                const double targetCellSize = 12.0;
+
+                var cols = Clamp((int)Math.Ceiling(robustBounds.Width / targetCellSize), 120, 420);
+                var rows = Clamp((int)Math.Ceiling(robustBounds.Height / targetCellSize), 120, 420);
+
+                var cellWidth = robustBounds.Width / cols;
+                var cellHeight = robustBounds.Height / rows;
+
+                ed.WriteMessage(
+                    $"\n[FluxCAD] AllBounds=({allBounds.MinX:F2},{allBounds.MinY:F2})-({allBounds.MaxX:F2},{allBounds.MaxY:F2}) " +
+                    $"size=({allBounds.Width:F2} x {allBounds.Height:F2})");
+
+                ed.WriteMessage(
+                    $"\n[FluxCAD] RobustBounds=({robustBounds.MinX:F2},{robustBounds.MinY:F2})-({robustBounds.MaxX:F2},{robustBounds.MaxY:F2}) " +
+                    $"size=({robustBounds.Width:F2} x {robustBounds.Height:F2}), rejectedOutliers={rejectedOutliers.Count}");
+
+                if (rejectedOutliers.Count > 0)
+                {
+                    foreach (var item in rejectedOutliers.Take(10))
+                    {
+                        ed.WriteMessage(
+                            $"\n  [Outlier] Handle={item.Handle}, Kind={item.Kind}, " +
+                            $"Bounds=({item.Bounds.MinX:F2},{item.Bounds.MinY:F2})-({item.Bounds.MaxX:F2},{item.Bounds.MaxY:F2})");
+                    }
+                }
+
+                ed.WriteMessage(
+                    $"\n[FluxCAD] Grid sheet=({robustBounds.Width:F2} x {robustBounds.Height:F2}), " +
+                    $"rows={rows}, cols={cols}, cell=({cellWidth:F2} x {cellHeight:F2})");
 
                 var hitMapBuilder = new StrokeOccupancyGridHitMapBuilder();
                 var hitMap = hitMapBuilder.Build(
                     gridInput,
-                    sheetBounds,
+                    robustBounds,
                     rows,
                     cols);
 
@@ -103,7 +243,7 @@ namespace FluxCAD.BricsCAD.Plugin26
 
                 var classifier = new ViewIslandSemanticClassifier();
                 var semanticResults = groups
-                    .Select(g => classifier.Classify(g, sheetBounds))
+                    .Select(g => classifier.Classify(g, robustBounds))
                     .ToList();
 
                 foreach (var result in semanticResults)
@@ -747,16 +887,45 @@ namespace FluxCAD.BricsCAD.Plugin26
                     return;
                 }
 
-                var sheetBounds = Bounds2DHelper.FromEntities(entities);
-                if (sheetBounds.IsEmpty)
+                // 참고용 전체 bounds
+                var allBounds = Bounds2DHelper.FromEntities(entities);
+                if (allBounds.IsEmpty)
                 {
                     ed.WriteMessage("\n[FluxCAD] sheet bounds가 비어 있습니다.");
                     return;
                 }
 
+                // 실제 grid bounds 계산용 geometry entity만 추림
+                var geometryEntities = entities
+                    .Where(x => x != null)
+                    .Where(x => x.IsVisible)
+                    .Where(x => x.IsGeometryLike)
+                    .Where(x => !x.IsTextLike)
+                    .Where(x => !x.IsDimensionLike)
+                    .Where(x => !x.IsBlockReference)
+                    .Where(x => !Bounds2DHelper.IsEmpty(x.Bounds))
+                    .ToList();
+
+                if (geometryEntities.Count == 0)
+                {
+                    ed.WriteMessage("\n[FluxCAD] geometry entity가 비어 있습니다.");
+                    return;
+                }
+
+                // 여기서 robust bounds를 계산
+                var robustBounds = ComputeRobustGeometryBounds(
+                    geometryEntities,
+                    out var rejectedOutliers,
+                    trimRatio: 0.02,
+                    minKeepCount: 20);
+
+                if (robustBounds.IsEmpty)
+                    robustBounds = allBounds;
+
+                // robust bounds 기준으로 occupancy input 생성
                 var gridInput = PrepareOccupancyInput(
                     entities,
-                    sheetBounds,
+                    robustBounds,
                     ed,
                     OccupancyInputMode.RawAllGeometrySeeds);
 
@@ -766,13 +935,41 @@ namespace FluxCAD.BricsCAD.Plugin26
                     return;
                 }
 
-                const int rows = 120;
-                const int cols = 120;
+                // adaptive grid
+                const double targetCellSize = 12.0;
+
+                var cols = Clamp((int)Math.Ceiling(robustBounds.Width / targetCellSize), 120, 420);
+                var rows = Clamp((int)Math.Ceiling(robustBounds.Height / targetCellSize), 120, 420);
+
+                var cellWidth = robustBounds.Width / cols;
+                var cellHeight = robustBounds.Height / rows;
+
+                ed.WriteMessage(
+                    $"\n[FluxCAD] AllBounds=({allBounds.MinX:F2},{allBounds.MinY:F2})-({allBounds.MaxX:F2},{allBounds.MaxY:F2}) " +
+                    $"size=({allBounds.Width:F2} x {allBounds.Height:F2})");
+
+                ed.WriteMessage(
+                    $"\n[FluxCAD] RobustBounds=({robustBounds.MinX:F2},{robustBounds.MinY:F2})-({robustBounds.MaxX:F2},{robustBounds.MaxY:F2}) " +
+                    $"size=({robustBounds.Width:F2} x {robustBounds.Height:F2}), rejectedOutliers={rejectedOutliers.Count}");
+
+                if (rejectedOutliers.Count > 0)
+                {
+                    foreach (var item in rejectedOutliers.Take(10))
+                    {
+                        ed.WriteMessage(
+                            $"\n  [Outlier] Handle={item.Handle}, Kind={item.Kind}, " +
+                            $"Bounds=({item.Bounds.MinX:F2},{item.Bounds.MinY:F2})-({item.Bounds.MaxX:F2},{item.Bounds.MaxY:F2})");
+                    }
+                }
+
+                ed.WriteMessage(
+                    $"\n[FluxCAD] Grid sheet=({robustBounds.Width:F2} x {robustBounds.Height:F2}), " +
+                    $"rows={rows}, cols={cols}, cell=({cellWidth:F2} x {cellHeight:F2})");
 
                 var hitMapBuilder = new StrokeOccupancyGridHitMapBuilder();
                 var hitMap = hitMapBuilder.Build(
                     gridInput,
-                    sheetBounds,
+                    robustBounds,
                     rows,
                     cols);
 
@@ -798,6 +995,125 @@ namespace FluxCAD.BricsCAD.Plugin26
             {
                 ed.WriteMessage($"\n[FluxCAD] FLUX_DEBUG_OCC_GRID_STROKE_RAW failed: {ex}");
             }
+        }
+
+        private static Bounds2D ComputeRobustGeometryBounds(
+    IReadOnlyList<SheetEntity> entities,
+    out List<SheetEntity> rejectedOutliers,
+    double trimRatio = 0.02,
+    int minKeepCount = 20)
+        {
+            rejectedOutliers = new List<SheetEntity>();
+
+            if (entities == null || entities.Count == 0)
+                return new Bounds2D(0, 0, 0, 0);
+
+            var source = entities
+                .Where(x => x != null)
+                .Select(x => new
+                {
+                    Entity = x,
+                    Bounds = Bounds2DHelper.Normalize(x.Bounds)
+                })
+                .Where(x => !Bounds2DHelper.IsEmpty(x.Bounds))
+                .ToList();
+
+            if (source.Count == 0)
+                return new Bounds2D(0, 0, 0, 0);
+
+            if (source.Count <= minKeepCount)
+                return Bounds2DHelper.Union(source.Select(x => x.Bounds));
+
+            var minXs = source.Select(x => x.Bounds.MinX).OrderBy(x => x).ToList();
+            var minYs = source.Select(x => x.Bounds.MinY).OrderBy(x => x).ToList();
+            var maxXs = source.Select(x => x.Bounds.MaxX).OrderBy(x => x).ToList();
+            var maxYs = source.Select(x => x.Bounds.MaxY).OrderBy(x => x).ToList();
+
+            var robustMinX = Percentile(minXs, trimRatio);
+            var robustMinY = Percentile(minYs, trimRatio);
+            var robustMaxX = Percentile(maxXs, 1.0 - trimRatio);
+            var robustMaxY = Percentile(maxYs, 1.0 - trimRatio);
+
+            if (robustMinX >= robustMaxX || robustMinY >= robustMaxY)
+                return Bounds2DHelper.Union(source.Select(x => x.Bounds));
+
+            var robust = new Bounds2D(robustMinX, robustMinY, robustMaxX, robustMaxY);
+            robust = Bounds2DHelper.Normalize(robust);
+
+            // 너무 빡빡하게 잘리지 않도록 약간 확장
+            var padX = Math.Max(robust.Width * 0.02, 5.0);
+            var padY = Math.Max(robust.Height * 0.02, 5.0);
+            robust = Bounds2DHelper.Inflate(robust, Math.Min(padX, padY));
+
+            var kept = new List<Bounds2D>();
+
+            foreach (var item in source)
+            {
+                // entity 중심이 robust 범위 안에 있으면 유지
+                if (Bounds2DHelper.Contains(robust, item.Bounds.Center, tolerance: 0))
+                {
+                    kept.Add(item.Bounds);
+                }
+                else
+                {
+                    rejectedOutliers.Add(item.Entity);
+                }
+            }
+
+            // 너무 많이 제거되면 fallback
+            if (kept.Count < Math.Max(minKeepCount, source.Count / 2))
+            {
+                rejectedOutliers.Clear();
+                return Bounds2DHelper.Union(source.Select(x => x.Bounds));
+            }
+
+            var finalBounds = Bounds2DHelper.Union(kept);
+
+            // 결과가 비정상적으로 납작해지는 것 방지
+            if (finalBounds.Width <= 0 || finalBounds.Height <= 0)
+            {
+                rejectedOutliers.Clear();
+                return Bounds2DHelper.Union(source.Select(x => x.Bounds));
+            }
+
+            return finalBounds;
+        }
+
+        private static double Percentile(IReadOnlyList<double> sortedValues, double p)
+        {
+            if (sortedValues == null || sortedValues.Count == 0)
+                return 0.0;
+
+            if (p <= 0) return sortedValues[0];
+            if (p >= 1) return sortedValues[sortedValues.Count - 1];
+
+            var index = (sortedValues.Count - 1) * p;
+            var lo = (int)Math.Floor(index);
+            var hi = (int)Math.Ceiling(index);
+
+            if (lo == hi)
+                return sortedValues[lo];
+
+            var t = index - lo;
+            return sortedValues[lo] * (1.0 - t) + sortedValues[hi] * t;
+        }
+
+        private static int Clamp(int value, int min, int max)
+        {
+            return Math.Max(min, Math.Min(max, value));
+        }
+
+        private static double Median(IReadOnlyList<double> values)
+        {
+            if (values == null || values.Count == 0)
+                return 0.0;
+
+            var mid = values.Count / 2;
+
+            if ((values.Count % 2) == 0)
+                return (values[mid - 1] + values[mid]) * 0.5;
+
+            return values[mid];
         }
 
         [CommandMethod("FLUX_DEBUG_OCC_GRID_HITMAP_RAW")]
