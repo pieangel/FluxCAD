@@ -28,7 +28,14 @@ namespace FluxCAD.SheetAnalysis.ViewIsolation.Analysis
                 FinalRole = result.Role,
                 InitialReason = result.Reason,
                 FinalReason = result.Reason,
-                Score = 0
+                Score = 0,
+
+                IsTopLevelView = false,
+                IsEmbeddedFeature = false,
+                ParentIslandId = null,
+                HierarchyReason = string.Empty,
+                ProjectionRole = string.Empty,
+                ProjectionReason = string.Empty
             };
         }
     }

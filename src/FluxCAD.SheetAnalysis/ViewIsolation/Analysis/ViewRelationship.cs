@@ -32,6 +32,36 @@ namespace FluxCAD.SheetAnalysis.ViewIsolation.Analysis
 
         public ViewRelativePosition RelativePosition { get; init; }
 
+        // -----------------------------------------
+        // Overlap / containment / hierarchical hints
+        // -----------------------------------------
+        public bool IsOverlapping { get; init; }
+
+        public double IntersectionArea { get; init; }
+
+        public double IntersectionAreaRatioToA { get; init; }
+
+        public double IntersectionAreaRatioToB { get; init; }
+
+        public bool IsCenterOfBInsideA { get; init; }
+
+        public bool IsCenterOfAInsideB { get; init; }
+
+        public bool AContainsB { get; init; }
+
+        public bool BContainsA { get; init; }
+
+        public double ContainmentRatioAContainsB { get; init; }
+
+        public double ContainmentRatioBContainsA { get; init; }
+
+        // -----------------------------------------
+        // Semantic interpretation slot
+        // -----------------------------------------
+        public ViewRelationKind RelationKind { get; set; } = ViewRelationKind.Unknown;
+
+        public string RelationReason { get; set; } = string.Empty;
+
         public override string ToString()
         {
             return
@@ -39,7 +69,12 @@ namespace FluxCAD.SheetAnalysis.ViewIsolation.Analysis
                 $"dx={DeltaX:F1}, dy={DeltaY:F1}, dist={CenterDistance:F1}, " +
                 $"HAlign={IsHorizontallyAligned}, VAlign={IsVerticallyAligned}, " +
                 $"Wsim={WidthSimilarity:F2}, Hsim={HeightSimilarity:F2}, Asim={AreaSimilarity:F2}, " +
-                $"SizeCmp={IsSizeComparable}, Pos={RelativePosition}";
+                $"SizeCmp={IsSizeComparable}, Pos={RelativePosition}, " +
+                $"Overlap={IsOverlapping}, IntA={IntersectionAreaRatioToA:F2}, IntB={IntersectionAreaRatioToB:F2}, " +
+                $"AContainsB={AContainsB}({ContainmentRatioAContainsB:F2}), " +
+                $"BContainsA={BContainsA}({ContainmentRatioBContainsA:F2}), " +
+                $"CenterBInA={IsCenterOfBInsideA}, CenterAInB={IsCenterOfAInsideB}, " +
+                $"Kind={RelationKind}";
         }
     }
 }

@@ -1,4 +1,5 @@
 ﻿using System;
+using System.Collections.Generic;
 
 namespace FluxCAD.SheetAnalysis.ViewIsolation.Analysis
 {
@@ -38,6 +39,27 @@ namespace FluxCAD.SheetAnalysis.ViewIsolation.Analysis
 
         public int Score { get; set; }
 
+        // -----------------------------
+        // Hierarchy / containment state
+        // -----------------------------
+        public bool IsTopLevelView { get; set; }
+
+        public bool IsEmbeddedFeature { get; set; }
+
+        public int? ParentIslandId { get; set; }
+
+        public List<int> ChildIslandIds { get; } = new();
+
+        public string HierarchyReason { get; set; } = string.Empty;
+
+        // -----------------------------
+        // Projection-role state
+        // ex) Front / LeftSide / RightSide / BottomFront / Detail
+        // -----------------------------
+        public string ProjectionRole { get; set; } = string.Empty;
+
+        public string ProjectionReason { get; set; } = string.Empty;
+
         public double AspectRatio
         {
             get
@@ -64,16 +86,33 @@ namespace FluxCAD.SheetAnalysis.ViewIsolation.Analysis
              InitialRole == ViewIslandSemanticRole.Unknown ||
              InitialRole == ViewIslandSemanticRole.AnnotationLike);
 
+        public bool HasParent => ParentIslandId.HasValue;
+
+        public bool HasChildren => ChildIslandIds.Count > 0;
+
+        public void ResetHierarchy()
+        {
+            IsTopLevelView = false;
+            IsEmbeddedFeature = false;
+            ParentIslandId = null;
+            ChildIslandIds.Clear();
+            HierarchyReason = string.Empty;
+            ProjectionRole = string.Empty;
+            ProjectionReason = string.Empty;
+        }
+
         public override string ToString()
         {
             return
                 $"Island={IslandId}, " +
                 $"Init={InitialRole}, Final={FinalRole}, " +
+                $"Top={IsTopLevelView}, Embedded={IsEmbeddedFeature}, Parent={ParentIslandId?.ToString() ?? "-"}, ChildCount={ChildIslandIds.Count}, " +
                 $"Dim={HasDimension}/{DimensionCount}, " +
                 $"Cells={CellCount}, Fill={FillRatio:0.###}, " +
                 $"Center=({Center.X:0.##},{Center.Y:0.##}), " +
                 $"Size=({Width:0.##}x{Height:0.##}), " +
-                $"Aspect={AspectRatio:0.##}, Score={Score}";
+                $"Aspect={AspectRatio:0.##}, Score={Score}, " +
+                $"Proj={ProjectionRole}";
         }
     }
 }

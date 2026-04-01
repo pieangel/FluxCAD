@@ -6,6 +6,7 @@ using FluxCAD.SheetAnalysis.Structure.Classifiers;
 using FluxCAD.SheetAnalysis.Structure.Models;
 using FluxCAD.SheetAnalysis.Structure.Results;
 using FluxCAD.SheetAnalysis.ViewIsolation;
+using FluxCAD.SheetAnalysis.ViewIsolation.Analysis;
 using FluxCAD.SheetAnalysis.ViewProjection;
 using System;
 using System.Collections.Generic;
@@ -16,6 +17,8 @@ using Teigha.DatabaseServices;
 using Teigha.Geometry;
 using Teigha.GraphicsInterface;
 using Teigha.Runtime;
+using Bricscad.ApplicationServices.Core;
+using TeighaColor = Teigha.Colors.Color;
 
 namespace FluxCAD.BricsCAD.Plugin26
 {
@@ -28,10 +31,536 @@ namespace FluxCAD.BricsCAD.Plugin26
             RawAllGeometrySeeds
         }
 
+        [CommandMethod("FLUX_DEBUG_VIEW_ISLAND_HIERARCHY")]
+        public void FluxDebugViewIslandHierarchy()
+        {
+            var doc = Bricscad.ApplicationServices.Application.DocumentManager.MdiActiveDocument;
+            if (doc == null)
+                return;
+
+            var db = doc.Database;
+            var ed = doc.Editor;
+
+            try
+            {
+                var sheetFilePath = db.Filename;
+                if (string.IsNullOrWhiteSpace(sheetFilePath))
+                {
+                    ed.WriteMessage("\n[FluxCAD] 저장된 DWG 파일이 아닙니다.");
+                    return;
+                }
+
+                IEntitySnapshotBuilder snapshotBuilder = new SimpleSheetFileSnapshotBuilder();
+                var entities = snapshotBuilder.Build(sheetFilePath);
+
+                if (entities == null || entities.Count == 0)
+                {
+                    ed.WriteMessage("\n[FluxCAD] snapshot이 비어 있습니다.");
+                    return;
+                }
+
+                var allBounds = Bounds2DHelper.FromEntities(entities);
+                if (allBounds.IsEmpty)
+                {
+                    ed.WriteMessage("\n[FluxCAD] sheet bounds가 비어 있습니다.");
+                    return;
+                }
+
+                var geometryEntities = entities
+                    .Where(x => x != null)
+                    .Where(x => x.IsVisible)
+                    .Where(x => x.IsGeometryLike)
+                    .Where(x => !x.IsTextLike)
+                    .Where(x => !x.IsDimensionLike)
+                    .Where(x => !x.IsBlockReference)
+                    .Where(x => !Bounds2DHelper.IsEmpty(x.Bounds))
+                    .ToList();
+
+                if (geometryEntities.Count == 0)
+                {
+                    ed.WriteMessage("\n[FluxCAD] geometry entity가 비어 있습니다.");
+                    return;
+                }
+
+                var geometryEntitiesForBounds = geometryEntities
+                    .Where(x => !GhostEntityPolicy.IsIgnorableGhostEntity(x, Bounds2D.Empty))
+                    .ToList();
+
+                if (geometryEntitiesForBounds.Count == 0)
+                    geometryEntitiesForBounds = geometryEntities.ToList();
+
+                var robustBounds = ComputeRobustGeometryBounds(
+                    geometryEntitiesForBounds,
+                    out var rejectedOutliers,
+                    trimRatio: 0.02,
+                    minKeepCount: 20);
+
+                if (robustBounds.IsEmpty)
+                    robustBounds = allBounds;
+
+                var filteredGeometryEntities = GhostEntityPolicy.ExcludeGhosts(
+                    geometryEntitiesForBounds,
+                    robustBounds,
+                    out var rejectedGhosts).ToList();
+
+                if (filteredGeometryEntities.Count > 0)
+                {
+                    var refinedBounds = ComputeRobustGeometryBounds(
+                        filteredGeometryEntities,
+                        out var rejectedOutliers2,
+                        trimRatio: 0.02,
+                        minKeepCount: 20);
+
+                    if (!refinedBounds.IsEmpty)
+                    {
+                        robustBounds = refinedBounds;
+                        rejectedOutliers = rejectedOutliers2;
+                    }
+                }
+
+                var hierarchySourceEntities = PrepareHierarchySourceEntities(
+                    entities,
+                    robustBounds,
+                    ed);
+
+                if (hierarchySourceEntities.Count == 0)
+                {
+                    ed.WriteMessage("\n[FluxCAD] hierarchy source entities가 비어 있습니다.");
+                    return;
+                }
+
+                var gridInput = PrepareOccupancyInput(
+                    hierarchySourceEntities,
+                    robustBounds,
+                    ed,
+                    OccupancyInputMode.RawAllGeometrySeeds);
+
+                if (gridInput == null || gridInput.Count == 0)
+                {
+                    ed.WriteMessage("\n[FluxCAD] hierarchy geometry-only input이 비어 있습니다.");
+                    return;
+                }
+
+                const double targetCellSize = 12.0;
+
+                var cols = Clamp((int)Math.Ceiling(robustBounds.Width / targetCellSize), 120, 420);
+                var rows = Clamp((int)Math.Ceiling(robustBounds.Height / targetCellSize), 120, 420);
+
+                var hitMapBuilder = new StrokeOccupancyGridHitMapBuilder();
+                var hitMap = hitMapBuilder.Build(
+                    gridInput,
+                    robustBounds,
+                    rows,
+                    cols);
+
+                var islandFinder = new OccupancyHitIslandFinder();
+                var hitGrid = BuildHitGrid(hitMap);
+
+                var islands = islandFinder.Find(hitGrid)
+                    .Where(x => x.CellCount > 2)
+                    .ToList();
+
+                foreach (var island in islands)
+                    island.IsSparseBridgeLike = IsSparseGiantHitIsland(island, hitMap);
+
+                var hierarchyIslands = islands
+                    .Where(x => !x.IsSparseBridgeLike)
+                    .ToList();
+
+                ed.WriteMessage(
+                    $"\n[FluxCAD] Hierarchy islands raw={islands.Count}, filtered={hierarchyIslands.Count}, sparseRemoved={islands.Count - hierarchyIslands.Count}");
+
+                var matcher = new DimensionOverlapMatcherForHitIslands();
+                matcher.Apply(islands, entities, tolerance: 0);
+
+                foreach (var island in islands)
+                    island.IsSparseBridgeLike = IsSparseGiantHitIsland(island, hitMap);
+
+                var collector = new ViewIslandEntityCollector();
+                var groups = collector.Collect(hierarchyIslands, entities, tolerance: 0);
+
+                var classifier = new ViewIslandSemanticClassifier();
+                var semanticResults = groups
+                    .Select(g => classifier.Classify(g, robustBounds))
+                    .ToList();
+
+                foreach (var result in semanticResults)
+                {
+                    result.Island.SemanticRole = result.Role;
+                    result.Island.SemanticReason = result.Reason;
+                }
+
+                var candidateBuilder = new ViewCandidateBuilder();
+                var candidates = candidateBuilder.Build(semanticResults);
+
+                var resolver = new ViewSetResolver();
+                resolver.Resolve(candidates);
+
+                WriteViewHierarchyCandidates(ed, candidates);
+
+                using (doc.LockDocument())
+                using (var tr = db.TransactionManager.StartTransaction())
+                {
+                    DrawHierarchyCandidateOverlays(
+                        db,
+                        tr,
+                        candidates,
+                        clearLayerFirst: true,
+                        drawLabels: true,
+                        drawRelations: true);
+
+                    tr.Commit();
+                }
+
+                ed.WriteMessage(
+                    $"\n[FluxCAD] ViewIslandHierarchy count={candidates.Count}, " +
+                    $"topLevel={candidates.Count(x => x.IsTopLevelView)}, " +
+                    $"embedded={candidates.Count(x => x.IsEmbeddedFeature)}, " +
+                    $"withParent={candidates.Count(x => x.HasParent)}");
+            }
+            catch (System.Exception ex)
+            {
+                ed.WriteMessage($"\n[FluxCAD] FLUX_DEBUG_VIEW_ISLAND_HIERARCHY failed: {ex}");
+            }
+        }
+
+        private static List<SheetEntity> PrepareHierarchySourceEntities(
+    IReadOnlyList<SheetEntity> entities,
+    Bounds2D robustBounds,
+    Bricscad.EditorInput.Editor ed)
+        {
+            if (entities == null)
+                throw new ArgumentNullException(nameof(entities));
+
+            var filtered = entities
+                .Where(x => x != null)
+                .Where(x => x.IsVisible)
+                .Where(x => x.IsGeometryLike)
+                .Where(x => !x.IsTextLike)
+                .Where(x => !x.IsDimensionLike)
+                .Where(x => !x.IsBlockReference)
+                .Where(x => !Bounds2DHelper.IsEmpty(x.Bounds))
+                .Where(x => !GhostEntityPolicy.IsIgnorableGhostEntity(x, robustBounds))
+                .Where(x => !IsHierarchyBridgeLikeEntity(x, robustBounds))
+                .ToList();
+
+            ed.WriteMessage(
+                $"\n[FluxCAD] HierarchySourceEntities filtered={filtered.Count} / total={entities.Count}");
+
+            return filtered;
+        }
+
+        private static bool IsHierarchyBridgeLikeEntity(SheetEntity entity, Bounds2D robustBounds)
+        {
+            if (entity == null)
+                return false;
+
+            var b = entity.Bounds;
+            if (Bounds2DHelper.IsEmpty(b))
+                return false;
+
+            var w = b.Width;
+            var h = b.Height;
+            var max = Math.Max(w, h);
+            var min = Math.Min(w, h);
+
+            // 거의 선분처럼 긴 개체
+            var aspect = min <= 1e-9 ? double.MaxValue : max / min;
+
+            // 시트 크기 기준의 상대 길이
+            var longThreshold = Math.Max(robustBounds.Width, robustBounds.Height) * 0.18;
+
+            // line / polyline / arc 중 매우 길고 얇은 것은 bridge 가능성 높음
+            var typeName = entity.EntityTypeName ?? string.Empty;
+            var isLineLike =
+                entity.Kind == SheetEntityKind.Line ||
+                entity.Kind == SheetEntityKind.Polyline ||
+                typeName.IndexOf("LINE", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                typeName.IndexOf("POLYLINE", StringComparison.OrdinalIgnoreCase) >= 0;
+
+            if (!isLineLike)
+                return false;
+
+            if (max >= longThreshold && aspect >= 20.0)
+                return true;
+
+            return false;
+        }
+
+        private static void WriteViewHierarchyCandidates(Bricscad.EditorInput.Editor ed, IReadOnlyList<ViewCandidate> candidates)
+        {
+            if (ed == null)
+                throw new ArgumentNullException(nameof(ed));
+            if (candidates == null)
+                throw new ArgumentNullException(nameof(candidates));
+
+            ed.WriteMessage("\n[FluxCAD] ---- View Hierarchy Candidates ----");
+
+            foreach (var c in candidates
+                .OrderByDescending(x => x.IsTopLevelView)
+                .ThenBy(x => x.HasParent)
+                .ThenByDescending(x => x.Area))
+            {
+                var state =
+                    c.IsEmbeddedFeature ? "Embedded" :
+                    c.IsTopLevelView ? "TopLevel" :
+                    c.HasParent ? "Child" :
+                    "Unresolved";
+
+                ed.WriteMessage(
+                    $"\n  Island={c.IslandId}, " +
+                    $"State={state}, Parent={c.ParentIslandId?.ToString() ?? "-"}, " +
+                    $"Children={c.ChildIslandIds.Count}, " +
+                    $"Init={c.InitialRole}, Final={c.FinalRole}, " +
+                    $"Dim={c.HasDimension}/{c.DimensionCount}, " +
+                    $"Size=({c.Width:0.##}x{c.Height:0.##}), " +
+                    $"Area={c.Area:0.##}, " +
+                    $"Center=({c.Center.X:0.##},{c.Center.Y:0.##}), " +
+                    $"Reason={c.HierarchyReason}");
+            }
+
+            ed.WriteMessage("\n[FluxCAD] ---- Parent -> Children ----");
+
+            foreach (var parent in candidates.Where(x => x.ChildIslandIds.Count > 0).OrderBy(x => x.IslandId))
+            {
+                ed.WriteMessage(
+                    $"\n  Parent={parent.IslandId} -> [{string.Join(", ", parent.ChildIslandIds.OrderBy(x => x))}]");
+            }
+        }
+
+        private static void DrawHierarchyCandidateOverlays(
+    Database db,
+    Transaction tr,
+    IReadOnlyList<ViewCandidate> candidates,
+    bool clearLayerFirst,
+    bool drawLabels,
+    bool drawRelations)
+        {
+            if (db == null)
+                throw new ArgumentNullException(nameof(db));
+            if (tr == null)
+                throw new ArgumentNullException(nameof(tr));
+            if (candidates == null)
+                throw new ArgumentNullException(nameof(candidates));
+
+            const string layerName = "FLUX_VIEW_HIERARCHY";
+
+            EnsureDebugLayer(db, tr, layerName, colorIndex: 3, clearLayerFirst: clearLayerFirst);
+
+            var candidateById = candidates.ToDictionary(x => x.IslandId);
+
+            foreach (var c in candidates)
+            {
+                var colorIndex = ResolveHierarchyColor(c);
+
+                DrawBoundsRectangle(db, tr, layerName, c.Bounds, colorIndex);
+
+                if (drawLabels)
+                {
+                    var label =
+                        c.IsEmbeddedFeature
+                            ? $"E:{c.IslandId} P={c.ParentIslandId?.ToString() ?? "-"}"
+                            : c.IsTopLevelView
+                                ? $"T:{c.IslandId}"
+                                : c.HasParent
+                                    ? $"C:{c.IslandId} P={c.ParentIslandId?.ToString() ?? "-"}"
+                                    : $"U:{c.IslandId}";
+
+                    DrawDebugText(
+                        db,
+                        tr,
+                        layerName,
+                        c.Bounds.Center,
+                        label,
+                        colorIndex,
+                        Math.Max(8.0, Math.Min(c.Bounds.Width, c.Bounds.Height) * 0.08));
+                }
+            }
+
+            if (!drawRelations)
+                return;
+
+            foreach (var child in candidates.Where(x => x.HasParent))
+            {
+                if (!child.ParentIslandId.HasValue)
+                    continue;
+
+                if (!candidateById.TryGetValue(child.ParentIslandId.Value, out var parent))
+                    continue;
+
+                DrawDebugLine(
+                    db,
+                    tr,
+                    layerName,
+                    child.Center,
+                    parent.Center,
+                    colorIndex: (short)(child.IsEmbeddedFeature ? 30 : 4));
+
+                var mid = new Point2D(
+                    (child.Center.X + parent.Center.X) * 0.5,
+                    (child.Center.Y + parent.Center.Y) * 0.5);
+
+                DrawDebugText(
+                    db,
+                    tr,
+                    layerName,
+                    mid,
+                    child.IsEmbeddedFeature ? "embedded" : "child",
+                    (short)(child.IsEmbeddedFeature ? 30 : 4),
+                    8.0);
+            }
+        }
+
+        private static short ResolveHierarchyColor(ViewCandidate c)
+        {
+            if (c == null)
+                return 8;
+
+            if (c.IsEmbeddedFeature)
+                return 30; // orange-ish
+
+            if (c.IsTopLevelView)
+                return 3; // green
+
+            if (c.HasParent)
+                return 4; // cyan
+
+            return 8; // gray
+        }
+
+        private static void EnsureDebugLayer(
+    Database db,
+    Transaction tr,
+    string layerName,
+    short colorIndex,
+    bool clearLayerFirst)
+        {
+            var lt = (LayerTable)tr.GetObject(db.LayerTableId, OpenMode.ForRead);
+
+            ObjectId layerId;
+            if (!lt.Has(layerName))
+            {
+                lt.UpgradeOpen();
+
+                var ltr = new LayerTableRecord
+                {
+                    Name = layerName,
+                    Color = TeighaColor.FromColorIndex(Teigha.Colors.ColorMethod.ByAci, colorIndex)
+                };
+
+                layerId = lt.Add(ltr);
+                tr.AddNewlyCreatedDBObject(ltr, true);
+            }
+            else
+            {
+                layerId = lt[layerName];
+            }
+
+            if (!clearLayerFirst)
+                return;
+
+            var bt = (BlockTable)tr.GetObject(db.BlockTableId, OpenMode.ForRead);
+            var ms = (BlockTableRecord)tr.GetObject(bt[BlockTableRecord.ModelSpace], OpenMode.ForWrite);
+
+            var toErase = new List<ObjectId>();
+
+            foreach (ObjectId id in ms)
+            {
+                var ent = tr.GetObject(id, OpenMode.ForRead) as Entity;
+                if (ent == null)
+                    continue;
+
+                if (string.Equals(ent.Layer, layerName, StringComparison.OrdinalIgnoreCase))
+                    toErase.Add(id);
+            }
+
+            foreach (var id in toErase)
+            {
+                var ent = tr.GetObject(id, OpenMode.ForWrite) as Entity;
+                ent?.Erase();
+            }
+        }
+
+        private static void DrawBoundsRectangle(
+            Database db,
+            Transaction tr,
+            string layerName,
+            Bounds2D bounds,
+            short colorIndex)
+        {
+            if (bounds.IsEmpty)
+                return;
+
+            var bt = (BlockTable)tr.GetObject(db.BlockTableId, OpenMode.ForRead);
+            var ms = (BlockTableRecord)tr.GetObject(bt[BlockTableRecord.ModelSpace], OpenMode.ForWrite);
+
+            var pl = new Teigha.DatabaseServices.Polyline();
+            pl.SetDatabaseDefaults();
+            pl.Layer = layerName;
+            pl.Color = TeighaColor.FromColorIndex(Teigha.Colors.ColorMethod.ByAci, colorIndex);
+
+            pl.AddVertexAt(0, new Point2d(bounds.MinX, bounds.MinY), 0, 0, 0);
+            pl.AddVertexAt(1, new Point2d(bounds.MaxX, bounds.MinY), 0, 0, 0);
+            pl.AddVertexAt(2, new Point2d(bounds.MaxX, bounds.MaxY), 0, 0, 0);
+            pl.AddVertexAt(3, new Point2d(bounds.MinX, bounds.MaxY), 0, 0, 0);
+            pl.Closed = true;
+
+            ms.AppendEntity(pl);
+            tr.AddNewlyCreatedDBObject(pl, true);
+        }
+
+        private static void DrawDebugLine(
+            Database db,
+            Transaction tr,
+            string layerName,
+            Point2D a,
+            Point2D b,
+            short colorIndex)
+        {
+            var bt = (BlockTable)tr.GetObject(db.BlockTableId, OpenMode.ForRead);
+            var ms = (BlockTableRecord)tr.GetObject(bt[BlockTableRecord.ModelSpace], OpenMode.ForWrite);
+
+            var line = new Line(
+                new Point3d(a.X, a.Y, 0.0),
+                new Point3d(b.X, b.Y, 0.0));
+
+            line.SetDatabaseDefaults();
+            line.Layer = layerName;
+            line.Color = TeighaColor.FromColorIndex(Teigha.Colors.ColorMethod.ByAci, colorIndex);
+
+            ms.AppendEntity(line);
+            tr.AddNewlyCreatedDBObject(line, true);
+        }
+
+        private static void DrawDebugText(
+            Database db,
+            Transaction tr,
+            string layerName,
+            Point2D position,
+            string text,
+            short colorIndex,
+            double textHeight)
+        {
+            var bt = (BlockTable)tr.GetObject(db.BlockTableId, OpenMode.ForRead);
+            var ms = (BlockTableRecord)tr.GetObject(bt[BlockTableRecord.ModelSpace], OpenMode.ForWrite);
+
+            var dbText = new DBText
+            {
+                Layer = layerName,
+                Height = textHeight,
+                Position = new Point3d(position.X, position.Y, 0.0),
+                TextString = text,
+                Color = TeighaColor.FromColorIndex(Teigha.Colors.ColorMethod.ByAci, colorIndex)
+            };
+
+            ms.AppendEntity(dbText);
+            tr.AddNewlyCreatedDBObject(dbText, true);
+        }
+
         [CommandMethod("FLUX_DEBUG_VIEW_ISLAND_ENTITIES")]
         public void FluxDebugViewIslandEntities()
         {
-            var doc = Application.DocumentManager.MdiActiveDocument;
+            var doc = Bricscad.ApplicationServices.Application.DocumentManager.MdiActiveDocument;
             if (doc == null)
                 return;
 
@@ -507,7 +1036,7 @@ namespace FluxCAD.BricsCAD.Plugin26
         [CommandMethod("FLUX_DEBUG_VIEW_ISLANDS_STROKE")]
         public void FluxDebugViewIslandsStroke()
         {
-            var doc = Application.DocumentManager.MdiActiveDocument;
+            var doc = Bricscad.ApplicationServices.Application.DocumentManager.MdiActiveDocument;
             if (doc == null)
                 return;
 
@@ -732,7 +1261,7 @@ namespace FluxCAD.BricsCAD.Plugin26
         [CommandMethod("FLUX_DEBUG_VIEW_ISLANDS")]
         public void FluxDebugViewIslands()
         {
-            var doc = Application.DocumentManager.MdiActiveDocument;
+            var doc =  Bricscad.ApplicationServices.Application.DocumentManager.MdiActiveDocument;
             if (doc == null)
                 return;
 
@@ -904,7 +1433,7 @@ namespace FluxCAD.BricsCAD.Plugin26
         [CommandMethod("FLUX_DEBUG_OCC_GRID_STROKE_RAW")]
         public void FluxDebugOccGridStrokeRaw()
         {
-            var doc = Application.DocumentManager.MdiActiveDocument;
+            var doc = Bricscad.ApplicationServices.Application.DocumentManager.MdiActiveDocument;
             if (doc == null)
                 return;
 
@@ -1201,7 +1730,7 @@ namespace FluxCAD.BricsCAD.Plugin26
         [CommandMethod("FLUX_DEBUG_OCC_GRID_HITMAP_RAW")]
         public void FluxDebugOccGridHitMapRaw()
         {
-            var doc = Application.DocumentManager.MdiActiveDocument;
+            var doc = Bricscad.ApplicationServices.Application.DocumentManager.MdiActiveDocument;
             if (doc == null)
                 return;
 
@@ -1282,7 +1811,7 @@ namespace FluxCAD.BricsCAD.Plugin26
         [CommandMethod("FLUX_DEBUG_OCC_GRID_HITMAP_LOOSE")]
         public void FluxDebugOccGridHitMapLoose()
         {
-            var doc = Application.DocumentManager.MdiActiveDocument;
+            var doc = Bricscad.ApplicationServices.Application.DocumentManager.MdiActiveDocument;
             if (doc == null)
                 return;
 
@@ -1383,7 +1912,7 @@ namespace FluxCAD.BricsCAD.Plugin26
         [CommandMethod("FLUX_DEBUG_OCC_GRID_HITMAP")]
         public void FluxDebugOccGridHitMap()
         {
-            var doc = Application.DocumentManager.MdiActiveDocument;
+            var doc = Bricscad.ApplicationServices.Application.DocumentManager.MdiActiveDocument;
             if (doc == null)
                 return;
 
@@ -1463,7 +1992,7 @@ namespace FluxCAD.BricsCAD.Plugin26
         [CommandMethod("FLUX_CLEAR_OCCUPANCY_MARKS")]
         public void FluxClearOccupancyMarks()
         {
-            var doc = Application.DocumentManager.MdiActiveDocument;
+            var doc = Bricscad.ApplicationServices.Application.DocumentManager.MdiActiveDocument;
             var db = doc.Database;
             var ed = doc.Editor;
 
@@ -1489,7 +2018,7 @@ namespace FluxCAD.BricsCAD.Plugin26
         [CommandMethod("FLUX_DEBUG_OCCUPANCY_ISLANDS_WITH_CELLS")]
         public void FluxDebugOccupancyIslandsWithCells()
         {
-            var doc = Application.DocumentManager.MdiActiveDocument;
+            var doc = Bricscad.ApplicationServices.Application.DocumentManager.MdiActiveDocument;
             var db = doc.Database;
             var ed = doc.Editor;
 
@@ -3053,7 +3582,7 @@ namespace FluxCAD.BricsCAD.Plugin26
 
         public void FluxDebugOccupancyIslandsWithCells_old()
         {
-            var doc = Application.DocumentManager.MdiActiveDocument;
+            var doc = Bricscad.ApplicationServices.Application.DocumentManager.MdiActiveDocument;
             var db = doc.Database;
             var ed = doc.Editor;
 
@@ -3132,7 +3661,7 @@ namespace FluxCAD.BricsCAD.Plugin26
         [CommandMethod("FLUX_DEBUG_OCCUPANCY_ISLANDS")]
         public void FluxDebugOccupancyIslands()
         {
-            var doc = Application.DocumentManager.MdiActiveDocument;
+            var doc = Bricscad.ApplicationServices.Application.DocumentManager.MdiActiveDocument;
             var db = doc.Database;
             var ed = doc.Editor;
 
@@ -3222,7 +3751,7 @@ namespace FluxCAD.BricsCAD.Plugin26
 
         public void FluxDebugOccupancyIslands_old()
         {
-            var doc = Application.DocumentManager.MdiActiveDocument;
+            var doc = Bricscad.ApplicationServices.Application.DocumentManager.MdiActiveDocument;
             var db = doc.Database;
             var ed = doc.Editor;
 
@@ -3294,7 +3823,7 @@ namespace FluxCAD.BricsCAD.Plugin26
         [CommandMethod("FLUX_DEBUG_SHEET_ENTITY_ROLES")]
         public void FluxDebugSheetEntityRoles()
         {
-            var doc = Application.DocumentManager.MdiActiveDocument;
+            var doc = Bricscad.ApplicationServices.Application.DocumentManager.MdiActiveDocument;
             if (doc == null)
                 return;
 
@@ -3523,7 +4052,7 @@ namespace FluxCAD.BricsCAD.Plugin26
         [CommandMethod("FLUX_DEBUG_GEOMETRY_CLUSTERS")]
         public void FluxDebugGeometryClusters()
         {
-            var doc = Application.DocumentManager.MdiActiveDocument;
+            var doc = Bricscad.ApplicationServices.Application.DocumentManager.MdiActiveDocument;
             if (doc == null)
                 return;
 
@@ -3743,7 +4272,7 @@ namespace FluxCAD.BricsCAD.Plugin26
         [CommandMethod("FLUX_DEBUG_SINGLE_SHEET_ROLES")]
         public void FluxDebugSingleSheetRoles()
         {
-            var doc = Application.DocumentManager.MdiActiveDocument;
+            var doc = Bricscad.ApplicationServices.Application.DocumentManager.MdiActiveDocument;
             var db = doc.Database;
             var ed = doc.Editor;
 
@@ -4300,7 +4829,7 @@ namespace FluxCAD.BricsCAD.Plugin26
         [CommandMethod("FLUX_DEBUG_CANONICAL_SINGLE_SHEET")]
         public void FluxDebugCanonicalSingleSheet()
         {
-            var doc = Application.DocumentManager.MdiActiveDocument;
+            var doc = Bricscad.ApplicationServices.Application.DocumentManager.MdiActiveDocument;
             var db = doc.Database;
             var ed = doc.Editor;
 
@@ -4444,7 +4973,7 @@ namespace FluxCAD.BricsCAD.Plugin26
         [CommandMethod("FLUX_DEBUG_SINGLE_SHEET_ANALYSIS")]
         public void FluxDebugSingleSheetAnalysis()
         {
-            var doc = Application.DocumentManager.MdiActiveDocument;
+            var doc = Bricscad.ApplicationServices.Application.DocumentManager.MdiActiveDocument;
             if (doc == null)
                 return;
 
