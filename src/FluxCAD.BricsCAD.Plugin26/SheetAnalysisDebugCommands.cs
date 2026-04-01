@@ -166,14 +166,56 @@ namespace FluxCAD.BricsCAD.Plugin26
                     return;
                 }
 
+                // 1차 robust bounds 계산용: obvious ghost 제거
+                var geometryEntitiesForBounds = geometryEntities
+                    .Where(x => !GhostEntityPolicy.IsIgnorableGhostEntity(x, Bounds2D.Empty))
+                    .ToList();
+
+                if (geometryEntitiesForBounds.Count == 0)
+                    geometryEntitiesForBounds = geometryEntities.ToList();
+
                 var robustBounds = ComputeRobustGeometryBounds(
-                    geometryEntities,
+                    geometryEntitiesForBounds,
                     out var rejectedOutliers,
                     trimRatio: 0.02,
                     minKeepCount: 20);
 
                 if (robustBounds.IsEmpty)
                     robustBounds = allBounds;
+
+                // 2차: provisional robust bounds 기준으로 far-out ghost 재제거
+                var filteredGeometryEntities = GhostEntityPolicy.ExcludeGhosts(
+                    geometryEntitiesForBounds,
+                    robustBounds,
+                    out var rejectedGhosts).ToList();
+
+                if (filteredGeometryEntities.Count > 0)
+                {
+                    var refinedBounds = ComputeRobustGeometryBounds(
+                        filteredGeometryEntities,
+                        out var rejectedOutliers2,
+                        trimRatio: 0.02,
+                        minKeepCount: 20);
+
+                    if (!refinedBounds.IsEmpty)
+                    {
+                        robustBounds = refinedBounds;
+                        rejectedOutliers = rejectedOutliers2;
+                    }
+                }
+
+                ed.WriteMessage($"\n[FluxCAD] AllBounds={allBounds}");
+                ed.WriteMessage($"\n[FluxCAD] RobustBounds={robustBounds}");
+                ed.WriteMessage($"\n[FluxCAD] rejectedOutliers={rejectedOutliers.Count}");
+                ed.WriteMessage($"\n[FluxCAD] rejectedGhosts={rejectedGhosts.Count}");
+
+                foreach (var ghost in rejectedGhosts.Take(10))
+                {
+                    ed.WriteMessage(
+                        $"\n  [GhostRejected] Handle={ghost.Handle}, Kind={ghost.Kind}, " +
+                        $"Block={ghost.BlockName}, Depth={ghost.Depth}, Bounds={ghost.Bounds}, " +
+                        $"Type={ghost.EntityTypeName ?? ghost.EntityType}");
+                }
 
                 var gridInput = PrepareOccupancyInput(
                     entities,
@@ -912,9 +954,16 @@ namespace FluxCAD.BricsCAD.Plugin26
                     return;
                 }
 
-                // 여기서 robust bounds를 계산
+                // 1차 robust bounds 계산용: obvious ghost 제거
+                var geometryEntitiesForBounds = geometryEntities
+                    .Where(x => !GhostEntityPolicy.IsIgnorableGhostEntity(x, Bounds2D.Empty))
+                    .ToList();
+
+                if (geometryEntitiesForBounds.Count == 0)
+                    geometryEntitiesForBounds = geometryEntities.ToList();
+
                 var robustBounds = ComputeRobustGeometryBounds(
-                    geometryEntities,
+                    geometryEntitiesForBounds,
                     out var rejectedOutliers,
                     trimRatio: 0.02,
                     minKeepCount: 20);
@@ -922,7 +971,40 @@ namespace FluxCAD.BricsCAD.Plugin26
                 if (robustBounds.IsEmpty)
                     robustBounds = allBounds;
 
-                // robust bounds 기준으로 occupancy input 생성
+                // 2차: provisional robust bounds 기준으로 far-out ghost 재제거
+                var filteredGeometryEntities = GhostEntityPolicy.ExcludeGhosts(
+                    geometryEntitiesForBounds,
+                    robustBounds,
+                    out var rejectedGhosts).ToList();
+
+                if (filteredGeometryEntities.Count > 0)
+                {
+                    var refinedBounds = ComputeRobustGeometryBounds(
+                        filteredGeometryEntities,
+                        out var rejectedOutliers2,
+                        trimRatio: 0.02,
+                        minKeepCount: 20);
+
+                    if (!refinedBounds.IsEmpty)
+                    {
+                        robustBounds = refinedBounds;
+                        rejectedOutliers = rejectedOutliers2;
+                    }
+                }
+
+                ed.WriteMessage($"\n[FluxCAD] AllBounds={allBounds}");
+                ed.WriteMessage($"\n[FluxCAD] RobustBounds={robustBounds}");
+                ed.WriteMessage($"\n[FluxCAD] rejectedOutliers={rejectedOutliers.Count}");
+                ed.WriteMessage($"\n[FluxCAD] rejectedGhosts={rejectedGhosts.Count}");
+
+                foreach (var ghost in rejectedGhosts.Take(10))
+                {
+                    ed.WriteMessage(
+                        $"\n  [GhostRejected] Handle={ghost.Handle}, Kind={ghost.Kind}, " +
+                        $"Block={ghost.BlockName}, Depth={ghost.Depth}, Bounds={ghost.Bounds}, " +
+                        $"Type={ghost.EntityTypeName ?? ghost.EntityType}");
+                }
+
                 var gridInput = PrepareOccupancyInput(
                     entities,
                     robustBounds,
@@ -1662,42 +1744,96 @@ namespace FluxCAD.BricsCAD.Plugin26
 
 
         private List<SheetEntity> PrepareOccupancyInput(
-            IReadOnlyList<SheetEntity> entities,
-            Bounds2D sheetBounds,
-            Bricscad.EditorInput.Editor ed,
-            OccupancyInputMode mode = OccupancyInputMode.StrictCandidateClusters)
+    IReadOnlyList<SheetEntity> entities,
+    Bounds2D sheetBounds,
+    Bricscad.EditorInput.Editor ed,
+    OccupancyInputMode mode = OccupancyInputMode.StrictCandidateClusters)
         {
             if (entities == null)
                 throw new ArgumentNullException(nameof(entities));
 
+            // ---------------------------------------------------------------------
+            // 0) 공통 ghost 제거용 reference bounds 준비
+            // ---------------------------------------------------------------------
+            var visibleEntities = entities
+                .Where(x => x != null && x.IsVisible)
+                .ToList();
+
+            var visibleGeometryLikeEntities = visibleEntities
+                .Where(GhostEntityPolicy.IsVisibleGeometryLikeForBounds)
+                .ToList();
+
+            var geometryEntitiesForBounds = visibleGeometryLikeEntities
+                .Where(x => !GhostEntityPolicy.IsIgnorableGhostEntity(x, Bounds2D.Empty))
+                .ToList();
+
+            if (geometryEntitiesForBounds.Count == 0)
+                geometryEntitiesForBounds = visibleGeometryLikeEntities.ToList();
+
+            var robustBounds = ComputeRobustGeometryBounds(
+                geometryEntitiesForBounds,
+                out var rejectedOutliers,
+                trimRatio: 0.02,
+                minKeepCount: 20);
+
+            if (robustBounds.IsEmpty)
+                robustBounds = sheetBounds;
+
+            var filteredEntities = GhostEntityPolicy.ExcludeGhosts(
+                visibleEntities,
+                robustBounds,
+                out var rejectedGhosts)
+                .ToList();
+
+            ed.WriteMessage($"\n[FluxCAD] PrepareOccupancyInput.AllVisible={visibleEntities.Count}");
+            ed.WriteMessage($"\n[FluxCAD] PrepareOccupancyInput.RobustBounds={robustBounds}");
+            ed.WriteMessage($"\n[FluxCAD] PrepareOccupancyInput.RejectedOutliers={rejectedOutliers.Count}");
+            ed.WriteMessage($"\n[FluxCAD] PrepareOccupancyInput.RejectedGhosts={rejectedGhosts.Count}");
+
+            foreach (var ghost in rejectedGhosts.Take(10))
+            {
+                ed.WriteMessage(
+                    $"\n  [PrepareGhostRejected] Handle={ghost.Handle}, Kind={ghost.Kind}, " +
+                    $"Block={ghost.BlockName}, Depth={ghost.Depth}, Bounds={ghost.Bounds}, " +
+                    $"Type={ghost.EntityTypeName ?? ghost.EntityType}");
+            }
+
             // ★ 핵심: RAW 모드는 구조 경로를 타지 않고 snapshot 전체를 직접 사용
+            // 단, ghost entity는 먼저 제거한 뒤 넘긴다.
             if (mode == OccupancyInputMode.RawAllGeometrySeeds)
             {
                 return PrepareOccupancyInput_RawAllGeometry(
-                    entities,
-                    sheetBounds,
+                    filteredEntities,
+                    robustBounds,
                     ed);
             }
 
-            // 0) scene partition 로그
+            // ---------------------------------------------------------------------
+            // 1) scene partition 로그
+            // ghost 제외된 filteredEntities 기준으로 진행
+            // ---------------------------------------------------------------------
             var partitioner = new ScenePartitioner();
-            var partition = partitioner.Partition(entities);
+            var partition = partitioner.Partition(filteredEntities);
 
             ed.WriteMessage(
                 $"\n[FluxCAD] ScenePartition geometry={partition.GeometryCoreEntities.Count}, " +
                 $"annotation={partition.AnnotationEntities.Count}, metadata={partition.MetadataEntities.Count}, " +
                 $"unknown={partition.UnknownEntities.Count}");
 
-            // 1) 구조 단위 구축
+            // ---------------------------------------------------------------------
+            // 2) 구조 단위 구축
+            // ---------------------------------------------------------------------
             var structuralBuilder = new StructuralUnitBuilder();
             var structuralModel = structuralBuilder.Build(
-                entities,
-                sheetBounds,
+                filteredEntities,
+                robustBounds,
                 options: null);
 
             ed.WriteMessage($"\n[FluxCAD] StructuralUnits total={structuralModel.Units.Count}");
 
-            // 2) 역할별 분리
+            // ---------------------------------------------------------------------
+            // 3) 역할별 분리
+            // ---------------------------------------------------------------------
             var separator = new StructuralSeparator();
             var separation = separator.Separate(structuralModel);
 
@@ -1707,7 +1843,9 @@ namespace FluxCAD.BricsCAD.Plugin26
                 $"frame={separation.FrameUnits.Count}, metadata={separation.MetadataUnits.Count}, " +
                 $"mixed={separation.MixedUnits.Count}");
 
-            // 3) geometry input 구축
+            // ---------------------------------------------------------------------
+            // 4) geometry input 구축
+            // ---------------------------------------------------------------------
             var viewInputBuilder = new GeometryViewInputBuilder(
                 new GeometryViewInputBuildOptions
                 {
@@ -1727,7 +1865,7 @@ namespace FluxCAD.BricsCAD.Plugin26
             var packAnalyzer = new GeometryUnitPackAnalyzer();
             var packResult = packAnalyzer.Build(
                 viewInput.GeometryUnits,
-                sheetBounds,
+                robustBounds,
                 new GeometryUnitPackOptions
                 {
                     ExcludeMetadataHeavyUnits = true,
@@ -1750,7 +1888,9 @@ namespace FluxCAD.BricsCAD.Plugin26
                     $"metaHits={pack.MetadataHitCount}, score={pack.Score:0.##}");
             }
 
-            // 4) geometry unit 전체를 대상으로 spatial seed 수집
+            // ---------------------------------------------------------------------
+            // 5) geometry unit 전체를 대상으로 spatial seed 수집
+            // ---------------------------------------------------------------------
             var spatialAnalyzer = new GeometryUnitSpatialClusterAnalyzer();
             var finalEntities = new List<SheetEntity>();
 
@@ -1759,6 +1899,7 @@ namespace FluxCAD.BricsCAD.Plugin26
             int totalGeometrySeedCount = 0;
             int totalFilteredOutSeedCount = 0;
             int totalAcceptedSeedCount = 0;
+            int totalGhostRejectedSeedCount = 0;
 
             foreach (var unit in viewInput.GeometryUnits)
             {
@@ -1805,7 +1946,7 @@ namespace FluxCAD.BricsCAD.Plugin26
                 totalFilteredOutSeedCount += clusterResult.FilteredOutGeometrySeedCount;
 
                 var candidateClusters = clusterResult.Clusters
-                    .Where(x => IsCandidateViewCluster(x, sheetBounds))
+                    .Where(x => IsCandidateViewCluster(x, robustBounds))
                     .ToList();
 
                 List<SheetEntity> acceptedSeeds;
@@ -1817,7 +1958,8 @@ namespace FluxCAD.BricsCAD.Plugin26
                         .SelectMany(x => x.GeometryMembers ?? Enumerable.Empty<SheetEntity>())
                         .Select(CloneWithFallbackBounds)
                         .Where(x => x != null)
-                        .Where(x => IsValidOccupancyPrimitive(x!, sheetBounds))
+                        .Where(x => !GhostEntityPolicy.IsIgnorableGhostEntity(x!, robustBounds))
+                        .Where(x => IsValidOccupancyPrimitive(x!, robustBounds))
                         .GroupBy(GetOccupancyDedupKey)
                         .Select(g => g.First())
                         .ToList()!;
@@ -1830,12 +1972,25 @@ namespace FluxCAD.BricsCAD.Plugin26
                         .Concat(clusterResult.GeometrySeeds ?? Enumerable.Empty<SheetEntity>())
                         .Select(CloneWithFallbackBounds)
                         .Where(x => x != null)
+                        .Where(x => !GhostEntityPolicy.IsIgnorableGhostEntity(x!, robustBounds))
                         .Where(x => IsValidOccupancyPrimitiveRaw(x!))
                         .GroupBy(GetOccupancyDedupKey)
                         .Select(g => g.First())
                         .ToList()!;
                     selectionModeLabel = "loose-all-geometry-seeds";
                 }
+
+                int unitGhostRejectedCount = 0;
+
+                // 진단용: ghost가 얼마나 걸러졌는지 계산
+                var rawCandidateSeedCount = (mode == OccupancyInputMode.StrictCandidateClusters)
+                    ? candidateClusters.SelectMany(x => x.GeometryMembers ?? Enumerable.Empty<SheetEntity>()).Count()
+                    : (clusterResult.RawGeometrySeeds ?? Enumerable.Empty<SheetEntity>())
+                        .Concat(clusterResult.GeometrySeeds ?? Enumerable.Empty<SheetEntity>())
+                        .Count();
+
+                unitGhostRejectedCount = Math.Max(0, rawCandidateSeedCount - acceptedSeeds.Count);
+                totalGhostRejectedSeedCount += unitGhostRejectedCount;
 
                 totalAcceptedSeedCount += acceptedSeeds.Count;
                 finalEntities.AddRange(acceptedSeeds);
@@ -1847,6 +2002,7 @@ namespace FluxCAD.BricsCAD.Plugin26
                     $"filteredOut={clusterResult.FilteredOutGeometrySeedCount}, " +
                     $"candidateClusters={candidateClusters.Count}, " +
                     $"acceptedGeometrySeeds={acceptedSeeds.Count}, " +
+                    $"ghostRejectedApprox={unitGhostRejectedCount}, " +
                     $"clusters={clusterResult.Clusters.Count}, " +
                     $"mode={selectionModeLabel}");
 
@@ -1864,8 +2020,12 @@ namespace FluxCAD.BricsCAD.Plugin26
                 }
             }
 
+            // ---------------------------------------------------------------------
+            // 6) 최종 결과도 한 번 더 ghost 제거 + dedupe
+            // ---------------------------------------------------------------------
             finalEntities = finalEntities
                 .Where(x => x != null && !x.Bounds.IsEmpty)
+                .Where(x => !GhostEntityPolicy.IsIgnorableGhostEntity(x, robustBounds))
                 .GroupBy(GetOccupancyDedupKey)
                 .Select(g => g.First())
                 .ToList();
@@ -1887,8 +2047,8 @@ namespace FluxCAD.BricsCAD.Plugin26
             ed.WriteMessage(
                 $"\n[FluxCAD] OccupancyInput mode={mode}, unitsUsed={usedUnitCount}, " +
                 $"rawSeeds={totalRawSeedCount}, geometrySeeds={totalGeometrySeedCount}, " +
-                $"filteredOut={totalFilteredOutSeedCount}, acceptedGeometrySeeds={totalAcceptedSeedCount}, " +
-                $"primitives={finalEntities.Count}");
+                $"filteredOut={totalFilteredOutSeedCount}, ghostRejectedApprox={totalGhostRejectedSeedCount}, " +
+                $"acceptedGeometrySeeds={totalAcceptedSeedCount}, primitives={finalEntities.Count}");
 
             var byKind = finalEntities
                 .GroupBy(x => x.Kind)
