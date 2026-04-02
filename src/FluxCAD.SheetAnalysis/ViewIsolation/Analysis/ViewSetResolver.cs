@@ -143,8 +143,8 @@ namespace FluxCAD.SheetAnalysis.ViewIsolation.Analysis
         }
 
         private void TryRegisterParentChild(
-            ViewRelationship rel,
-            Dictionary<int, ParentAssignment> parentAssignments)
+    ViewRelationship rel,
+    Dictionary<int, ParentAssignment> parentAssignments)
         {
             if (rel == null)
                 throw new ArgumentNullException(nameof(rel));
@@ -152,23 +152,55 @@ namespace FluxCAD.SheetAnalysis.ViewIsolation.Analysis
             switch (rel.RelationKind)
             {
                 case ViewRelationKind.EmbeddedFeature:
-                    RegisterParent(
-                        parentAssignments,
-                        parent: rel.AContainsB ? rel.A : rel.B,
-                        child: rel.AContainsB ? rel.B : rel.A,
-                        isEmbeddedFeature: true,
-                        relation: rel);
-                    break;
+                    {
+                        var parent = rel.AContainsB ? rel.A : rel.B;
+                        var child = rel.AContainsB ? rel.B : rel.A;
+
+                        if (IsInvalidHierarchyParent(parent))
+                            return;
+
+                        RegisterParent(
+                            parentAssignments,
+                            parent: parent,
+                            child: child,
+                            isEmbeddedFeature: true,
+                            relation: rel);
+                        break;
+                    }
 
                 case ViewRelationKind.ParentChildContainment:
-                    RegisterParent(
-                        parentAssignments,
-                        parent: rel.AContainsB ? rel.A : rel.B,
-                        child: rel.AContainsB ? rel.B : rel.A,
-                        isEmbeddedFeature: false,
-                        relation: rel);
-                    break;
+                    {
+                        var parent = rel.AContainsB ? rel.A : rel.B;
+                        var child = rel.AContainsB ? rel.B : rel.A;
+
+                        if (IsInvalidHierarchyParent(parent))
+                            return;
+
+                        RegisterParent(
+                            parentAssignments,
+                            parent: parent,
+                            child: child,
+                            isEmbeddedFeature: false,
+                            relation: rel);
+                        break;
+                    }
             }
+        }
+
+        private static bool IsInvalidHierarchyParent(ViewCandidate parent)
+        {
+            if (parent == null)
+                return true;
+
+            // SparseBridge는 hierarchy parent가 되면 안 됨
+            if (parent.InitialRole == ViewIslandSemanticRole.SparseBridge ||
+                parent.FinalRole == ViewIslandSemanticRole.SparseBridge ||
+                parent.IsSparseBridgeLike)
+            {
+                return true;
+            }
+
+            return false;
         }
 
         private static void RegisterParent(

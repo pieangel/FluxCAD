@@ -31,6 +31,24 @@ namespace FluxCAD.BricsCAD.Plugin26
             RawAllGeometrySeeds
         }
 
+        private sealed class SemanticIslandPipelineResult
+        {
+            public IReadOnlyList<SheetEntity> Entities { get; init; } = Array.Empty<SheetEntity>();
+
+            public Bounds2D AllBounds { get; init; } = Bounds2D.Empty;
+            public Bounds2D RobustBounds { get; init; } = Bounds2D.Empty;
+
+            public IReadOnlyList<SheetEntity> GridInput { get; init; } = Array.Empty<SheetEntity>();
+
+            public OccupancyGridHitMapResult HitMap { get; init; } = default!;
+
+            public IReadOnlyList<OccupancyHitIsland> Islands { get; init; } = Array.Empty<OccupancyHitIsland>();
+
+            public IReadOnlyList<ViewIslandEntityGroup> Groups { get; init; } = Array.Empty<ViewIslandEntityGroup>();
+
+            public IReadOnlyList<ViewIslandSemanticResult> SemanticResults { get; init; } = Array.Empty<ViewIslandSemanticResult>();
+        }
+
         [CommandMethod("FLUX_DEBUG_VIEW_ISLAND_HIERARCHY")]
         public void FluxDebugViewIslandHierarchy()
         {
@@ -123,6 +141,13 @@ namespace FluxCAD.BricsCAD.Plugin26
                     robustBounds,
                     ed);
 
+                ed.WriteMessage("\n[FluxCAD] ---- HierarchySourceEntities Sample ----");
+                foreach (var e in hierarchySourceEntities.Take(20))
+                {
+                    ed.WriteMessage(
+                        $"\n  Handle={e.Handle}, Kind={e.Kind}, Bounds={e.Bounds}, Type={e.EntityTypeName ?? e.EntityType}");
+                }
+
                 if (hierarchySourceEntities.Count == 0)
                 {
                     ed.WriteMessage("\n[FluxCAD] hierarchy source entities가 비어 있습니다.");
@@ -141,7 +166,7 @@ namespace FluxCAD.BricsCAD.Plugin26
                     return;
                 }
 
-                const double targetCellSize = 12.0;
+                const double targetCellSize = 6.0;
 
                 var cols = Clamp((int)Math.Ceiling(robustBounds.Width / targetCellSize), 120, 420);
                 var rows = Clamp((int)Math.Ceiling(robustBounds.Height / targetCellSize), 120, 420);
@@ -155,6 +180,8 @@ namespace FluxCAD.BricsCAD.Plugin26
 
                 var islandFinder = new OccupancyHitIslandFinder();
                 var hitGrid = BuildHitGrid(hitMap);
+
+                CloseSingleCellGaps(hitGrid);
 
                 var islands = islandFinder.Find(hitGrid)
                     .Where(x => x.CellCount > 2)
@@ -224,6 +251,229 @@ namespace FluxCAD.BricsCAD.Plugin26
             }
         }
 
+        private static bool TryComputeRobustBounds(
+    IReadOnlyList<SheetEntity> entities,
+    Bounds2D allBounds,
+    out Bounds2D robustBounds,
+    out List<SheetEntity> rejectedOutliers,
+    out List<SheetEntity> rejectedGhosts)
+        {
+            robustBounds = Bounds2D.Empty;
+            rejectedOutliers = new List<SheetEntity>();
+            rejectedGhosts = new List<SheetEntity>();
+
+            if (entities == null || entities.Count == 0)
+                return false;
+
+            var geometryEntities = entities
+                .Where(x => x != null)
+                .Where(x => x.IsVisible)
+                .Where(x => x.IsGeometryLike)
+                .Where(x => !x.IsTextLike)
+                .Where(x => !x.IsDimensionLike)
+                .Where(x => !x.IsBlockReference)
+                .Where(x => !Bounds2DHelper.IsEmpty(x.Bounds))
+                .ToList();
+
+            if (geometryEntities.Count == 0)
+                return false;
+
+            var geometryEntitiesForBounds = geometryEntities
+                .Where(x => !GhostEntityPolicy.IsIgnorableGhostEntity(x, Bounds2D.Empty))
+                .ToList();
+
+            if (geometryEntitiesForBounds.Count == 0)
+                geometryEntitiesForBounds = geometryEntities.ToList();
+
+            robustBounds = ComputeRobustGeometryBounds(
+                geometryEntitiesForBounds,
+                out rejectedOutliers,
+                trimRatio: 0.02,
+                minKeepCount: 20);
+
+            if (robustBounds.IsEmpty)
+                robustBounds = allBounds;
+
+            var filteredGeometryEntities = GhostEntityPolicy.ExcludeGhosts(
+                geometryEntitiesForBounds,
+                robustBounds,
+                out rejectedGhosts).ToList();
+
+            if (filteredGeometryEntities.Count > 0)
+            {
+                var refinedBounds = ComputeRobustGeometryBounds(
+                    filteredGeometryEntities,
+                    out var rejectedOutliers2,
+                    trimRatio: 0.02,
+                    minKeepCount: 20);
+
+                if (!refinedBounds.IsEmpty)
+                {
+                    robustBounds = refinedBounds;
+                    rejectedOutliers = rejectedOutliers2;
+                }
+            }
+
+            return !robustBounds.IsEmpty;
+        }
+
+        private static SemanticIslandPipelineResult BuildSemanticIslandPipeline(
+    IReadOnlyList<SheetEntity> entities,
+    Bricscad.EditorInput.Editor ed,
+    bool closeSingleCellGaps,
+    double targetCellSize,
+    bool excludeSparseBridgeFromGroups)
+        {
+            if (entities == null)
+                throw new ArgumentNullException(nameof(entities));
+
+            if (ed == null)
+                throw new ArgumentNullException(nameof(ed));
+
+            var allBounds = Bounds2DHelper.FromEntities(entities);
+            if (allBounds.IsEmpty)
+                throw new InvalidOperationException("sheet bounds가 비어 있습니다.");
+
+            if (!TryComputeRobustBounds(
+                entities,
+                allBounds,
+                out var robustBounds,
+                out var rejectedOutliers,
+                out var rejectedGhosts))
+            {
+                throw new InvalidOperationException("geometry robust bounds 계산에 실패했습니다.");
+            }
+
+            ed.WriteMessage($"\n[FluxCAD] AllBounds={allBounds}");
+            ed.WriteMessage($"\n[FluxCAD] RobustBounds={robustBounds}");
+            ed.WriteMessage($"\n[FluxCAD] rejectedOutliers={rejectedOutliers.Count}");
+            ed.WriteMessage($"\n[FluxCAD] rejectedGhosts={rejectedGhosts.Count}");
+
+            foreach (var ghost in rejectedGhosts.Take(10))
+            {
+                ed.WriteMessage(
+                    $"\n  [GhostRejected] Handle={ghost.Handle}, Kind={ghost.Kind}, " +
+                    $"Block={ghost.BlockName}, Depth={ghost.Depth}, Bounds={ghost.Bounds}, " +
+                    $"Type={ghost.EntityTypeName ?? ghost.EntityType}");
+            }
+
+            var gridInput = PrepareOccupancyInput(
+                entities,
+                robustBounds,
+                ed,
+                OccupancyInputMode.RawAllGeometrySeeds);
+
+            if (gridInput == null || gridInput.Count == 0)
+                throw new InvalidOperationException("semantic island grid input이 비어 있습니다.");
+
+            var cols = Clamp((int)Math.Ceiling(robustBounds.Width / targetCellSize), 120, 420);
+            var rows = Clamp((int)Math.Ceiling(robustBounds.Height / targetCellSize), 120, 420);
+
+            var hitMapBuilder = new StrokeOccupancyGridHitMapBuilder();
+            var hitMap = hitMapBuilder.Build(
+                gridInput,
+                robustBounds,
+                rows,
+                cols);
+
+            var islandFinder = new OccupancyHitIslandFinder();
+            var hitGrid = BuildHitGrid(hitMap);
+
+            if (closeSingleCellGaps)
+                CloseSingleCellGaps(hitGrid);
+
+            var islands = islandFinder.Find(hitGrid)
+                .Where(x => x.CellCount > 2)
+                .ToList();
+
+            var matcher = new DimensionOverlapMatcherForHitIslands();
+            matcher.Apply(islands, entities, tolerance: 0);
+
+            foreach (var island in islands)
+                island.IsSparseBridgeLike = IsSparseGiantHitIsland(island, hitMap);
+
+            var effectiveIslands = excludeSparseBridgeFromGroups
+                ? islands.Where(x => !x.IsSparseBridgeLike).ToList()
+                : islands;
+
+            var collector = new ViewIslandEntityCollector();
+            var groups = collector.Collect(effectiveIslands, entities, tolerance: 0);
+
+            var classifier = new ViewIslandSemanticClassifier();
+            var semanticResults = groups
+                .Select(g => classifier.Classify(g, robustBounds))
+                .ToList();
+
+            foreach (var result in semanticResults)
+            {
+                result.Island.SemanticRole = result.Role;
+                result.Island.SemanticReason = result.Reason;
+            }
+
+            return new SemanticIslandPipelineResult
+            {
+                Entities = entities.ToList(),
+                AllBounds = allBounds,
+                RobustBounds = robustBounds,
+                GridInput = gridInput.ToList(),
+                HitMap = hitMap,
+                Islands = islands,
+                Groups = groups,
+                SemanticResults = semanticResults
+            };
+        }
+
+        private static void CloseSingleCellGaps(OccupancyGridHitCell[,] grid)
+        {
+            if (grid == null)
+                return;
+
+            var rows = grid.GetLength(0);
+            var cols = grid.GetLength(1);
+
+            var toFill = new List<(int r, int c)>();
+
+            for (int r = 1; r < rows - 1; r++)
+            {
+                for (int c = 1; c < cols - 1; c++)
+                {
+                    if (grid[r, c] == null)
+                        continue;
+
+                    if (grid[r, c].IsOn)
+                        continue;
+
+                    var horizontalBridge =
+                        grid[r, c - 1] != null && grid[r, c - 1].IsOn &&
+                        grid[r, c + 1] != null && grid[r, c + 1].IsOn;
+
+                    var verticalBridge =
+                        grid[r - 1, c] != null && grid[r - 1, c].IsOn &&
+                        grid[r + 1, c] != null && grid[r + 1, c].IsOn;
+
+                    if (horizontalBridge || verticalBridge)
+                        toFill.Add((r, c));
+                }
+            }
+
+            foreach (var cell in toFill)
+            {
+                MarkCellOn(grid, cell.r, cell.c);
+            }
+        }
+
+        private static void MarkCellOn(OccupancyGridHitCell[,] grid, int row, int col)
+        {
+            var cell = grid[row, col];
+            if (cell == null)
+                return;
+
+            // 가장 단순하고 안전한 방식:
+            // 비어 있는 셀을 bounds hit 1개로 간주하여 ON으로 만든다.
+            if (!cell.IsOn)
+                cell.BoundsHitCount = 1;
+        }
+
         private static List<SheetEntity> PrepareHierarchySourceEntities(
     IReadOnlyList<SheetEntity> entities,
     Bounds2D robustBounds,
@@ -233,16 +483,15 @@ namespace FluxCAD.BricsCAD.Plugin26
                 throw new ArgumentNullException(nameof(entities));
 
             var filtered = entities
-                .Where(x => x != null)
-                .Where(x => x.IsVisible)
-                .Where(x => x.IsGeometryLike)
-                .Where(x => !x.IsTextLike)
-                .Where(x => !x.IsDimensionLike)
-                .Where(x => !x.IsBlockReference)
-                .Where(x => !Bounds2DHelper.IsEmpty(x.Bounds))
-                .Where(x => !GhostEntityPolicy.IsIgnorableGhostEntity(x, robustBounds))
-                .Where(x => !IsHierarchyBridgeLikeEntity(x, robustBounds))
-                .ToList();
+                 .Where(x => x != null)
+                 .Where(x => x.IsVisible)
+                 .Where(x => x.IsGeometryLike)
+                 .Where(x => !x.IsTextLike)
+                 .Where(x => !x.IsDimensionLike)
+                 .Where(x => !x.IsBlockReference)
+                 .Where(x => !Bounds2DHelper.IsEmpty(x.Bounds))
+                 .Where(x => !GhostEntityPolicy.IsIgnorableGhostEntity(x, robustBounds))
+                 .ToList();
 
             ed.WriteMessage(
                 $"\n[FluxCAD] HierarchySourceEntities filtered={filtered.Count} / total={entities.Count}");
@@ -1092,6 +1341,8 @@ namespace FluxCAD.BricsCAD.Plugin26
 
                 var islandFinder = new OccupancyHitIslandFinder();
                 var hitGrid = BuildHitGrid(hitMap);
+                
+                CloseSingleCellGaps(hitGrid);
 
                 var islands = islandFinder.Find(hitGrid)
                     .Where(x => x.CellCount > 2)
@@ -2272,7 +2523,7 @@ namespace FluxCAD.BricsCAD.Plugin26
         }
 
 
-        private List<SheetEntity> PrepareOccupancyInput(
+        private static List<SheetEntity> PrepareOccupancyInput(
     IReadOnlyList<SheetEntity> entities,
     Bounds2D sheetBounds,
     Bricscad.EditorInput.Editor ed,
@@ -2594,7 +2845,7 @@ namespace FluxCAD.BricsCAD.Plugin26
 
 
 
-        private List<SheetEntity> PrepareOccupancyInput_RawAllGeometry(
+        private static List<SheetEntity> PrepareOccupancyInput_RawAllGeometry(
     IReadOnlyList<SheetEntity> entities,
     Bounds2D sheetBounds,
     Bricscad.EditorInput.Editor ed)

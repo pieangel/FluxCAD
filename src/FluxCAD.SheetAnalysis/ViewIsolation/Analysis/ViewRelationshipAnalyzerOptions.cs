@@ -42,18 +42,18 @@
         /// 부모 대비 자식 크기 상한
         /// child.Area / parent.Area <= MaxEmbeddedAreaRatioToParent
         /// </summary>
-        public double MaxEmbeddedAreaRatioToParent { get; set; } = 0.35;
+        public double MaxEmbeddedAreaRatioToParent { get; set; } = 0.08;
 
         /// <summary>
         /// embedded feature로 보기 위한 절대 면적 비교 완화 하한
         /// 너무 큰 island는 child로 보지 않기 위한 안전장치
         /// </summary>
-        public double MaxEmbeddedWidthRatioToParent { get; set; } = 0.75;
+        public double MaxEmbeddedWidthRatioToParent { get; set; } = 0.35;
 
         /// <summary>
         /// embedded feature로 보기 위한 높이 비율 상한
         /// </summary>
-        public double MaxEmbeddedHeightRatioToParent { get; set; } = 0.75;
+        public double MaxEmbeddedHeightRatioToParent { get; set; } = 0.35;
 
         /// <summary>
         /// 중심이 bounds 내부에 있다고 볼 여유값
