@@ -39,30 +39,261 @@ namespace FluxCAD.SheetAnalysis.ViewIsolation.Analysis
                 .Where(x => x.IsStrongGeometrySeed)
                 .ToList();
 
-            if (strongViews.Count == 0)
+            // strong geometry seed가 없어도 여기서 끝내면 안 됩니다.
+            // 왜냐하면 primary 판정은 현재 FinalRole 승격 여부와 별개로
+            // top-level 전체를 대상으로 다시 의미 해석해야 하기 때문입니다.
+            if (strongViews.Count > 0)
+            {
+                foreach (var candidate in topLevelCandidates)
+                {
+                    if (candidate.IsStrongGeometrySeed)
+                    {
+                        candidate.FinalRole = ViewIslandSemanticRole.GeometryView;
+                        AppendFinalReason(candidate, "StrongGeometrySeed");
+                        continue;
+                    }
+
+                    if (candidate.IsSparseBridgeLike)
+                    {
+                        candidate.FinalRole = ViewIslandSemanticRole.SparseBridge;
+                        AppendFinalReason(candidate, "KeepSparseBridge");
+                        continue;
+                    }
+
+                    if (!candidate.IsPromotableWeakCandidate)
+                        continue;
+
+                    EvaluatePromotion(candidate, strongViews);
+                }
+            }
+            else
+            {
+                // strong seed가 전혀 없는 경우에도 SparseBridge는 의미를 유지
+                foreach (var candidate in topLevelCandidates)
+                {
+                    if (candidate.IsSparseBridgeLike)
+                    {
+                        candidate.FinalRole = ViewIslandSemanticRole.SparseBridge;
+                        AppendFinalReason(candidate, "KeepSparseBridge");
+                    }
+                }
+            }
+
+            foreach (var c in topLevelCandidates)
+            {
+                AppendFinalReason(
+                    c,
+                    $"TopLevelBeforePrimary Init={c.InitialRole}, Final={c.FinalRole}, Dim={c.DimensionCount}, Area={c.Area:0.##}");
+            }
+
+            // 3) 마지막에 반드시 primary view 판정 수행
+            ResolvePrimaryViews(candidates);
+        }
+
+        private static void ResolvePrimaryViews(IEnumerable<ViewCandidate> candidates)
+        {
+            if (candidates == null)
                 return;
 
-            foreach (var candidate in topLevelCandidates)
+            var candidateList = candidates.ToList();
+            if (candidateList.Count == 0)
+                return;
+
+            foreach (var c in candidateList)
             {
-                if (candidate.IsStrongGeometrySeed)
-                {
-                    candidate.FinalRole = ViewIslandSemanticRole.GeometryView;
-                    AppendFinalReason(candidate, "StrongGeometrySeed");
-                    continue;
-                }
-
-                if (candidate.IsSparseBridgeLike)
-                {
-                    candidate.FinalRole = ViewIslandSemanticRole.SparseBridge;
-                    AppendFinalReason(candidate, "KeepSparseBridge");
-                    continue;
-                }
-
-                if (!candidate.IsPromotableWeakCandidate)
-                    continue;
-
-                EvaluatePromotion(candidate, strongViews);
+                c.IsPrimaryCandidate = false;
+                c.IsPrimaryView = false;
+                c.PrimaryScore = 0.0;
+                c.PrimaryReason = string.Empty;
             }
+
+            var topLevels = candidateList
+                .Where(x => x.IsTopLevelView)
+                .Where(x => !x.HasParent)
+                .ToList();
+
+            if (topLevels.Count == 0)
+                return;
+
+            var maxArea = topLevels.Max(x => Math.Max(x.Area, 1.0));
+            var maxDim = topLevels.Max(x => x.DimensionCount);
+            var maxMajorSpan = topLevels.Max(x => Math.Max(x.Width, x.Height));
+            var sheetCenterX = topLevels.Average(x => x.Center.X);
+            var sheetCenterY = topLevels.Average(x => x.Center.Y);
+
+            var span = Math.Max(
+                topLevels.Max(x => x.Center.X) - topLevels.Min(x => x.Center.X),
+                topLevels.Max(x => x.Center.Y) - topLevels.Min(x => x.Center.Y));
+
+            foreach (var c in topLevels)
+            {
+                var reasons = new List<string>();
+                var exclude = false;
+
+                if (c.InitialRole == ViewIslandSemanticRole.SparseBridge)
+                {
+                    exclude = true;
+                    reasons.Add("Exclude=SparseBridge");
+                }
+
+                if (c.InitialRole == ViewIslandSemanticRole.BadgeMarker)
+                {
+                    exclude = true;
+                    reasons.Add("Exclude=BadgeMarker");
+                }
+
+                if (c.IsEmbeddedFeature || c.HasParent)
+                {
+                    exclude = true;
+                    reasons.Add("Exclude=EmbeddedOrHasParent");
+                }
+
+                var aspect = ComputeAspectRatio(c.Width, c.Height);
+                var minSide = Math.Min(c.Width, c.Height);
+                var areaRatio = c.Area / maxArea;
+
+                if (c.DimensionCount <= 0 &&
+                    c.InitialRole != ViewIslandSemanticRole.GeometryView &&
+                    areaRatio < 0.08)
+                {
+                    exclude = true;
+                    reasons.Add("Exclude=WeakNonGeometry");
+                }
+
+                if (c.DimensionCount == 0 && areaRatio < 0.05)
+                {
+                    exclude = true;
+                    reasons.Add("Exclude=TinyNoDim");
+                }
+
+                if (exclude)
+                {
+                    c.IsPrimaryCandidate = false;
+                    c.IsPrimaryView = false;
+                    c.PrimaryScore = -1.0;
+                    c.PrimaryReason = string.Join(", ", reasons);
+                    continue;
+                }
+
+                c.IsPrimaryCandidate = true;
+
+                double score = 0.0;
+
+                if (c.InitialRole == ViewIslandSemanticRole.GeometryView)
+                {
+                    score += 6.0;
+                    reasons.Add("Role=GeometryView(+6)");
+                }
+                else if (c.InitialRole == ViewIslandSemanticRole.Unknown)
+                {
+                    score += 1.0;
+                    reasons.Add("Role=Unknown(+1)");
+                }
+
+                if (maxDim > 0)
+                {
+                    var dimNorm = (double)c.DimensionCount / maxDim;
+                    score += dimNorm * 8.0;
+                    reasons.Add($"DimNorm={dimNorm:0.###}(+{dimNorm * 8.0:0.##})");
+                }
+
+                score += areaRatio * 6.0;
+                reasons.Add($"AreaRatio={areaRatio:0.###}(+{areaRatio * 6.0:0.##})");
+
+                var majorSpanRatio = Math.Max(c.Width, c.Height) / Math.Max(1.0, maxMajorSpan);
+                score += majorSpanRatio * 2.0;
+                reasons.Add($"MajorSpanRatio={majorSpanRatio:0.###}(+{majorSpanRatio * 2.0:0.##})");
+
+                if (c.ChildIslandIds.Count > 0)
+                {
+                    var childBonus = Math.Min(3.0, c.ChildIslandIds.Count * 0.75);
+                    score += childBonus;
+                    reasons.Add($"Children={c.ChildIslandIds.Count}(+{childBonus:0.##})");
+                }
+
+                var dx = c.Center.X - sheetCenterX;
+                var dy = c.Center.Y - sheetCenterY;
+                var dist = Math.Sqrt(dx * dx + dy * dy);
+
+                if (span > 1e-6)
+                {
+                    var centrality = 1.0 - Math.Min(1.0, dist / span);
+                    score += centrality * 1.5;
+                    reasons.Add($"Centrality={centrality:0.###}(+{centrality * 1.5:0.##})");
+                }
+
+                if (aspect >= 12.0 && minSide < 80.0)
+                {
+                    if (c.InitialRole == ViewIslandSemanticRole.GeometryView && c.DimensionCount > 0)
+                    {
+                        score -= 0.75;
+                        reasons.Add("ThinButDimensionedGeometryPenalty(-0.75)");
+                    }
+                    else
+                    {
+                        score -= 2.0;
+                        reasons.Add("ThinPenalty(-2)");
+                    }
+                }
+                else if (aspect >= 20.0)
+                {
+                    if (c.InitialRole == ViewIslandSemanticRole.GeometryView && c.DimensionCount > 0)
+                    {
+                        score -= 0.5;
+                        reasons.Add("VeryThinButDimensionedGeometryPenalty(-0.5)");
+                    }
+                    else
+                    {
+                        score -= 1.0;
+                        reasons.Add("VeryThinPenalty(-1)");
+                    }
+                }
+
+                if (c.InitialRole == ViewIslandSemanticRole.Unknown && c.DimensionCount == 0)
+                {
+                    score -= 2.0;
+                    reasons.Add("UnknownNoDimPenalty(-2)");
+                }
+
+                c.PrimaryScore = score;
+                c.PrimaryReason = string.Join(", ", reasons);
+            }
+
+            var primaryCandidates = topLevels
+                .Where(x => x.IsPrimaryCandidate)
+                .OrderByDescending(x => x.PrimaryScore)
+                .ToList();
+
+            if (primaryCandidates.Count == 0)
+                return;
+
+            var bestScore = primaryCandidates[0].PrimaryScore;
+
+            var selected = primaryCandidates
+                .Where(x => x.PrimaryScore >= Math.Max(4.0, bestScore * 0.45))
+                .Take(3)
+                .ToList();
+
+            foreach (var c in selected)
+            {
+                c.IsPrimaryView = true;
+
+                if (string.IsNullOrWhiteSpace(c.PrimaryReason))
+                    c.PrimaryReason = "SelectedPrimary";
+                else
+                    c.PrimaryReason += ", SelectedPrimary";
+            }
+        }
+
+        private static double ComputeAspectRatio(double width, double height)
+        {
+            var max = Math.Max(width, height);
+            var min = Math.Min(width, height);
+
+            if (min <= 1e-9)
+                return double.MaxValue;
+
+            return max / min;
         }
 
         private static void ResetCandidates(IList<ViewCandidate> candidates)

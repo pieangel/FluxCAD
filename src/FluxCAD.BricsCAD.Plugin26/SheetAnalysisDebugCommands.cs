@@ -49,6 +49,7 @@ namespace FluxCAD.BricsCAD.Plugin26
             public IReadOnlyList<ViewIslandSemanticResult> SemanticResults { get; init; } = Array.Empty<ViewIslandSemanticResult>();
         }
 
+
         [CommandMethod("FLUX_DEBUG_VIEW_ISLAND_HIERARCHY")]
         public void FluxDebugViewIslandHierarchy()
         {
@@ -77,148 +78,15 @@ namespace FluxCAD.BricsCAD.Plugin26
                     return;
                 }
 
-                var allBounds = Bounds2DHelper.FromEntities(entities);
-                if (allBounds.IsEmpty)
-                {
-                    ed.WriteMessage("\n[FluxCAD] sheet bounds가 비어 있습니다.");
-                    return;
-                }
-
-                var geometryEntities = entities
-                    .Where(x => x != null)
-                    .Where(x => x.IsVisible)
-                    .Where(x => x.IsGeometryLike)
-                    .Where(x => !x.IsTextLike)
-                    .Where(x => !x.IsDimensionLike)
-                    .Where(x => !x.IsBlockReference)
-                    .Where(x => !Bounds2DHelper.IsEmpty(x.Bounds))
-                    .ToList();
-
-                if (geometryEntities.Count == 0)
-                {
-                    ed.WriteMessage("\n[FluxCAD] geometry entity가 비어 있습니다.");
-                    return;
-                }
-
-                var geometryEntitiesForBounds = geometryEntities
-                    .Where(x => !GhostEntityPolicy.IsIgnorableGhostEntity(x, Bounds2D.Empty))
-                    .ToList();
-
-                if (geometryEntitiesForBounds.Count == 0)
-                    geometryEntitiesForBounds = geometryEntities.ToList();
-
-                var robustBounds = ComputeRobustGeometryBounds(
-                    geometryEntitiesForBounds,
-                    out var rejectedOutliers,
-                    trimRatio: 0.02,
-                    minKeepCount: 20);
-
-                if (robustBounds.IsEmpty)
-                    robustBounds = allBounds;
-
-                var filteredGeometryEntities = GhostEntityPolicy.ExcludeGhosts(
-                    geometryEntitiesForBounds,
-                    robustBounds,
-                    out var rejectedGhosts).ToList();
-
-                if (filteredGeometryEntities.Count > 0)
-                {
-                    var refinedBounds = ComputeRobustGeometryBounds(
-                        filteredGeometryEntities,
-                        out var rejectedOutliers2,
-                        trimRatio: 0.02,
-                        minKeepCount: 20);
-
-                    if (!refinedBounds.IsEmpty)
-                    {
-                        robustBounds = refinedBounds;
-                        rejectedOutliers = rejectedOutliers2;
-                    }
-                }
-
-                var hierarchySourceEntities = PrepareHierarchySourceEntities(
+                var pipeline = BuildSemanticIslandPipeline(
                     entities,
-                    robustBounds,
-                    ed);
-
-                ed.WriteMessage("\n[FluxCAD] ---- HierarchySourceEntities Sample ----");
-                foreach (var e in hierarchySourceEntities.Take(20))
-                {
-                    ed.WriteMessage(
-                        $"\n  Handle={e.Handle}, Kind={e.Kind}, Bounds={e.Bounds}, Type={e.EntityTypeName ?? e.EntityType}");
-                }
-
-                if (hierarchySourceEntities.Count == 0)
-                {
-                    ed.WriteMessage("\n[FluxCAD] hierarchy source entities가 비어 있습니다.");
-                    return;
-                }
-
-                var gridInput = PrepareOccupancyInput(
-                    hierarchySourceEntities,
-                    robustBounds,
                     ed,
-                    OccupancyInputMode.RawAllGeometrySeeds);
-
-                if (gridInput == null || gridInput.Count == 0)
-                {
-                    ed.WriteMessage("\n[FluxCAD] hierarchy geometry-only input이 비어 있습니다.");
-                    return;
-                }
-
-                const double targetCellSize = 6.0;
-
-                var cols = Clamp((int)Math.Ceiling(robustBounds.Width / targetCellSize), 120, 420);
-                var rows = Clamp((int)Math.Ceiling(robustBounds.Height / targetCellSize), 120, 420);
-
-                var hitMapBuilder = new StrokeOccupancyGridHitMapBuilder();
-                var hitMap = hitMapBuilder.Build(
-                    gridInput,
-                    robustBounds,
-                    rows,
-                    cols);
-
-                var islandFinder = new OccupancyHitIslandFinder();
-                var hitGrid = BuildHitGrid(hitMap);
-
-                CloseSingleCellGaps(hitGrid);
-
-                var islands = islandFinder.Find(hitGrid)
-                    .Where(x => x.CellCount > 2)
-                    .ToList();
-
-                foreach (var island in islands)
-                    island.IsSparseBridgeLike = IsSparseGiantHitIsland(island, hitMap);
-
-                var hierarchyIslands = islands
-                    .Where(x => !x.IsSparseBridgeLike)
-                    .ToList();
-
-                ed.WriteMessage(
-                    $"\n[FluxCAD] Hierarchy islands raw={islands.Count}, filtered={hierarchyIslands.Count}, sparseRemoved={islands.Count - hierarchyIslands.Count}");
-
-                var matcher = new DimensionOverlapMatcherForHitIslands();
-                matcher.Apply(islands, entities, tolerance: 0);
-
-                foreach (var island in islands)
-                    island.IsSparseBridgeLike = IsSparseGiantHitIsland(island, hitMap);
-
-                var collector = new ViewIslandEntityCollector();
-                var groups = collector.Collect(hierarchyIslands, entities, tolerance: 0);
-
-                var classifier = new ViewIslandSemanticClassifier();
-                var semanticResults = groups
-                    .Select(g => classifier.Classify(g, robustBounds))
-                    .ToList();
-
-                foreach (var result in semanticResults)
-                {
-                    result.Island.SemanticRole = result.Role;
-                    result.Island.SemanticReason = result.Reason;
-                }
+                    closeSingleCellGaps: false,
+                    targetCellSize: 12.0,
+                    excludeSparseBridgeFromGroups: false);
 
                 var candidateBuilder = new ViewCandidateBuilder();
-                var candidates = candidateBuilder.Build(semanticResults);
+                var candidates = candidateBuilder.Build(pipeline.SemanticResults);
 
                 var resolver = new ViewSetResolver();
                 resolver.Resolve(candidates);
@@ -551,6 +419,7 @@ namespace FluxCAD.BricsCAD.Plugin26
                 .ThenByDescending(x => x.Area))
             {
                 var state =
+                    c.IsPrimaryView ? "Primary" :
                     c.IsEmbeddedFeature ? "Embedded" :
                     c.IsTopLevelView ? "TopLevel" :
                     c.HasParent ? "Child" :
@@ -564,8 +433,9 @@ namespace FluxCAD.BricsCAD.Plugin26
                     $"Dim={c.HasDimension}/{c.DimensionCount}, " +
                     $"Size=({c.Width:0.##}x{c.Height:0.##}), " +
                     $"Area={c.Area:0.##}, " +
+                    $"PrimaryScore={c.PrimaryScore:0.##}, " +
                     $"Center=({c.Center.X:0.##},{c.Center.Y:0.##}), " +
-                    $"Reason={c.HierarchyReason}");
+                    $"Reason={c.HierarchyReason}, PrimaryReason={c.PrimaryReason}");
             }
 
             ed.WriteMessage("\n[FluxCAD] ---- Parent -> Children ----");
@@ -607,13 +477,15 @@ namespace FluxCAD.BricsCAD.Plugin26
                 if (drawLabels)
                 {
                     var label =
-                        c.IsEmbeddedFeature
-                            ? $"E:{c.IslandId} P={c.ParentIslandId?.ToString() ?? "-"}"
-                            : c.IsTopLevelView
-                                ? $"T:{c.IslandId}"
-                                : c.HasParent
-                                    ? $"C:{c.IslandId} P={c.ParentIslandId?.ToString() ?? "-"}"
-                                    : $"U:{c.IslandId}";
+                        c.IsPrimaryView
+                            ? $"P:{c.IslandId}"
+                            : c.IsEmbeddedFeature
+                                ? $"E:{c.IslandId} P={c.ParentIslandId?.ToString() ?? "-"}"
+                                : c.IsTopLevelView
+                                    ? $"T:{c.IslandId}"
+                                    : c.HasParent
+                                        ? $"C:{c.IslandId} P={c.ParentIslandId?.ToString() ?? "-"}"
+                                        : $"U:{c.IslandId}";
 
                     DrawDebugText(
                         db,
@@ -664,6 +536,9 @@ namespace FluxCAD.BricsCAD.Plugin26
         {
             if (c == null)
                 return 8;
+
+            if (c.IsPrimaryView)
+                return 6; // magenta
 
             if (c.IsEmbeddedFeature)
                 return 30; // orange-ish
@@ -834,245 +709,14 @@ namespace FluxCAD.BricsCAD.Plugin26
                     return;
                 }
 
-                // 참고용 전체 bounds
-                var allBounds = Bounds2DHelper.FromEntities(entities);
-                if (allBounds.IsEmpty)
-                {
-                    ed.WriteMessage("\n[FluxCAD] sheet bounds가 비어 있습니다.");
-                    return;
-                }
-
-                // ==============================
-                // DEBUG: out-of-sheet detector
-                // ==============================
-
-                double thresholdY = allBounds.Height * 0.5;
-                double thresholdX = allBounds.Width * 0.5;
-
-                var suspicious = entities
-                    .Where(e => !Bounds2DHelper.IsEmpty(e.Bounds))
-                    .Where(e =>
-                        Math.Abs(e.Bounds.MinY - allBounds.MinY) > thresholdY ||
-                        Math.Abs(e.Bounds.MaxY - allBounds.MaxY) > thresholdY ||
-                        Math.Abs(e.Bounds.MinX - allBounds.MinX) > thresholdX ||
-                        Math.Abs(e.Bounds.MaxX - allBounds.MaxX) > thresholdX)
-                    .Take(20)
-                    .ToList();
-
-                ed.WriteMessage("\n[DEBUG] ---- Suspicious Outliers ----");
-
-                foreach (var e in suspicious)
-                {
-                    ed.WriteMessage(
-                        $"\n  Handle={e.Handle}, Kind={e.Kind}, " +
-                        $"Bounds=({e.Bounds.MinX:F2},{e.Bounds.MinY:F2})-({e.Bounds.MaxX:F2},{e.Bounds.MaxY:F2}), " +
-                        $"Visible={e.IsVisible}, Block={e.BlockName}, Depth={e.Depth}");
-                }
-
-                var blockOutliers = suspicious
-                .GroupBy(e => e.BlockName)
-                .Select(g => new { Block = g.Key, Count = g.Count() })
-                .OrderByDescending(x => x.Count)
-                .ToList();
-
-                ed.WriteMessage("\n[DEBUG] ---- Outlier By Block ----");
-
-                foreach (var b in blockOutliers)
-                {
-                    ed.WriteMessage($"\n  Block={b.Block}, Count={b.Count}");
-                }
-
-                // ==============================
-                // DEBUG: extreme bounds detector
-                // ==============================
-
-                var extremeMinY = entities.OrderBy(x => x.Bounds.MinY).Take(10).ToList();
-                var extremeMaxY = entities.OrderByDescending(x => x.Bounds.MaxY).Take(10).ToList();
-                var extremeMinX = entities.OrderBy(x => x.Bounds.MinX).Take(10).ToList();
-                var extremeMaxX = entities.OrderByDescending(x => x.Bounds.MaxX).Take(10).ToList();
-
-                ed.WriteMessage("\n[DEBUG] ---- Extreme MinY ----");
-                foreach (var e in extremeMinY)
-                {
-                    ed.WriteMessage(
-                        $"\n  Handle={e.Handle}, Kind={e.Kind}, " +
-                        $"Bounds=({e.Bounds.MinX:F2},{e.Bounds.MinY:F2})-({e.Bounds.MaxX:F2},{e.Bounds.MaxY:F2}), " +
-                        $"Visible={e.IsVisible}, Block={e.BlockName}, Depth={e.Depth}");
-                }
-
-                ed.WriteMessage("\n[DEBUG] ---- Extreme MaxY ----");
-                foreach (var e in extremeMaxY)
-                {
-                    ed.WriteMessage(
-                        $"\n  Handle={e.Handle}, Kind={e.Kind}, " +
-                        $"Bounds=({e.Bounds.MinX:F2},{e.Bounds.MinY:F2})-({e.Bounds.MaxX:F2},{e.Bounds.MaxY:F2}), " +
-                        $"Visible={e.IsVisible}, Block={e.BlockName}, Depth={e.Depth}");
-                }
-
-                ed.WriteMessage("\n[DEBUG] ---- Extreme MinX ----");
-                foreach (var e in extremeMinX)
-                {
-                    ed.WriteMessage(
-                        $"\n  Handle={e.Handle}, Kind={e.Kind}, " +
-                        $"Bounds=({e.Bounds.MinX:F2},{e.Bounds.MinY:F2})-({e.Bounds.MaxX:F2},{e.Bounds.MaxY:F2}), " +
-                        $"Visible={e.IsVisible}, Block={e.BlockName}, Depth={e.Depth}");
-                }
-
-                ed.WriteMessage("\n[DEBUG] ---- Extreme MaxX ----");
-                foreach (var e in extremeMaxX)
-                {
-                    ed.WriteMessage(
-                        $"\n  Handle={e.Handle}, Kind={e.Kind}, " +
-                        $"Bounds=({e.Bounds.MinX:F2},{e.Bounds.MinY:F2})-({e.Bounds.MaxX:F2},{e.Bounds.MaxY:F2}), " +
-                        $"Visible={e.IsVisible}, Block={e.BlockName}, Depth={e.Depth}");
-                }
-
-                // 실제 형상 후보만 사용해서 robust bounds 계산
-                var geometryEntities = entities
-                    .Where(x => x != null)
-                    .Where(x => x.IsVisible)
-                    .Where(x => x.IsGeometryLike)
-                    .Where(x => !x.IsTextLike)
-                    .Where(x => !x.IsDimensionLike)
-                    .Where(x => !x.IsBlockReference)
-                    .Where(x => !Bounds2DHelper.IsEmpty(x.Bounds))
-                    .ToList();
-
-                if (geometryEntities.Count == 0)
-                {
-                    ed.WriteMessage("\n[FluxCAD] geometry entity가 비어 있습니다.");
-                    return;
-                }
-
-                // 1차 robust bounds 계산용: obvious ghost 제거
-                var geometryEntitiesForBounds = geometryEntities
-                    .Where(x => !GhostEntityPolicy.IsIgnorableGhostEntity(x, Bounds2D.Empty))
-                    .ToList();
-
-                if (geometryEntitiesForBounds.Count == 0)
-                    geometryEntitiesForBounds = geometryEntities.ToList();
-
-                var robustBounds = ComputeRobustGeometryBounds(
-                    geometryEntitiesForBounds,
-                    out var rejectedOutliers,
-                    trimRatio: 0.02,
-                    minKeepCount: 20);
-
-                if (robustBounds.IsEmpty)
-                    robustBounds = allBounds;
-
-                // 2차: provisional robust bounds 기준으로 far-out ghost 재제거
-                var filteredGeometryEntities = GhostEntityPolicy.ExcludeGhosts(
-                    geometryEntitiesForBounds,
-                    robustBounds,
-                    out var rejectedGhosts).ToList();
-
-                if (filteredGeometryEntities.Count > 0)
-                {
-                    var refinedBounds = ComputeRobustGeometryBounds(
-                        filteredGeometryEntities,
-                        out var rejectedOutliers2,
-                        trimRatio: 0.02,
-                        minKeepCount: 20);
-
-                    if (!refinedBounds.IsEmpty)
-                    {
-                        robustBounds = refinedBounds;
-                        rejectedOutliers = rejectedOutliers2;
-                    }
-                }
-
-                ed.WriteMessage($"\n[FluxCAD] AllBounds={allBounds}");
-                ed.WriteMessage($"\n[FluxCAD] RobustBounds={robustBounds}");
-                ed.WriteMessage($"\n[FluxCAD] rejectedOutliers={rejectedOutliers.Count}");
-                ed.WriteMessage($"\n[FluxCAD] rejectedGhosts={rejectedGhosts.Count}");
-
-                foreach (var ghost in rejectedGhosts.Take(10))
-                {
-                    ed.WriteMessage(
-                        $"\n  [GhostRejected] Handle={ghost.Handle}, Kind={ghost.Kind}, " +
-                        $"Block={ghost.BlockName}, Depth={ghost.Depth}, Bounds={ghost.Bounds}, " +
-                        $"Type={ghost.EntityTypeName ?? ghost.EntityType}");
-                }
-
-                var gridInput = PrepareOccupancyInput(
+                var pipeline = BuildSemanticIslandPipeline(
                     entities,
-                    robustBounds,
                     ed,
-                    OccupancyInputMode.RawAllGeometrySeeds);
+                    closeSingleCellGaps: false,
+                    targetCellSize: 12.0,
+                    excludeSparseBridgeFromGroups: false);
 
-                if (gridInput == null || gridInput.Count == 0)
-                {
-                    ed.WriteMessage("\n[FluxCAD] view island stroke input이 비어 있습니다.");
-                    return;
-                }
-
-                // adaptive grid
-                const double targetCellSize = 12.0;
-
-                var cols = Clamp((int)Math.Ceiling(robustBounds.Width / targetCellSize), 120, 420);
-                var rows = Clamp((int)Math.Ceiling(robustBounds.Height / targetCellSize), 120, 420);
-
-                var cellWidth = robustBounds.Width / cols;
-                var cellHeight = robustBounds.Height / rows;
-
-                ed.WriteMessage(
-                    $"\n[FluxCAD] AllBounds=({allBounds.MinX:F2},{allBounds.MinY:F2})-({allBounds.MaxX:F2},{allBounds.MaxY:F2}) " +
-                    $"size=({allBounds.Width:F2} x {allBounds.Height:F2})");
-
-                ed.WriteMessage(
-                    $"\n[FluxCAD] RobustBounds=({robustBounds.MinX:F2},{robustBounds.MinY:F2})-({robustBounds.MaxX:F2},{robustBounds.MaxY:F2}) " +
-                    $"size=({robustBounds.Width:F2} x {robustBounds.Height:F2}), rejectedOutliers={rejectedOutliers.Count}");
-
-                if (rejectedOutliers.Count > 0)
-                {
-                    foreach (var item in rejectedOutliers.Take(10))
-                    {
-                        ed.WriteMessage(
-                            $"\n  [Outlier] Handle={item.Handle}, Kind={item.Kind}, " +
-                            $"Bounds=({item.Bounds.MinX:F2},{item.Bounds.MinY:F2})-({item.Bounds.MaxX:F2},{item.Bounds.MaxY:F2})");
-                    }
-                }
-
-                ed.WriteMessage(
-                    $"\n[FluxCAD] Grid sheet=({robustBounds.Width:F2} x {robustBounds.Height:F2}), " +
-                    $"rows={rows}, cols={cols}, cell=({cellWidth:F2} x {cellHeight:F2})");
-
-                var hitMapBuilder = new StrokeOccupancyGridHitMapBuilder();
-                var hitMap = hitMapBuilder.Build(
-                    gridInput,
-                    robustBounds,
-                    rows,
-                    cols);
-
-                var islandFinder = new OccupancyHitIslandFinder();
-                var hitGrid = BuildHitGrid(hitMap);
-
-                var islands = islandFinder.Find(hitGrid)
-                    .Where(x => x.CellCount > 2)
-                    .ToList();
-
-                var matcher = new DimensionOverlapMatcherForHitIslands();
-                matcher.Apply(islands, entities, tolerance: 0);
-
-                foreach (var island in islands)
-                    island.IsSparseBridgeLike = IsSparseGiantHitIsland(island, hitMap);
-
-                var collector = new ViewIslandEntityCollector();
-                var groups = collector.Collect(islands, entities, tolerance: 0);
-
-                var classifier = new ViewIslandSemanticClassifier();
-                var semanticResults = groups
-                    .Select(g => classifier.Classify(g, robustBounds))
-                    .ToList();
-
-                foreach (var result in semanticResults)
-                {
-                    result.Island.SemanticRole = result.Role;
-                    result.Island.SemanticReason = result.Reason;
-                }
-
-                var rankedGroups = groups
+                var rankedGroups = pipeline.Groups
                     .OrderByDescending(g => g.Island.SemanticRole == ViewIslandSemanticRole.GeometryView)
                     .ThenByDescending(g => g.Island.IsStrongGeometryContent)
                     .ThenBy(g => g.Island.SemanticRole == ViewIslandSemanticRole.SparseBridge)
@@ -1097,8 +741,8 @@ namespace FluxCAD.BricsCAD.Plugin26
 
                 ed.WriteMessage(
                     $"\n[FluxCAD] ViewIslandEntities count={rankedGroups.Count}, " +
-                    $"on={hitMap.OnCount}, both={hitMap.BothCount}, " +
-                    $"boundsOnly={hitMap.BoundsOnlyCount}, repOnly={hitMap.RepOnlyCount}");
+                    $"on={pipeline.HitMap.OnCount}, both={pipeline.HitMap.BothCount}, " +
+                    $"boundsOnly={pipeline.HitMap.BoundsOnlyCount}, repOnly={pipeline.HitMap.RepOnlyCount}");
             }
             catch (System.Exception ex)
             {

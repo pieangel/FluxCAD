@@ -60,6 +60,14 @@ namespace FluxCAD.SheetAnalysis.ViewIsolation.Analysis
 
         public string ProjectionReason { get; set; } = string.Empty;
 
+        public bool IsPrimaryCandidate { get; set; }
+
+        public bool IsPrimaryView { get; set; }
+
+        public double PrimaryScore { get; set; }
+
+        public string PrimaryReason { get; set; } = string.Empty;
+
         public double AspectRatio
         {
             get
