@@ -200,10 +200,11 @@ namespace FluxCAD.SheetAnalysis.ViewIsolation
             }
         }
 
+
         private static void AppendArc(
-            SheetEntity entity,
-            double step,
-            List<Point2D> output)
+    SheetEntity entity,
+    double step,
+    List<Point2D> output)
         {
             if (!entity.CenterPoint.HasValue ||
                 !entity.Radius.HasValue ||
@@ -216,7 +217,7 @@ namespace FluxCAD.SheetAnalysis.ViewIsolation
             }
 
             var center = entity.CenterPoint.Value;
-            var r = entity.Radius.Value;
+            double r = entity.Radius.Value;
 
             double startRad = DegToRad(entity.StartAngleDeg2D.Value);
             double endRad = DegToRad(entity.EndAngleDeg2D.Value);
@@ -224,12 +225,50 @@ namespace FluxCAD.SheetAnalysis.ViewIsolation
             while (endRad < startRad)
                 endRad += 2.0 * Math.PI;
 
-            double arcLen = (endRad - startRad) * r;
-            int count = Math.Max(12, (int)Math.Ceiling(arcLen / step));
+            double sweep = endRad - startRad;
+            if (sweep <= 1e-12)
+            {
+                output.Add(new Point2D(
+                    center.X + r * Math.Cos(startRad),
+                    center.Y + r * Math.Sin(startRad)));
+                return;
+            }
+
+            // 핵심:
+            // step 자체를 길이 기준으로만 쓰지 말고,
+            // Arc와 chord의 최대 오차(sagitta)를 셀 크기의 일부로 제한
+            //
+            // step은 현재 호출부에서 대략 cell size 계열로 들어오므로
+            // 이를 이용해 허용 sagitta를 더 보수적으로 잡습니다.
+            double sagittaTolerance = Math.Max(step * 0.15, 0.02);
+
+            // sagitta = r * (1 - cos(theta/2))
+            // => theta = 2 * acos(1 - sagitta/r)
+            double maxThetaPerSegment;
+            if (sagittaTolerance >= r)
+            {
+                maxThetaPerSegment = sweep;
+            }
+            else
+            {
+                double v = 1.0 - (sagittaTolerance / r);
+                v = Math.Max(-1.0, Math.Min(1.0, v));
+                maxThetaPerSegment = 2.0 * Math.Acos(v);
+
+                if (maxThetaPerSegment <= 1e-6 || double.IsNaN(maxThetaPerSegment))
+                    maxThetaPerSegment = sweep / 64.0;
+            }
+
+            // 길이 기준 최소 개수도 같이 반영
+            double arcLen = sweep * r;
+            int countByLength = Math.Max(24, (int)Math.Ceiling(arcLen / Math.Max(step * 0.35, 0.02)));
+            int countBySagitta = Math.Max(1, (int)Math.Ceiling(sweep / maxThetaPerSegment));
+
+            int count = Math.Max(countByLength, countBySagitta);
 
             for (int i = 0; i <= count; i++)
             {
-                double t = startRad + ((endRad - startRad) * i / count);
+                double t = startRad + (sweep * i / count);
                 output.Add(new Point2D(
                     center.X + r * Math.Cos(t),
                     center.Y + r * Math.Sin(t)));

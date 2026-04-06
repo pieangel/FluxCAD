@@ -68,6 +68,19 @@ namespace FluxCAD.SheetAnalysis.ViewIsolation.Analysis
 
         public string PrimaryReason { get; set; } = string.Empty;
 
+        public bool IsConfirmedSeed { get; set; }
+
+        public double SeedScore { get; set; }
+
+        public string SeedReason { get; set; } = string.Empty;
+
+
+        public double BestProjectionScore { get; set; }
+        public int? BestProjectionSourceIslandId { get; set; }
+        public string BestProjectionPosition { get; set; } = string.Empty;
+
+
+
         public double AspectRatio
         {
             get
@@ -107,6 +120,10 @@ namespace FluxCAD.SheetAnalysis.ViewIsolation.Analysis
             HierarchyReason = string.Empty;
             ProjectionRole = string.Empty;
             ProjectionReason = string.Empty;
+
+            BestProjectionScore = 0.0;
+            BestProjectionSourceIslandId = null;
+            BestProjectionPosition = string.Empty;
         }
 
         public override string ToString()

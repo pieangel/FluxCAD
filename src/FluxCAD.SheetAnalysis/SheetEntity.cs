@@ -80,6 +80,8 @@ namespace FluxCAD.SheetAnalysis
         public string EntityTypeName => EntityType ?? string.Empty;
         public Point2D RepresentativePoint => Anchor;
 
+        public StrokeSemanticType StrokeSemantic { get; set; } = StrokeSemanticType.Unknown;
+
         public bool HasText =>
             !string.IsNullOrWhiteSpace(TextNormalized) ||
             !string.IsNullOrWhiteSpace(Text);

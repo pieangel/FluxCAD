@@ -49,6 +49,632 @@ namespace FluxCAD.BricsCAD.Plugin26
             public IReadOnlyList<ViewIslandSemanticResult> SemanticResults { get; init; } = Array.Empty<ViewIslandSemanticResult>();
         }
 
+        [CommandMethod("FLUX_DEBUG_PRIMARY_VIEW_DIAGNOSTICS")]
+        public void FluxDebugPrimaryViewDiagnostics()
+        {
+            var doc = Bricscad.ApplicationServices.Application.DocumentManager.MdiActiveDocument;
+            if (doc == null)
+                return;
+
+            var db = doc.Database;
+            var ed = doc.Editor;
+
+            try
+            {
+                var sheetFilePath = db.Filename;
+                if (string.IsNullOrWhiteSpace(sheetFilePath))
+                {
+                    ed.WriteMessage("\n[FluxCAD] 저장된 DWG 파일이 아닙니다.");
+                    return;
+                }
+
+                var candidates = BuildResolvedViewCandidates(sheetFilePath, ed);
+                if (candidates.Count == 0)
+                {
+                    ed.WriteMessage("\n[FluxCAD] view candidate가 비어 있습니다.");
+                    return;
+                }
+
+                var candidateViews = candidates
+                    .Where(x => x != null)
+                    .OrderBy(x => x.IslandId)
+                    .ToList();
+
+                ed.WriteMessage("\n");
+                ed.WriteMessage("\n================ PRIMARY VIEW DIAGNOSTICS ================");
+                ed.WriteMessage($"\n[FluxCAD] CandidateCount={candidateViews.Count}");
+
+                // 1) 전체 후보 상세 출력
+                ed.WriteMessage("\n");
+                ed.WriteMessage("\n---- Candidate Diagnostics (By IslandId) ----");
+                foreach (var c in candidateViews)
+                {
+                    ed.WriteMessage("\n" + FormatPrimaryDiagnosticCandidate(c));
+                }
+
+                // 2) Primary score 순 출력
+                var byPrimaryScore = candidateViews
+                    .OrderByDescending(x => x.PrimaryScore)
+                    .ThenBy(x => x.IslandId)
+                    .ToList();
+
+                ed.WriteMessage("\n");
+                ed.WriteMessage("\n---- Candidate Diagnostics (By PrimaryScore DESC) ----");
+                foreach (var c in byPrimaryScore)
+                {
+                    ed.WriteMessage(
+                        $"\n  Island={c.IslandId}, " +
+                        $"PrimaryView={c.IsPrimaryView}, " +
+                        $"PrimaryCandidate={c.IsPrimaryCandidate}, " +
+                        $"PrimaryScore={c.PrimaryScore:0.###}, " +
+                        $"Final={c.FinalRole}, " +
+                        $"Seed={c.IsConfirmedSeed}/{c.SeedScore:0.###}, " +
+                        $"ProjBest={c.BestProjectionScore:0.###}, " +
+                        $"ProjPos={SafeText(c.BestProjectionPosition)}, " +
+                        $"ProjSrc={c.BestProjectionSourceIslandId?.ToString() ?? "-"}, " +
+                        $"Dim={c.DimensionCount}, " +
+                        $"Size=({c.Width:0.##}x{c.Height:0.##})");
+                }
+
+                // 3) 실제 primary view만 별도 출력
+                var primaryViews = candidateViews
+                    .Where(x => x.IsPrimaryView)
+                    .OrderByDescending(x => x.PrimaryScore)
+                    .ThenBy(x => x.IslandId)
+                    .ToList();
+
+                ed.WriteMessage("\n");
+                ed.WriteMessage("\n---- Selected Primary Views ----");
+                if (primaryViews.Count == 0)
+                {
+                    ed.WriteMessage("\n  (none)");
+                }
+                else
+                {
+                    foreach (var c in primaryViews)
+                    {
+                        ed.WriteMessage(
+                            $"\n  Island={c.IslandId}, " +
+                            $"Score={c.PrimaryScore:0.###}, " +
+                            $"Final={c.FinalRole}, " +
+                            $"ProjBest={c.BestProjectionScore:0.###}, " +
+                            $"ProjPos={SafeText(c.BestProjectionPosition)}, " +
+                            $"ProjSrc={c.BestProjectionSourceIslandId?.ToString() ?? "-"}, " +
+                            $"Reason={SafeText(c.PrimaryReason)}");
+                    }
+                }
+
+                // 4) 탈락했지만 projection이 강한 후보 출력
+                var missedStrongProjection = candidateViews
+                    .Where(x => !x.IsPrimaryView)
+                    .Where(x => x.BestProjectionScore >= 0.50)
+                    .OrderByDescending(x => x.BestProjectionScore)
+                    .ThenByDescending(x => x.PrimaryScore)
+                    .ToList();
+
+                ed.WriteMessage("\n");
+                ed.WriteMessage("\n---- Missed But Strong Projection Candidates ----");
+                if (missedStrongProjection.Count == 0)
+                {
+                    ed.WriteMessage("\n  (none)");
+                }
+                else
+                {
+                    foreach (var c in missedStrongProjection)
+                    {
+                        ed.WriteMessage(
+                            $"\n  Island={c.IslandId}, " +
+                            $"PrimaryScore={c.PrimaryScore:0.###}, " +
+                            $"Final={c.FinalRole}, " +
+                            $"ProjBest={c.BestProjectionScore:0.###}, " +
+                            $"ProjPos={SafeText(c.BestProjectionPosition)}, " +
+                            $"ProjSrc={c.BestProjectionSourceIslandId?.ToString() ?? "-"}");
+                        ed.WriteMessage($"\n    PrimaryReason={SafeText(c.PrimaryReason)}");
+                        ed.WriteMessage($"\n    FinalReason={SafeText(c.FinalReason)}");
+                    }
+                }
+
+                // 5) relation 요약
+                var analyzer = new ViewRelationAnalyzer();
+                var relations = analyzer.Analyze(candidateViews);
+
+                ed.WriteMessage("\n");
+                ed.WriteMessage("\n---- Top Pairwise Relations (ProjectionScore DESC) ----");
+                foreach (var r in relations
+                    .OrderByDescending(x => x.ProjectionScore)
+                    .ThenByDescending(x => x.CompositeScore)
+                    .Take(20))
+                {
+                    ed.WriteMessage("\n" + FormatPrimaryDiagnosticRelation(r));
+                }
+
+                // 6) overlay
+                using (doc.LockDocument())
+                using (var tr = db.TransactionManager.StartTransaction())
+                {
+                    DrawHierarchyCandidateOverlays(
+                        db,
+                        tr,
+                        candidateViews,
+                        clearLayerFirst: true,
+                        drawLabels: true,
+                        drawRelations: false);
+
+                    DrawPrimaryDiagnosticOverlays(
+                        db,
+                        tr,
+                        candidateViews);
+
+                    tr.Commit();
+                }
+
+                ed.WriteMessage("\n");
+                ed.WriteMessage("\n================ END PRIMARY VIEW DIAGNOSTICS ================");
+            }
+            catch (System.Exception ex)
+            {
+                ed.WriteMessage($"\n[FluxCAD] FLUX_DEBUG_PRIMARY_VIEW_DIAGNOSTICS failed: {ex}");
+            }
+        }
+
+
+        private static string FormatPrimaryDiagnosticCandidate(ViewCandidate c)
+        {
+            if (c == null)
+                return "  (null candidate)";
+
+            return
+                $"  Island={c.IslandId}\n" +
+                $"    InitRole={c.InitialRole}, FinalRole={c.FinalRole}\n" +
+                $"    TopLevel={c.IsTopLevelView}, Embedded={c.IsEmbeddedFeature}, Parent={c.ParentIslandId?.ToString() ?? "-"}, Children={c.ChildIslandIds.Count}\n" +
+                $"    Dim={c.HasDimension}/{c.DimensionCount}, SparseBridge={c.IsSparseBridgeLike}, Cells={c.CellCount}, Fill={c.FillRatio:0.###}\n" +
+                $"    Size=({c.Width:0.##}x{c.Height:0.##}), Area={c.Area:0.##}, Aspect={c.AspectRatio:0.###}\n" +
+                $"    Seed=Confirmed:{c.IsConfirmedSeed}, SeedScore={c.SeedScore:0.###}, SeedReason={SafeText(c.SeedReason)}\n" +
+                $"    ProjectionRole={SafeText(c.ProjectionRole)}, ProjectionReason={SafeText(c.ProjectionReason)}\n" +
+                $"    BestProjectionScore={c.BestProjectionScore:0.###}, BestProjectionPosition={SafeText(c.BestProjectionPosition)}, BestProjectionSource={c.BestProjectionSourceIslandId?.ToString() ?? "-"}\n" +
+                $"    PrimaryCandidate={c.IsPrimaryCandidate}, PrimaryView={c.IsPrimaryView}, PrimaryScore={c.PrimaryScore:0.###}\n" +
+                $"    HierarchyReason={SafeText(c.HierarchyReason)}\n" +
+                $"    FinalReason={SafeText(c.FinalReason)}\n" +
+                $"    PrimaryReason={SafeText(c.PrimaryReason)}";
+        }
+
+        private static string FormatPrimaryDiagnosticRelation(ViewRelationMetrics r)
+        {
+            if (r == null)
+                return "  (null relation)";
+
+            var pos =
+                r.IsAbove ? "Above" :
+                r.IsBelow ? "Below" :
+                r.IsLeft ? "Left" :
+                r.IsRight ? "Right" :
+                "Overlap";
+
+            var proj =
+                r.IsVerticalProjectionCandidate ? "VP" :
+                r.IsHorizontalProjectionCandidate ? "HP" :
+                "NP";
+
+            return
+                $"  Relation({r.AId},{r.BId}) " +
+                $"Pos={pos}, " +
+                $"Proj={proj}, " +
+                $"ProjScore={r.ProjectionScore:0.###}, " +
+                $"Composite={r.CompositeScore:0.###}, " +
+                $"CX={r.CenterXAlignment:0.###}, " +
+                $"CY={r.CenterYAlignment:0.###}, " +
+                $"W={r.WidthSimilarity:0.###}, " +
+                $"H={r.HeightSimilarity:0.###}, " +
+                $"D={r.DistanceScore:0.###}, " +
+                $"A={r.AnchorMatchScore:0.###}";
+        }
+
+        private static string SafeText(string? text)
+        {
+            return string.IsNullOrWhiteSpace(text) ? "-" : text!;
+        }
+
+        private void DrawPrimaryDiagnosticOverlays(
+    Database db,
+    Transaction tr,
+    IReadOnlyList<ViewCandidate> candidates)
+        {
+            if (db == null)
+                throw new ArgumentNullException(nameof(db));
+            if (tr == null)
+                throw new ArgumentNullException(nameof(tr));
+            if (candidates == null || candidates.Count == 0)
+                return;
+
+            var modelSpace = (BlockTableRecord)tr.GetObject(
+                SymbolUtilityServices.GetBlockModelSpaceId(db),
+                OpenMode.ForWrite);
+
+            foreach (var c in candidates)
+            {
+                var pt = new Point3d(c.Bounds.MaxX + 4.0, c.Bounds.MaxY + 4.0, 0.0);
+
+                var label =
+                    $"I:{c.IslandId} " +
+                    $"P:{(c.IsPrimaryView ? "Y" : "N")} " +
+                    $"PC:{(c.IsPrimaryCandidate ? "Y" : "N")} " +
+                    $"PS:{c.PrimaryScore:0.##} " +
+                    $"PR:{c.FinalRole} " +
+                    $"BP:{c.BestProjectionScore:0.##}/{SafeText(c.BestProjectionPosition)}";
+
+                var text = new DBText
+                {
+                    Position = pt,
+                    Height = Math.Max(Math.Min(c.Width, c.Height) * 0.06, 2.5),
+                    TextString = label,
+                    ColorIndex = GetPrimaryDiagnosticColorIndex(c)
+                };
+
+                modelSpace.AppendEntity(text);
+                tr.AddNewlyCreatedDBObject(text, true);
+            }
+        }
+
+
+        private static short GetPrimaryDiagnosticColorIndex(ViewCandidate c)
+        {
+            if (c == null)
+                return 1;
+
+            if (c.IsPrimaryView)
+                return 3; // green
+
+            if (c.IsPrimaryCandidate && c.BestProjectionScore >= 0.55)
+                return 4; // cyan
+
+            if (c.IsConfirmedSeed)
+                return 2; // yellow
+
+            return 1; // red
+        }
+
+
+        [CommandMethod("FLUX_DEBUG_PRIMARY_VIEW_RELATIONS")]
+        public void FluxDebugPrimaryViewRelations()
+        {
+            var doc = Bricscad.ApplicationServices.Application.DocumentManager.MdiActiveDocument;
+            if (doc == null)
+                return;
+
+            var db = doc.Database;
+            var ed = doc.Editor;
+
+            try
+            {
+                var sheetFilePath = db.Filename;
+                if (string.IsNullOrWhiteSpace(sheetFilePath))
+                {
+                    ed.WriteMessage("\n[FluxCAD] 저장된 DWG 파일이 아닙니다.");
+                    return;
+                }
+
+                var candidates = BuildResolvedViewCandidates(sheetFilePath, ed);
+                if (candidates.Count == 0)
+                {
+                    ed.WriteMessage("\n[FluxCAD] view candidate가 비어 있습니다.");
+                    return;
+                }
+
+                var candidateViews = candidates
+                    .Where(x => x != null)
+                    .OrderBy(x => x.IslandId)
+                    .ToList();
+
+                var initialPrimaryViews = candidateViews
+                    .Where(x => x.IsTopLevelView)
+                    .OrderBy(x => x.IslandId)
+                    .ToList();
+
+                ed.WriteMessage($"\n[FluxCAD] CandidateViews={candidateViews.Count}");
+                ed.WriteMessage($"\n[FluxCAD] InitialPrimaryViews={initialPrimaryViews.Count}");
+
+                if (candidateViews.Count < 2)
+                {
+                    ed.WriteMessage("\n[FluxCAD] relation 분석을 위한 candidate view 수가 부족합니다.");
+                    return;
+                }
+
+                var analyzer = new ViewRelationAnalyzer();
+                var relations = analyzer.Analyze(candidateViews);
+
+                ed.WriteMessage("\n" + ViewRelationReportFormatter.Format(relations));
+
+                using (doc.LockDocument())
+                using (var tr = db.TransactionManager.StartTransaction())
+                {
+                    // 기존 후보 overlay 먼저
+                    DrawHierarchyCandidateOverlays(
+                        db,
+                        tr,
+                        candidates,
+                        clearLayerFirst: true,
+                        drawLabels: true,
+                        drawRelations: false);
+
+                    // relation overlay 추가
+                    DrawViewRelationOverlays(
+                        db,
+                        tr,
+                        candidateViews,
+                        relations);
+
+                    tr.Commit();
+                }
+
+                ed.WriteMessage(
+                    $"\n[FluxCAD] PrimaryViewRelations count={relations.Count}, " +
+                    $"candidates={candidateViews.Count}, " +
+                    $"initialPrimary={initialPrimaryViews.Count}");
+            }
+            catch (System.Exception ex)
+            {
+                ed.WriteMessage($"\n[FluxCAD] FLUX_DEBUG_PRIMARY_VIEW_RELATIONS failed: {ex}");
+            }
+        }
+
+        private void DrawViewRelationOverlays(
+            Database db,
+            Transaction tr,
+            IReadOnlyList<ViewCandidate> primaryViews,
+            IReadOnlyList<ViewRelationMetrics> relations)
+        {
+            if (db == null)
+                throw new ArgumentNullException(nameof(db));
+            if (tr == null)
+                throw new ArgumentNullException(nameof(tr));
+            if (primaryViews == null || primaryViews.Count == 0)
+                return;
+            if (relations == null || relations.Count == 0)
+                return;
+
+            var modelSpace = (BlockTableRecord)tr.GetObject(
+                SymbolUtilityServices.GetBlockModelSpaceId(db),
+                OpenMode.ForWrite);
+
+            // 1) primary view 중심점 표시
+            foreach (var view in primaryViews)
+            {
+                DrawPrimaryViewCenterMarker(modelSpace, tr, view);
+            }
+
+            // 2) relation 선 + 텍스트 표시
+            foreach (var relation in relations)
+            {
+                var a = primaryViews.FirstOrDefault(x => x.IslandId == relation.AId);
+                var b = primaryViews.FirstOrDefault(x => x.IslandId == relation.BId);
+
+                if (a == null || b == null)
+                    continue;
+
+                var aPt = ToPoint3d(a.Center);
+                var bPt = ToPoint3d(b.Center);
+
+                // 연결선
+                var line = new Line(aPt, bPt)
+                {
+                    ColorIndex = GetRelationColorIndex(relation),
+                    LineWeight = LineWeight.LineWeight030
+                };
+
+                modelSpace.AppendEntity(line);
+                tr.AddNewlyCreatedDBObject(line, true);
+
+                // 중간 텍스트
+                var mid = new Point3d(
+                    (aPt.X + bPt.X) * 0.5,
+                    (aPt.Y + bPt.Y) * 0.5,
+                    0.0);
+
+                var text = BuildRelationShortLabel(relation);
+                var textHeight = ComputeRelationTextHeight(a, b);
+
+                var dbText = new DBText
+                {
+                    Position = mid,
+                    Height = textHeight,
+                    TextString = text,
+                    ColorIndex = GetRelationColorIndex(relation),
+                    HorizontalMode = TextHorizontalMode.TextCenter,
+                    VerticalMode = TextVerticalMode.TextVerticalMid,
+                    AlignmentPoint = mid
+                };
+
+                modelSpace.AppendEntity(dbText);
+                tr.AddNewlyCreatedDBObject(dbText, true);
+            }
+        }
+
+        private void DrawPrimaryViewCenterMarker(
+    BlockTableRecord modelSpace,
+    Transaction tr,
+    ViewCandidate view)
+        {
+            if (modelSpace == null || tr == null || view == null)
+                return;
+
+            var center = ToPoint3d(view.Center);
+            var markerRadius = Math.Max(Math.Min(view.Width, view.Height) * 0.03, 2.0);
+
+            var circle = new Circle(center, Vector3d.ZAxis, markerRadius)
+            {
+                ColorIndex = 2
+            };
+
+            modelSpace.AppendEntity(circle);
+            tr.AddNewlyCreatedDBObject(circle, true);
+
+            var labelPos = new Point3d(
+                center.X + markerRadius * 1.8,
+                center.Y + markerRadius * 1.8,
+                0.0);
+
+            var text = new DBText
+            {
+                Position = labelPos,
+                Height = Math.Max(markerRadius * 1.2, 2.5),
+                TextString = $"PV:{view.IslandId}",
+                ColorIndex = 2
+            };
+
+            modelSpace.AppendEntity(text);
+            tr.AddNewlyCreatedDBObject(text, true);
+        }
+
+        private static Point3d ToPoint3d(dynamic p)
+        {
+            return new Point3d((double)p.X, (double)p.Y, 0.0);
+        }
+
+        private static Point3d ToPoint3d(Point2D p)
+        {
+            return new Point3d(p.X, p.Y, 0.0);
+        }
+
+        private static string BuildRelationShortLabel(ViewRelationMetrics r)
+        {
+            var pos =
+                r.IsAbove ? "Above" :
+                r.IsBelow ? "Below" :
+                r.IsLeft ? "Left" :
+                r.IsRight ? "Right" :
+                "Overlap";
+
+            var proj =
+                r.IsVerticalProjectionCandidate ? "VP" :
+                r.IsHorizontalProjectionCandidate ? "HP" :
+                "NP";
+
+            return
+                $"{r.AId}-{r.BId} " +
+                $"CX:{r.CenterXAlignment:F2} " +
+                $"CY:{r.CenterYAlignment:F2} " +
+                $"W:{r.WidthSimilarity:F2} " +
+                $"H:{r.HeightSimilarity:F2} " +
+                $"D:{r.DistanceScore:F2} " +
+                $"A:{r.AnchorMatchScore:F2} " +
+                $"P:{r.ProjectionScore:F2} " +
+                $"{proj} {pos}";
+        }
+
+        private static double ComputeRelationTextHeight(ViewCandidate a, ViewCandidate b)
+        {
+            var avg = Math.Max(((a.Width + a.Height + b.Width + b.Height) * 0.25) * 0.05, 2.5);
+            return avg;
+        }
+
+        private static short GetRelationColorIndex(ViewRelationMetrics r)
+        {
+            if (r.IsProjectionCandidate && r.ProjectionScore >= 0.75)
+                return 3; // green
+
+            if (r.IsProjectionCandidate && r.ProjectionScore >= 0.55)
+                return 4; // cyan
+
+            if (r.CompositeScore >= 0.55)
+                return 2; // yellow
+
+            return 1; // red
+        }
+
+        private List<ViewCandidate> BuildResolvedViewCandidates(string sheetFilePath, Bricscad.EditorInput.Editor ed)
+        {
+            if (string.IsNullOrWhiteSpace(sheetFilePath))
+                return new List<ViewCandidate>();
+
+            IEntitySnapshotBuilder snapshotBuilder = new SimpleSheetFileSnapshotBuilder();
+            var entities = snapshotBuilder.Build(sheetFilePath);
+
+            if (entities == null || entities.Count == 0)
+                return new List<ViewCandidate>();
+
+            var pipeline = BuildSemanticIslandPipeline(
+                entities,
+                ed,
+                closeSingleCellGaps: false,
+                targetCellSize: 12.0,
+                excludeSparseBridgeFromGroups: false);
+
+            var semanticResults = pipeline?.SemanticResults?
+                .Where(x => x != null)
+                .OrderBy(x => x.Island?.Id ?? -1)
+                .ToList()
+                ?? new List<ViewIslandSemanticResult>();
+
+            ed.WriteMessage($"\n[FluxCAD] SemanticResults={semanticResults.Count}");
+
+            foreach (var s in semanticResults)
+            {
+                var island = s.Island;
+                var islandId = island?.Id ?? -1;
+                var bounds = island?.Bounds ?? Bounds2D.Empty;
+                var dimCount = island?.OverlapDimensionCount ?? 0;
+                var hasDim = island?.OverlapsDimension ?? false;
+                var cellCount = island?.CellCount ?? 0;
+                var fillRatio = island?.FillRatio ?? 0.0;
+                var sparseBridge = island?.IsSparseBridgeLike ?? false;
+
+                ed.WriteMessage(
+                    $"\n  [Semantic] Island={islandId}, " +
+                    $"Role={s.Role}, " +
+                    $"Geom={s.ScoreGeometry:F3}, " +
+                    $"Badge={s.ScoreBadge:F3}, " +
+                    $"Anno={s.ScoreAnnotation:F3}, " +
+                    $"Dim={hasDim}/{dimCount}, " +
+                    $"Cells={cellCount}, " +
+                    $"Fill={fillRatio:F3}, " +
+                    $"SparseBridge={sparseBridge}, " +
+                    $"Size=({bounds.Width:F1}x{bounds.Height:F1}), " +
+                    $"Reason={s.Reason}");
+            }
+
+            var candidateBuilder = new ViewCandidateBuilder();
+            var candidates = candidateBuilder.Build(semanticResults);
+
+            var candidateListBeforeResolve = candidates?
+                .Where(x => x != null)
+                .OrderBy(x => x.IslandId)
+                .ToList()
+                ?? new List<ViewCandidate>();
+
+            ed.WriteMessage($"\n[FluxCAD] CandidateBuilder.Count={candidateListBeforeResolve.Count}");
+
+            foreach (var c in candidateListBeforeResolve)
+            {
+                ed.WriteMessage(
+                    $"\n  [CandidateBeforeResolve] Island={c.IslandId}, " +
+                    $"Init={c.InitialRole}, " +
+                    $"Final={c.FinalRole}, " +
+                    $"TopLevel={c.IsTopLevelView}, " +
+                    $"Dim={c.HasDimension}/{c.DimensionCount}, " +
+                    $"SparseBridge={c.IsSparseBridgeLike}, " +
+                    $"Size=({c.Width:F1}x{c.Height:F1})");
+            }
+
+            var resolver = new ViewSetResolver();
+            resolver.Resolve(candidateListBeforeResolve);
+
+            ed.WriteMessage($"\n[FluxCAD] CandidateAfterResolve.Count={candidateListBeforeResolve.Count}");
+
+            foreach (var c in candidateListBeforeResolve)
+            {
+                ed.WriteMessage(
+                    $"\n  [CandidateAfterResolve] Island={c.IslandId}, " +
+                    $"Init={c.InitialRole}, " +
+                    $"Final={c.FinalRole}, " +
+                    $"TopLevel={c.IsTopLevelView}, " +
+                    $"Dim={c.HasDimension}/{c.DimensionCount}, " +
+                    $"SparseBridge={c.IsSparseBridgeLike}, " +
+                    $"Size=({c.Width:F1}x{c.Height:F1})");
+            }
+
+            return candidateListBeforeResolve;
+        }
+
 
         [CommandMethod("FLUX_DEBUG_VIEW_ISLAND_HIERARCHY")]
         public void FluxDebugViewIslandHierarchy()

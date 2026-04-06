@@ -27,40 +27,27 @@ namespace FluxCAD.SheetAnalysis.ViewIsolation.Analysis
             if (candidates.Count == 0)
                 return;
 
-            // 1) 먼저 hierarchy 해석
+            // 1) hierarchy 해석
             ResolveHierarchy(candidates);
 
-            // 2) top-level 후보만 대상으로 geometry 승격
+            // 2) top-level 후보 수집
             var topLevelCandidates = candidates
                 .Where(x => x.IsTopLevelView)
                 .ToList();
 
+            // 3) strong seed 확정
+            ResolveStrongSeeds(topLevelCandidates);
+
             var strongViews = topLevelCandidates
-                .Where(x => x.IsStrongGeometrySeed)
+                .Where(x => x.IsConfirmedSeed)
                 .ToList();
 
-            // strong geometry seed가 없어도 여기서 끝내면 안 됩니다.
-            // 왜냐하면 primary 판정은 현재 FinalRole 승격 여부와 별개로
-            // top-level 전체를 대상으로 다시 의미 해석해야 하기 때문입니다.
+            // 4) seed가 있으면 weak 후보 rescue
             if (strongViews.Count > 0)
             {
                 foreach (var candidate in topLevelCandidates)
                 {
-                    if (candidate.IsStrongGeometrySeed)
-                    {
-                        candidate.FinalRole = ViewIslandSemanticRole.GeometryView;
-                        AppendFinalReason(candidate, "StrongGeometrySeed");
-                        continue;
-                    }
-
-                    if (candidate.IsSparseBridgeLike)
-                    {
-                        candidate.FinalRole = ViewIslandSemanticRole.SparseBridge;
-                        AppendFinalReason(candidate, "KeepSparseBridge");
-                        continue;
-                    }
-
-                    if (!candidate.IsPromotableWeakCandidate)
+                    if (candidate.IsConfirmedSeed)
                         continue;
 
                     EvaluatePromotion(candidate, strongViews);
@@ -68,7 +55,7 @@ namespace FluxCAD.SheetAnalysis.ViewIsolation.Analysis
             }
             else
             {
-                // strong seed가 전혀 없는 경우에도 SparseBridge는 의미를 유지
+                // strong seed가 전혀 없더라도 SparseBridge는 의미 유지
                 foreach (var candidate in topLevelCandidates)
                 {
                     if (candidate.IsSparseBridgeLike)
@@ -83,10 +70,15 @@ namespace FluxCAD.SheetAnalysis.ViewIsolation.Analysis
             {
                 AppendFinalReason(
                     c,
-                    $"TopLevelBeforePrimary Init={c.InitialRole}, Final={c.FinalRole}, Dim={c.DimensionCount}, Area={c.Area:0.##}");
+                    $"TopLevelBeforePrimary Init={c.InitialRole}, Final={c.FinalRole}, Seed={c.IsConfirmedSeed}, Dim={c.DimensionCount}, Area={c.Area:0.##}");
             }
 
-            // 3) 마지막에 반드시 primary view 판정 수행
+            // 5) top-level relation 기반 projection 정보 주입
+            //    promotion 단계의 임시 projection 점수를 덮어쓰고,
+            //    모든 top-level view에 대해 일관된 projection summary를 만든다.
+            PopulateTopLevelProjectionLinks(topLevelCandidates);
+
+            // 6) 마지막에 primary view 판정
             ResolvePrimaryViews(candidates);
         }
 
@@ -130,16 +122,28 @@ namespace FluxCAD.SheetAnalysis.ViewIsolation.Analysis
                 var reasons = new List<string>();
                 var exclude = false;
 
-                if (c.InitialRole == ViewIslandSemanticRole.SparseBridge)
+                if (c.FinalRole == ViewIslandSemanticRole.SparseBridge)
                 {
                     exclude = true;
                     reasons.Add("Exclude=SparseBridge");
                 }
 
-                if (c.InitialRole == ViewIslandSemanticRole.BadgeMarker)
+                if (c.FinalRole == ViewIslandSemanticRole.BadgeMarker)
                 {
                     exclude = true;
                     reasons.Add("Exclude=BadgeMarker");
+                }
+
+                if (c.FinalRole == ViewIslandSemanticRole.AnnotationLike)
+                {
+                    exclude = true;
+                    reasons.Add("Exclude=AnnotationLike");
+                }
+
+                if (c.FinalRole == ViewIslandSemanticRole.Unknown)
+                {
+                    exclude = true;
+                    reasons.Add("Exclude=Unknown");
                 }
 
                 if (c.IsEmbeddedFeature || c.HasParent)
@@ -153,7 +157,7 @@ namespace FluxCAD.SheetAnalysis.ViewIsolation.Analysis
                 var areaRatio = c.Area / maxArea;
 
                 if (c.DimensionCount <= 0 &&
-                    c.InitialRole != ViewIslandSemanticRole.GeometryView &&
+                    c.FinalRole != ViewIslandSemanticRole.GeometryView &&
                     areaRatio < 0.08)
                 {
                     exclude = true;
@@ -179,12 +183,12 @@ namespace FluxCAD.SheetAnalysis.ViewIsolation.Analysis
 
                 double score = 0.0;
 
-                if (c.InitialRole == ViewIslandSemanticRole.GeometryView)
+                if (c.FinalRole == ViewIslandSemanticRole.GeometryView)
                 {
                     score += 6.0;
                     reasons.Add("Role=GeometryView(+6)");
                 }
-                else if (c.InitialRole == ViewIslandSemanticRole.Unknown)
+                else if (c.FinalRole == ViewIslandSemanticRole.Unknown)
                 {
                     score += 1.0;
                     reasons.Add("Role=Unknown(+1)");
@@ -211,6 +215,33 @@ namespace FluxCAD.SheetAnalysis.ViewIsolation.Analysis
                     reasons.Add($"Children={c.ChildIslandIds.Count}(+{childBonus:0.##})");
                 }
 
+                // relation rescue:
+                // 하방 정면도 / 측면도처럼 독립 geometry view인데
+                // 치수 / 면적에서 밀릴 수 있는 후보를 projection 근거로 보정
+                if (c.FinalRole == ViewIslandSemanticRole.GeometryView &&
+                    c.BestProjectionScore > 0.0)
+                {
+                    if (string.Equals(c.BestProjectionPosition, ViewRelativePosition.Below.ToString(), StringComparison.OrdinalIgnoreCase))
+                    {
+                        var belowBonus = Math.Min(3.5, 1.5 + (c.BestProjectionScore * 1.5));
+                        score += belowBonus;
+                        reasons.Add($"BelowProjectionBonus={c.BestProjectionScore:0.###}(+{belowBonus:0.##})");
+                    }
+                    else if (string.Equals(c.BestProjectionPosition, ViewRelativePosition.Above.ToString(), StringComparison.OrdinalIgnoreCase))
+                    {
+                        var aboveBonus = Math.Min(1.5, 0.4 + (c.BestProjectionScore * 0.8));
+                        score += aboveBonus;
+                        reasons.Add($"AboveProjectionBonus={c.BestProjectionScore:0.###}(+{aboveBonus:0.##})");
+                    }
+                    else if (string.Equals(c.BestProjectionPosition, ViewRelativePosition.Left.ToString(), StringComparison.OrdinalIgnoreCase) ||
+                             string.Equals(c.BestProjectionPosition, ViewRelativePosition.Right.ToString(), StringComparison.OrdinalIgnoreCase))
+                    {
+                        var sideBonus = Math.Min(2.0, 0.8 + (c.BestProjectionScore * 0.9));
+                        score += sideBonus;
+                        reasons.Add($"SideProjectionBonus={c.BestProjectionPosition}:{c.BestProjectionScore:0.###}(+{sideBonus:0.##})");
+                    }
+                }
+
                 var dx = c.Center.X - sheetCenterX;
                 var dy = c.Center.Y - sheetCenterY;
                 var dist = Math.Sqrt(dx * dx + dy * dy);
@@ -222,12 +253,25 @@ namespace FluxCAD.SheetAnalysis.ViewIsolation.Analysis
                     reasons.Add($"Centrality={centrality:0.###}(+{centrality * 1.5:0.##})");
                 }
 
-                if (aspect >= 12.0 && minSide < 80.0)
+                if (aspect >= 20.0)
                 {
-                    if (c.InitialRole == ViewIslandSemanticRole.GeometryView && c.DimensionCount > 0)
+                    if (c.FinalRole == ViewIslandSemanticRole.GeometryView && c.DimensionCount > 0)
                     {
                         score -= 0.75;
-                        reasons.Add("ThinButDimensionedGeometryPenalty(-0.75)");
+                        reasons.Add("VeryThinButDimensionedGeometryPenalty(-0.75)");
+                    }
+                    else
+                    {
+                        score -= 1.5;
+                        reasons.Add("VeryThinPenalty(-1.5)");
+                    }
+                }
+                else if (aspect >= 12.0 && minSide < 80.0)
+                {
+                    if (c.FinalRole == ViewIslandSemanticRole.GeometryView && c.DimensionCount > 0)
+                    {
+                        score -= 0.50;
+                        reasons.Add("ThinButDimensionedGeometryPenalty(-0.5)");
                     }
                     else
                     {
@@ -235,21 +279,8 @@ namespace FluxCAD.SheetAnalysis.ViewIsolation.Analysis
                         reasons.Add("ThinPenalty(-2)");
                     }
                 }
-                else if (aspect >= 20.0)
-                {
-                    if (c.InitialRole == ViewIslandSemanticRole.GeometryView && c.DimensionCount > 0)
-                    {
-                        score -= 0.5;
-                        reasons.Add("VeryThinButDimensionedGeometryPenalty(-0.5)");
-                    }
-                    else
-                    {
-                        score -= 1.0;
-                        reasons.Add("VeryThinPenalty(-1)");
-                    }
-                }
 
-                if (c.InitialRole == ViewIslandSemanticRole.Unknown && c.DimensionCount == 0)
+                if (c.FinalRole == ViewIslandSemanticRole.Unknown && c.DimensionCount == 0)
                 {
                     score -= 2.0;
                     reasons.Add("UnknownNoDimPenalty(-2)");
@@ -269,12 +300,27 @@ namespace FluxCAD.SheetAnalysis.ViewIsolation.Analysis
 
             var bestScore = primaryCandidates[0].PrimaryScore;
 
+            // 기존 0.45 -> 0.40 완화 유지
             var selected = primaryCandidates
-                .Where(x => x.PrimaryScore >= Math.Max(4.0, bestScore * 0.45))
+                .Where(x => x.PrimaryScore >= Math.Max(4.0, bestScore * 0.40))
                 .Take(3)
                 .ToList();
 
-            foreach (var c in selected)
+            // 그래도 3개가 안 차면, 독립적인 confirmed geometry seed를 우선 보충
+            if (selected.Count < 3)
+            {
+                var extras = primaryCandidates
+                    .Where(x => !selected.Contains(x))
+                    .Where(x => x.FinalRole == ViewIslandSemanticRole.GeometryView)
+                    .Where(x => x.IsConfirmedSeed)
+                    .OrderByDescending(x => x.PrimaryScore)
+                    .Take(3 - selected.Count)
+                    .ToList();
+
+                selected.AddRange(extras);
+            }
+
+            foreach (var c in selected.Distinct())
             {
                 c.IsPrimaryView = true;
 
@@ -303,6 +349,18 @@ namespace FluxCAD.SheetAnalysis.ViewIsolation.Analysis
                 candidate.FinalRole = candidate.InitialRole;
                 candidate.FinalReason = candidate.InitialReason;
                 candidate.Score = 0;
+
+                candidate.IsConfirmedSeed = false;
+                candidate.SeedScore = 0.0;
+                candidate.SeedReason = string.Empty;
+
+                candidate.IsPrimaryCandidate = false;
+                candidate.IsPrimaryView = false;
+                candidate.PrimaryScore = 0.0;
+                candidate.PrimaryReason = string.Empty;
+
+                candidate.ProjectionRole = string.Empty;
+                candidate.ProjectionReason = string.Empty;
 
                 candidate.ResetHierarchy();
             }
@@ -343,13 +401,73 @@ namespace FluxCAD.SheetAnalysis.ViewIsolation.Analysis
 
             foreach (var candidate in candidates)
             {
-                if (!candidate.HasParent)
-                {
-                    candidate.IsTopLevelView = true;
-                    candidate.IsEmbeddedFeature = false;
+                if (candidate.HasParent)
+                    continue;
 
-                    if (string.IsNullOrWhiteSpace(candidate.HierarchyReason))
-                        candidate.HierarchyReason = "TopLevelByNoParent";
+                candidate.IsEmbeddedFeature = false;
+
+                // TopLevel은 "공간적으로 독립된 상위 island"라는 의미로 둡니다.
+                // 의미적 차단은 여기서 너무 일찍 하지 않습니다.
+                var allowTopLevel = true;
+
+                // 다만 SparseBridge는 top-level로 올려도 관계 복원에 거의 방해가 되므로 차단
+                if (candidate.InitialRole == ViewIslandSemanticRole.SparseBridge ||
+                    candidate.IsSparseBridgeLike)
+                {
+                    allowTopLevel = false;
+                }
+
+                candidate.IsTopLevelView = allowTopLevel;
+
+                if (string.IsNullOrWhiteSpace(candidate.HierarchyReason))
+                {
+                    candidate.HierarchyReason = allowTopLevel
+                        ? "TopLevelByNoParent"
+                        : $"NoParentButBlocked({candidate.InitialRole})";
+                }
+            }
+        }
+
+        private void ResolveStrongSeeds(IList<ViewCandidate> candidates)
+        {
+            foreach (var c in candidates)
+            {
+                c.IsConfirmedSeed = false;
+                c.SeedScore = 0.0;
+                c.SeedReason = string.Empty;
+
+                if (!c.IsTopLevelView)
+                    continue;
+
+                double score = 0.0;
+                var reasons = new List<string>();
+
+                if (c.InitialRole == ViewIslandSemanticRole.GeometryView)
+                {
+                    score += 0.45;
+                    reasons.Add("InitGeometry");
+                }
+
+                if (c.HasDimension)
+                {
+                    score += 0.40;
+                    reasons.Add("HasDimension");
+                }
+
+                if (!c.IsSparseBridgeLike)
+                {
+                    score += 0.15;
+                    reasons.Add("NotSparseBridge");
+                }
+
+                c.SeedScore = score;
+                c.SeedReason = string.Join(", ", reasons);
+
+                if (score >= 0.75)
+                {
+                    c.IsConfirmedSeed = true;
+                    c.FinalRole = ViewIslandSemanticRole.GeometryView;
+                    AppendFinalReason(c, $"ConfirmedSeed({c.SeedReason})");
                 }
             }
         }
@@ -373,9 +491,181 @@ namespace FluxCAD.SheetAnalysis.ViewIsolation.Analysis
             return result;
         }
 
+        private void PopulateTopLevelProjectionLinks(IList<ViewCandidate> topLevelCandidates)
+        {
+            if (topLevelCandidates == null || topLevelCandidates.Count == 0)
+                return;
+
+            foreach (var c in topLevelCandidates)
+            {
+                c.BestProjectionScore = 0.0;
+                c.BestProjectionSourceIslandId = null;
+                c.BestProjectionPosition = string.Empty;
+            }
+
+            for (var i = 0; i < topLevelCandidates.Count; i++)
+            {
+                for (var j = i + 1; j < topLevelCandidates.Count; j++)
+                {
+                    var a = topLevelCandidates[i];
+                    var b = topLevelCandidates[j];
+
+                    if (a.HasParent || b.HasParent)
+                        continue;
+
+                    if (!a.IsTopLevelView || !b.IsTopLevelView)
+                        continue;
+
+                    var rel = _relationshipAnalyzer.Analyze(a, b);
+
+                    var abScore = ComputeCadProjectionScore(a, b, rel);
+                    if (abScore > 0.0)
+                    {
+                        UpdateBestProjection(
+                            target: b,
+                            source: a,
+                            position: rel.RelativePosition,
+                            score: abScore);
+                    }
+
+                    var reversePos = ReversePosition(rel.RelativePosition);
+                    var baScore = ComputeCadProjectionScore(b, a, rel, reversePos);
+                    if (baScore > 0.0)
+                    {
+                        UpdateBestProjection(
+                            target: a,
+                            source: b,
+                            position: reversePos,
+                            score: baScore);
+                    }
+                }
+            }
+        }
+
+        private static double ComputeCadProjectionScore(
+            ViewCandidate source,
+            ViewCandidate target,
+            ViewRelationship rel,
+            ViewRelativePosition? forcedPosition = null)
+        {
+            if (source == null)
+                throw new ArgumentNullException(nameof(source));
+            if (target == null)
+                throw new ArgumentNullException(nameof(target));
+            if (rel == null)
+                throw new ArgumentNullException(nameof(rel));
+
+            var pos = forcedPosition ?? rel.RelativePosition;
+
+            double score = 0.0;
+
+            switch (pos)
+            {
+                case ViewRelativePosition.Below:
+                case ViewRelativePosition.Above:
+                    // 상하 관계에서는 폭 유사성이 핵심
+                    if (rel.IsVerticallyAligned)
+                        score += 0.9;
+
+                    score += rel.WidthSimilarity * 1.2;
+
+                    // 높이/면적은 참고만
+                    score += rel.HeightSimilarity * 0.15;
+                    score += rel.AreaSimilarity * 0.10;
+
+                    // 너무 멀면 감점
+                    if (rel.NormalizedDistanceY > 2.5)
+                        score -= Math.Min(0.5, (rel.NormalizedDistanceY - 2.5) * 0.2);
+
+                    break;
+
+                case ViewRelativePosition.Left:
+                case ViewRelativePosition.Right:
+                    // 좌우 관계에서는 높이 유사성이 핵심
+                    if (rel.IsHorizontallyAligned)
+                        score += 0.9;
+
+                    score += rel.HeightSimilarity * 1.2;
+
+                    // 폭/면적은 참고만
+                    score += rel.WidthSimilarity * 0.15;
+                    score += rel.AreaSimilarity * 0.10;
+
+                    if (rel.NormalizedDistanceX > 2.5)
+                        score -= Math.Min(0.5, (rel.NormalizedDistanceX - 2.5) * 0.2);
+
+                    break;
+
+                default:
+                    return 0.0;
+            }
+
+            // geometry view끼리는 약간 신뢰도 가산
+            if (source.FinalRole == ViewIslandSemanticRole.GeometryView &&
+                target.FinalRole == ViewIslandSemanticRole.GeometryView)
+            {
+                score += 0.25;
+            }
+
+            return Math.Max(0.0, score);
+        }
+
+
+        private static void UpdateBestProjection(
+            ViewCandidate target,
+            ViewCandidate source,
+            ViewRelativePosition position,
+            double score)
+        {
+            if (target == null)
+                throw new ArgumentNullException(nameof(target));
+            if (source == null)
+                throw new ArgumentNullException(nameof(source));
+
+            if (score <= target.BestProjectionScore)
+                return;
+
+            target.BestProjectionScore = score;
+            target.BestProjectionSourceIslandId = source.IslandId;
+            target.BestProjectionPosition = position.ToString();
+        }
+
+        private static ViewRelativePosition ReversePosition(ViewRelativePosition position)
+        {
+            return position switch
+            {
+                ViewRelativePosition.Left => ViewRelativePosition.Right,
+                ViewRelativePosition.Right => ViewRelativePosition.Left,
+                ViewRelativePosition.Above => ViewRelativePosition.Below,
+                ViewRelativePosition.Below => ViewRelativePosition.Above,
+                _ => position
+            };
+        }
+
+        private static double ComputePrimaryProjectionScore(ViewRelationship rel)
+        {
+            if (rel == null)
+                throw new ArgumentNullException(nameof(rel));
+
+            double score = 0.0;
+
+            if (rel.IsHorizontallyAligned || rel.IsVerticallyAligned)
+                score += 0.8;
+
+            score += rel.WidthSimilarity * 0.8;
+            score += rel.HeightSimilarity * 0.8;
+            score += rel.AreaSimilarity * 0.4;
+
+            var distancePenalty = Math.Max(rel.NormalizedDistanceX, rel.NormalizedDistanceY);
+            if (distancePenalty > 1.5)
+                score -= Math.Min(0.6, (distancePenalty - 1.5) * 0.2);
+
+            return Math.Max(0.0, score);
+        }
+
         private void TryRegisterParentChild(
-    ViewRelationship rel,
-    Dictionary<int, ParentAssignment> parentAssignments)
+            ViewRelationship rel,
+            Dictionary<int, ParentAssignment> parentAssignments)
         {
             if (rel == null)
                 throw new ArgumentNullException(nameof(rel));
@@ -423,7 +713,6 @@ namespace FluxCAD.SheetAnalysis.ViewIsolation.Analysis
             if (parent == null)
                 return true;
 
-            // SparseBridge는 hierarchy parent가 되면 안 됨
             if (parent.InitialRole == ViewIslandSemanticRole.SparseBridge ||
                 parent.FinalRole == ViewIslandSemanticRole.SparseBridge ||
                 parent.IsSparseBridgeLike)
@@ -510,8 +799,23 @@ namespace FluxCAD.SheetAnalysis.ViewIsolation.Analysis
             if (strongViews.Count == 0)
                 return;
 
-            var bestScore = int.MinValue;
-            var bestReason = "No strong relation";
+            if (candidate.InitialRole == ViewIslandSemanticRole.SparseBridge ||
+                candidate.IsSparseBridgeLike)
+            {
+                candidate.Score = 0;
+                candidate.FinalRole = ViewIslandSemanticRole.SparseBridge;
+                candidate.BestProjectionScore = 0.0;
+                candidate.BestProjectionSourceIslandId = null;
+                candidate.BestProjectionPosition = string.Empty;
+                AppendFinalReason(candidate, "PromotionBlocked=SparseBridge");
+                return;
+            }
+
+            double bestScore = double.MinValue;
+            string bestReason = "No strong relation";
+            string bestProjectionRole = string.Empty;
+            int? bestSourceIslandId = null;
+            string bestProjectionPosition = string.Empty;
 
             foreach (var strong in strongViews)
             {
@@ -520,63 +824,103 @@ namespace FluxCAD.SheetAnalysis.ViewIsolation.Analysis
 
                 var rel = _relationshipAnalyzer.Analyze(strong, candidate);
 
-                // embedded/containment 관계는 top-level projection 승격에서 제외
                 if (rel.RelationKind == ViewRelationKind.EmbeddedFeature ||
                     rel.RelationKind == ViewRelationKind.ParentChildContainment)
                 {
                     continue;
                 }
 
-                var score = 0;
+                double score = 0.0;
                 var reasons = new List<string>();
 
                 if (rel.IsHorizontallyAligned)
                 {
-                    score++;
+                    score += 0.20;
                     reasons.Add("HAlign");
                 }
 
                 if (rel.IsVerticallyAligned)
                 {
-                    score++;
+                    score += 0.20;
                     reasons.Add("VAlign");
                 }
 
                 if (rel.IsSizeComparable)
                 {
-                    score++;
+                    score += 0.20;
                     reasons.Add("SizeComparable");
                 }
 
                 var areaRatio = strong.Area <= 1e-9 ? 0.0 : candidate.Area / strong.Area;
                 if (areaRatio >= _options.MinAreaRatioToStrong)
                 {
-                    score++;
+                    score += 0.15;
                     reasons.Add($"AreaRatio={areaRatio:0.##}");
                 }
 
                 if (candidate.AspectRatio <= _options.MaxAspectRatioForGeometryPromotion)
                 {
-                    score++;
+                    score += 0.10;
                     reasons.Add($"Aspect={candidate.AspectRatio:0.##}");
                 }
+                else
+                {
+                    reasons.Add($"AspectHigh={candidate.AspectRatio:0.##}");
+                }
+
+                if (candidate.HasDimension)
+                {
+                    score += 0.15;
+                    reasons.Add("HasDimension");
+                }
+
+                if (rel.RelativePosition == ViewRelativePosition.Below)
+                {
+                    score += 0.15;
+                    reasons.Add("BelowBonus");
+                }
+
+                if (rel.RelativePosition == ViewRelativePosition.Above)
+                {
+                    score += 0.05;
+                    reasons.Add("AboveBonus");
+                }
+
+                var projectionRole = rel.RelativePosition.ToString();
 
                 if (score > bestScore)
                 {
                     bestScore = score;
-                    bestReason = $"BestStrong={strong.IslandId}, Score={score}, {string.Join("/", reasons)}";
+                    bestReason =
+                        $"BestStrong={strong.IslandId}, Score={score:0.##}, Kind={rel.RelationKind}, Pos={rel.RelativePosition}, {string.Join("/", reasons)}";
+                    bestProjectionRole = projectionRole;
+                    bestSourceIslandId = strong.IslandId;
+                    bestProjectionPosition = rel.RelativePosition.ToString();
                 }
             }
 
-            candidate.Score = Math.Max(0, bestScore);
+            if (bestScore == double.MinValue)
+            {
+                bestScore = 0.0;
+                bestReason = "No promotable relation";
+            }
 
-            if (bestScore >= _options.MinPromotionScore)
+            candidate.Score = (int)Math.Round(Math.Max(0.0, bestScore) * 100.0);
+            candidate.BestProjectionScore = Math.Max(0.0, bestScore);
+            candidate.BestProjectionSourceIslandId = bestSourceIslandId;
+            candidate.BestProjectionPosition = bestProjectionPosition;
+
+            if (bestScore >= 0.55)
             {
                 candidate.FinalRole = ViewIslandSemanticRole.GeometryView;
+                candidate.ProjectionRole = bestProjectionRole;
+                candidate.ProjectionReason = bestReason;
                 AppendFinalReason(candidate, $"Promoted: {bestReason}");
             }
             else
             {
+                candidate.ProjectionRole = bestProjectionRole;
+                candidate.ProjectionReason = bestReason;
                 AppendFinalReason(candidate, $"Kept: {bestReason}");
             }
         }
