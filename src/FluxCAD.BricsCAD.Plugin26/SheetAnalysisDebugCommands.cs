@@ -35,6 +35,15 @@ namespace FluxCAD.BricsCAD.Plugin26
             RawAllGeometrySeeds
         }
 
+        private enum ViewIntentSemantic
+        {
+            Unknown = 0,
+            LeftViewingCandidate = 1,
+            RightViewingCandidate = 2,
+            UpperViewingCandidate = 3,
+            LowerViewingCandidate = 4
+        }
+
         private sealed class SemanticIslandPipelineResult
         {
             public IReadOnlyList<SheetEntity> Entities { get; init; } = Array.Empty<SheetEntity>();
@@ -79,6 +88,9 @@ namespace FluxCAD.BricsCAD.Plugin26
             public AnchorRelativePosition Position { get; init; }
             public double Score { get; init; }
             public string Reason { get; init; } = string.Empty;
+
+            public ProjectionDirection? SiblingDirection { get; init; }
+            public ViewIntentSemantic IntentSemantic { get; init; } = ViewIntentSemantic.Unknown;
         }
 
         [CommandMethod("FLUX_DEBUG_VIEW_GRAPH")]
@@ -239,7 +251,240 @@ namespace FluxCAD.BricsCAD.Plugin26
             }
         }
 
-        private static string BuildAnchorRelationLabel(AnchorDisplayRelation rel)
+
+        private static ProjectionDirection ResolveTargetRelativeDirection(
+    ViewCluster source,
+    ViewCluster target)
+        {
+            if (source == null || target == null)
+                return ProjectionDirection.Overlapping;
+
+            var dx = target.Center.X - source.Center.X;
+            var dy = target.Center.Y - source.Center.Y;
+
+            if (Math.Abs(dx) >= Math.Abs(dy))
+            {
+                return dx < 0
+                    ? ProjectionDirection.LeftOf
+                    : ProjectionDirection.RightOf;
+            }
+
+            return dy < 0
+                ? ProjectionDirection.Below
+                : ProjectionDirection.Above;
+        }
+
+        private static ViewIntentSemantic ResolveViewIntentSemantic(
+    AnchorRelativePosition baseAnchorGroup,
+    ProjectionDirection siblingDirection)
+        {
+            return baseAnchorGroup switch
+            {
+                // Anchor 위/아래 그룹 안에서 좌우 배치는 측면 의도일 가능성이 큼
+                AnchorRelativePosition.Above when siblingDirection == ProjectionDirection.LeftOf
+                    => ViewIntentSemantic.LeftViewingCandidate,
+
+                AnchorRelativePosition.Above when siblingDirection == ProjectionDirection.RightOf
+                    => ViewIntentSemantic.RightViewingCandidate,
+
+                AnchorRelativePosition.Below when siblingDirection == ProjectionDirection.LeftOf
+                    => ViewIntentSemantic.LeftViewingCandidate,
+
+                AnchorRelativePosition.Below when siblingDirection == ProjectionDirection.RightOf
+                    => ViewIntentSemantic.RightViewingCandidate,
+
+                // Anchor 좌/우 그룹 안에서 상하 배치는 상/하 방향 의도일 가능성
+                AnchorRelativePosition.Left when siblingDirection == ProjectionDirection.Above
+                    => ViewIntentSemantic.UpperViewingCandidate,
+
+                AnchorRelativePosition.Left when siblingDirection == ProjectionDirection.Below
+                    => ViewIntentSemantic.LowerViewingCandidate,
+
+                AnchorRelativePosition.Right when siblingDirection == ProjectionDirection.Above
+                    => ViewIntentSemantic.UpperViewingCandidate,
+
+                AnchorRelativePosition.Right when siblingDirection == ProjectionDirection.Below
+                    => ViewIntentSemantic.LowerViewingCandidate,
+
+                _ => ViewIntentSemantic.Unknown
+            };
+        }
+
+        private static List<AnchorDisplayRelation> BuildPrimaryAnchorDisplayRelations(
+            ViewGraph graph,
+            RelativePositionMap map)
+        {
+            var result = new List<AnchorDisplayRelation>();
+            var anchorId = graph.Anchor.Id;
+
+            foreach (var kv in map.Groups)
+            {
+                foreach (var node in kv.Value)
+                {
+                    if (node == null)
+                        continue;
+
+                    if (!IsDirectOrReverseReason(node.Reason))
+                        continue;
+
+                    result.Add(new AnchorDisplayRelation
+                    {
+                        SourceViewId = anchorId,
+                        TargetViewId = node.ViewId,
+                        Position = kv.Key,
+                        Score = node.Score,
+                        Reason = node.Reason
+                    });
+                }
+            }
+
+            return result;
+        }
+
+        private static List<AnchorDisplayRelation> BuildSecondaryAnchorDisplayRelations(
+            ViewGraph graph,
+            RelativePositionMap map)
+        {
+            var result = new List<AnchorDisplayRelation>();
+
+            foreach (var kv in map.Groups)
+            {
+                foreach (var node in kv.Value)
+                {
+                    if (node == null)
+                        continue;
+
+                    if (!IsIndirectReason(node.Reason))
+                        continue;
+
+                    if (!TryParseIndirectVia(node.Reason, out var viaId))
+                        continue;
+
+                    var siblingDir = TryParseProjectionDirection(node.Reason, "sibling");
+                    var intent = TryParseViewIntentSemantic(node.Reason, "intent");
+
+                    result.Add(new AnchorDisplayRelation
+                    {
+                        SourceViewId = viaId,
+                        TargetViewId = node.ViewId,
+                        Position = kv.Key,
+                        Score = node.Score,
+                        Reason = node.Reason ?? string.Empty,
+                        SiblingDirection = siblingDir,
+                        IntentSemantic = intent
+                    });
+                }
+            }
+
+            return result;
+        }
+
+        private static ProjectionDirection? TryParseProjectionDirection(string? reason, string key)
+        {
+            var value = TryParseReasonValue(reason, key);
+            if (string.IsNullOrWhiteSpace(value))
+                return null;
+
+            if (Enum.TryParse<ProjectionDirection>(value, ignoreCase: true, out var parsed))
+                return parsed;
+
+            return null;
+        }
+
+        private static ViewIntentSemantic TryParseViewIntentSemantic(string? reason, string key)
+        {
+            var value = TryParseReasonValue(reason, key);
+            if (string.IsNullOrWhiteSpace(value))
+                return ViewIntentSemantic.Unknown;
+
+            if (Enum.TryParse<ViewIntentSemantic>(value, ignoreCase: true, out var parsed))
+                return parsed;
+
+            return ViewIntentSemantic.Unknown;
+        }
+
+        private static bool IsDirectOrReverseReason(string? reason)
+        {
+            if (string.IsNullOrWhiteSpace(reason))
+                return false;
+
+            return reason.StartsWith("direct", StringComparison.OrdinalIgnoreCase)
+                || reason.StartsWith("reverse", StringComparison.OrdinalIgnoreCase);
+        }
+
+        private static bool IsIndirectReason(string? reason)
+        {
+            if (string.IsNullOrWhiteSpace(reason))
+                return false;
+
+            return reason.StartsWith("indirect|", StringComparison.OrdinalIgnoreCase);
+        }
+
+        private static bool TryParseIndirectVia(string reason, out int viaId)
+        {
+            viaId = -1;
+
+            if (string.IsNullOrWhiteSpace(reason))
+                return false;
+
+            var parts = reason.Split('|');
+            foreach (var part in parts)
+            {
+                if (!part.StartsWith("via=", StringComparison.OrdinalIgnoreCase))
+                    continue;
+
+                var value = part.Substring(4);
+                return int.TryParse(value, out viaId);
+            }
+
+            return false;
+        }
+
+        private static string BuildViewGraphNodeLabel(
+    ViewCluster node,
+    ViewGraph graph,
+    RelativePositionMap map,
+    IReadOnlyDictionary<int, ViewCandidate> candidateMap)
+        {
+            candidateMap.TryGetValue(node.Id, out var c);
+
+            if (node.Id == graph.Anchor.Id)
+                return $"Anchor:{node.Id}";
+
+            var pos = FindAnchorRelativePosition(map, node.Id);
+            var posText = ToAnchorPositionText(pos);
+
+            var relNode = FindAnchorRelativeNode(map, node.Id);
+            var suffix = "";
+
+            if (relNode != null && IsIndirectReason(relNode.Reason) && TryParseIndirectVia(relNode.Reason, out var viaId))
+                suffix = $" via:{viaId}";
+
+            if (c != null)
+            {
+                return
+                    $"{posText}:{node.Id}{suffix} " +
+                    $"Primary={(c.IsPrimaryView ? "Y" : "N")} " +
+                    $"Representative={(c.IsRepresentativePrimaryView ? "Y" : "N")}";
+            }
+
+            return $"{posText}:{node.Id}{suffix}";
+        }
+
+        private static AnchorRelativeNode? FindAnchorRelativeNode(RelativePositionMap map, int viewId)
+        {
+            foreach (var kv in map.Groups)
+            {
+                var found = kv.Value.FirstOrDefault(x => x.ViewId == viewId);
+                if (found != null)
+                    return found;
+            }
+
+            return null;
+        }
+
+        /*
+        private static string BuildAnchorRelationLabel_old(AnchorDisplayRelation rel)
         {
             var posText = ToAnchorPositionText(rel.Position);
             return $"{posText} ({rel.Score:0.00})";
@@ -258,6 +503,7 @@ namespace FluxCAD.BricsCAD.Plugin26
 
             return $"{dir} {rel.Score:0.00}";
         }
+        */
 
         private static short ResolveAnchorRelationColor(
     AnchorRelativePosition position,
@@ -382,6 +628,239 @@ namespace FluxCAD.BricsCAD.Plugin26
         }
 
         private static RelativePositionMap BuildRelativePositionMap(
+    ViewGraph graph,
+    double minScore)
+        {
+            if (graph == null)
+                throw new ArgumentNullException(nameof(graph));
+
+            var groups = new Dictionary<AnchorRelativePosition, List<AnchorRelativeNode>>
+            {
+                [AnchorRelativePosition.Left] = new List<AnchorRelativeNode>(),
+                [AnchorRelativePosition.Right] = new List<AnchorRelativeNode>(),
+                [AnchorRelativePosition.Above] = new List<AnchorRelativeNode>(),
+                [AnchorRelativePosition.Below] = new List<AnchorRelativeNode>()
+            };
+
+            var anchorId = graph.Anchor.Id;
+            var assigned = new HashSet<int> { anchorId };
+
+            // ------------------------------------------------------------
+            // PASS 1: anchor direct / reverse relation
+            // ------------------------------------------------------------
+            foreach (var node in graph.Nodes)
+            {
+                if (node == null || node.Id == anchorId)
+                    continue;
+
+                var rel = ResolveAgainstAnchor(graph, anchorId, node.Id, minScore);
+                if (rel == null || rel.Position == AnchorRelativePosition.Unknown)
+                    continue;
+
+                groups[rel.Position].Add(rel);
+                assigned.Add(node.Id);
+            }
+
+            // ------------------------------------------------------------
+            // PASS 2: unresolved node를 grouped node의 sibling으로 편입
+            // ------------------------------------------------------------
+            var unresolved = graph.Nodes
+                .Where(x => x != null)
+                .Where(x => x.Id != anchorId)
+                .Where(x => !assigned.Contains(x.Id))
+                .ToList();
+
+            bool changed;
+            do
+            {
+                changed = false;
+
+                foreach (var node in unresolved.ToList())
+                {
+                    var indirect = ResolveIndirectAgainstAnchorGroups(
+                        graph,
+                        groups,
+                        anchorId,
+                        node.Id,
+                        minScore);
+
+                    if (indirect == null || indirect.Position == AnchorRelativePosition.Unknown)
+                        continue;
+
+                    groups[indirect.Position].Add(indirect);
+                    assigned.Add(node.Id);
+                    unresolved.Remove(node);
+                    changed = true;
+                }
+            }
+            while (changed);
+
+            var finalized = groups.ToDictionary(
+                kv => kv.Key,
+                kv => (IReadOnlyList<AnchorRelativeNode>)kv.Value
+                    .OrderByDescending(x => x.Score)
+                    .ThenBy(x => x.ViewId)
+                    .ToList());
+
+            return new RelativePositionMap
+            {
+                AnchorViewId = anchorId,
+                Groups = finalized
+            };
+        }
+
+
+        private static AnchorRelativeNode? ResolveIndirectAgainstAnchorGroups(
+    ViewGraph graph,
+    IReadOnlyDictionary<AnchorRelativePosition, List<AnchorRelativeNode>> groups,
+    int anchorId,
+    int targetId,
+    double minScore)
+        {
+            AnchorRelativeNode? best = null;
+            double bestScore = double.MinValue;
+
+            var targetNode = graph.FindNode(targetId);
+            if (targetNode == null)
+                return null;
+
+            foreach (var kv in groups)
+            {
+                var basePos = kv.Key;
+                var members = kv.Value;
+
+                if (members == null || members.Count == 0)
+                    continue;
+
+                foreach (var member in members)
+                {
+                    var viaNode = graph.FindNode(member.ViewId);
+                    if (viaNode == null)
+                        continue;
+
+                    var relation = FindBestRelationBetweenViews(
+                        graph,
+                        member.ViewId,
+                        targetId,
+                        minScore);
+
+                    if (relation == null)
+                        continue;
+
+                    // 중요: via -> target 기준으로 target의 상대 방향을 직접 계산
+                    var siblingDirection = ResolveTargetRelativeDirection(viaNode, targetNode);
+
+                    if (!IsSiblingCompatibleWithAnchorGroup(basePos, siblingDirection))
+                        continue;
+
+                    var semanticIntent = ResolveViewIntentSemantic(basePos, siblingDirection);
+
+                    // direct보다 약간 낮게
+                    var score = relation.Score * 0.90;
+
+                    if (score <= bestScore)
+                        continue;
+
+                    bestScore = score;
+
+                    best = new AnchorRelativeNode
+                    {
+                        ViewId = targetId,
+                        Position = basePos,
+                        Score = score,
+                        Reason =
+                            $"indirect|via={member.ViewId}|base={basePos}|sibling={siblingDirection}|intent={semanticIntent}|raw={relation.Score:0.000}"
+                    };
+                }
+            }
+
+            return best;
+        }
+
+        private static ViewRelation? FindBestRelationBetweenViews(
+    ViewGraph graph,
+    int aId,
+    int bId,
+    double minScore)
+        {
+            if (graph == null)
+                return null;
+
+            var ab = graph.GetOutgoing(aId, minScore)
+                .FirstOrDefault(x => x.TargetViewId == bId);
+
+            var ba = graph.GetOutgoing(bId, minScore)
+                .FirstOrDefault(x => x.TargetViewId == aId);
+
+            if (ab == null)
+                return ba;
+
+            if (ba == null)
+                return ab;
+
+            return ab.Score >= ba.Score ? ab : ba;
+        }
+
+        private static ProjectionDirection ResolveSiblingDirection(
+    int targetId,
+    int memberId,
+    ViewRelation relation)
+        {
+            if (relation == null)
+                return ProjectionDirection.Overlapping;
+
+            // relation이 target -> member 인 경우
+            if (relation.SourceViewId == targetId && relation.TargetViewId == memberId)
+                return relation.Direction;
+
+            // relation이 member -> target 인 경우 반전
+            if (relation.SourceViewId == memberId && relation.TargetViewId == targetId)
+                return ReverseProjectionDirection(relation.Direction);
+
+            return ProjectionDirection.Overlapping;
+        }
+
+        private static ProjectionDirection ReverseProjectionDirection(ProjectionDirection dir)
+        {
+            return dir switch
+            {
+                ProjectionDirection.LeftOf => ProjectionDirection.RightOf,
+                ProjectionDirection.RightOf => ProjectionDirection.LeftOf,
+                ProjectionDirection.Above => ProjectionDirection.Below,
+                ProjectionDirection.Below => ProjectionDirection.Above,
+                _ => ProjectionDirection.Overlapping
+            };
+        }
+
+        private static bool IsSiblingCompatibleWithAnchorGroup(
+    AnchorRelativePosition basePos,
+    ProjectionDirection siblingDirection)
+        {
+            return basePos switch
+            {
+                // Anchor 위/아래 그룹 안에서는 좌/우 sibling 허용
+                AnchorRelativePosition.Above =>
+                    siblingDirection == ProjectionDirection.LeftOf ||
+                    siblingDirection == ProjectionDirection.RightOf,
+
+                AnchorRelativePosition.Below =>
+                    siblingDirection == ProjectionDirection.LeftOf ||
+                    siblingDirection == ProjectionDirection.RightOf,
+
+                // Anchor 좌/우 그룹 안에서는 상/하 sibling 허용
+                AnchorRelativePosition.Left =>
+                    siblingDirection == ProjectionDirection.Above ||
+                    siblingDirection == ProjectionDirection.Below,
+
+                AnchorRelativePosition.Right =>
+                    siblingDirection == ProjectionDirection.Above ||
+                    siblingDirection == ProjectionDirection.Below,
+
+                _ => false
+            };
+        }
+
+        private static RelativePositionMap BuildRelativePositionMap_old(
     ViewGraph graph,
     double minScore)
         {
@@ -553,6 +1032,102 @@ namespace FluxCAD.BricsCAD.Plugin26
             }
 
             sb.AppendLine();
+            sb.AppendLine("Primary Anchor Relations:");
+
+            var primary = BuildPrimaryAnchorDisplayRelations(graph, map);
+            if (primary.Count == 0)
+            {
+                sb.AppendLine("- (none)");
+            }
+            else
+            {
+                foreach (var rel in primary.OrderByDescending(x => x.Score).ThenBy(x => x.TargetViewId))
+                {
+                    sb.AppendLine(
+                        $"- {rel.SourceViewId} -> {rel.TargetViewId} : " +
+                        $"{ToAnchorPositionText(rel.Position)}, score={rel.Score:0.000}, reason={rel.Reason}");
+                }
+            }
+
+            // Secondary Group Relations 출력 부분만 교체
+            sb.AppendLine();
+            sb.AppendLine("Secondary Group Relations:");
+
+            var secondary = BuildSecondaryAnchorDisplayRelations(graph, map);
+            if (secondary.Count == 0)
+            {
+                sb.AppendLine("- (none)");
+            }
+            else
+            {
+                foreach (var rel in secondary.OrderByDescending(x => x.Score).ThenBy(x => x.TargetViewId))
+                {
+                    var sibling = rel.SiblingDirection?.ToString() ?? "Unknown";
+                    var intent = rel.IntentSemantic.ToString();
+
+                    sb.AppendLine(
+                        $"- {rel.SourceViewId} -> {rel.TargetViewId} : " +
+                        $"sibling={sibling}, intent={intent}, score={rel.Score:0.000}, reason={rel.Reason}");
+                }
+            }
+
+            sb.AppendLine();
+            sb.AppendLine("Unresolved Nodes:");
+
+            var unresolved = graph.Nodes
+                .Where(x => x.Id != graph.Anchor.Id)
+                .Where(x => FindAnchorRelativePosition(map, x.Id) == AnchorRelativePosition.Unknown)
+                .OrderBy(x => x.Id)
+                .ToList();
+
+            if (unresolved.Count == 0)
+            {
+                sb.AppendLine("- (none)");
+            }
+            else
+            {
+                foreach (var node in unresolved)
+                {
+                    sb.AppendLine(
+                        $"- View {node.Id}, Area={node.Area:0.###}, Size=({node.Width:0.##}x{node.Height:0.##})");
+                }
+            }
+
+            return sb.ToString();
+        }
+
+        private static string FormatViewGraph_old2(
+    ViewGraph graph,
+    ViewCandidate anchorCandidate,
+    RelativePositionMap map)
+        {
+            var sb = new StringBuilder();
+
+            sb.AppendLine("[ViewGraph]");
+            sb.AppendLine(
+                $"Anchor = {graph.Anchor.Id} " +
+                $"(Primary={anchorCandidate.IsPrimaryView}, " +
+                $"Representative={anchorCandidate.IsRepresentativePrimaryView}, " +
+                $"PrimaryScore={anchorCandidate.PrimaryScore:0.###}, " +
+                $"RepresentativeScore={anchorCandidate.RepresentativePrimaryScore:0.###})");
+            sb.AppendLine();
+
+            sb.AppendLine("Nodes:");
+            foreach (var node in graph.Nodes.OrderBy(x => x.Id))
+            {
+                var pos = node.Id == graph.Anchor.Id
+                    ? "Anchor"
+                    : ToAnchorPositionText(FindAnchorRelativePosition(map, node.Id));
+
+                sb.AppendLine(
+                    $"- View {node.Id}, " +
+                    $"Position={pos}, " +
+                    $"Area={node.Area:0.###}, " +
+                    $"Size=({node.Width:0.##}x{node.Height:0.##}), " +
+                    $"Bounds=({node.Bounds.MinX:0.##},{node.Bounds.MinY:0.##})-({node.Bounds.MaxX:0.##},{node.Bounds.MaxY:0.##})");
+            }
+
+            sb.AppendLine();
             sb.AppendLine("Anchor Relations:");
 
             var anchorRelations = BuildAnchorDisplayRelations(graph, map)
@@ -655,6 +1230,39 @@ namespace FluxCAD.BricsCAD.Plugin26
             return sb.ToString();
         }
 
+        private static string BuildSecondaryRelationLabel(string? reason, double score)
+        {
+            var sibling = TryParseReasonValue(reason, "sibling");
+            var intent = TryParseReasonValue(reason, "intent");
+
+            if (!string.IsNullOrWhiteSpace(intent) && intent != "Unknown")
+                return $"{intent} ({score:0.00})";
+
+            if (!string.IsNullOrWhiteSpace(sibling))
+                return $"{sibling} ({score:0.00})";
+
+            return $"Sibling ({score:0.00})";
+        }
+
+        private static string? TryParseReasonValue(string reason, string key)
+        {
+            if (string.IsNullOrWhiteSpace(reason) || string.IsNullOrWhiteSpace(key))
+                return null;
+
+            var parts = reason.Split('|');
+            foreach (var part in parts)
+            {
+                var prefix = key + "=";
+                if (!part.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
+                    continue;
+
+                return part.Substring(prefix.Length);
+            }
+
+            return null;
+        }
+
+
         private static void DrawViewGraphOverlays(
     Database db,
     Transaction tr,
@@ -683,7 +1291,9 @@ namespace FluxCAD.BricsCAD.Plugin26
                 .ToDictionary(x => x.IslandId)
                 ?? new Dictionary<int, ViewCandidate>();
 
+            // ------------------------------------------------------------
             // 1) node box + node label
+            // ------------------------------------------------------------
             foreach (var node in graph.Nodes)
             {
                 short colorIndex = ResolveViewGraphColor(node, graph, map);
@@ -693,6 +1303,7 @@ namespace FluxCAD.BricsCAD.Plugin26
                     continue;
 
                 var label = BuildViewGraphNodeLabel(node, graph, map, candidateMap);
+
                 DrawDebugText(
                     db,
                     tr,
@@ -706,15 +1317,16 @@ namespace FluxCAD.BricsCAD.Plugin26
             if (!drawRelations)
                 return;
 
-            // 2) anchor 기준 relation만 그림
             var anchor = graph.Anchor;
             if (anchor == null)
                 return;
 
-            var anchorRelations = BuildAnchorDisplayRelations(graph, map);
+            // ------------------------------------------------------------
+            // 2) primary relation: anchor direct / reverse 기반
+            // ------------------------------------------------------------
+            var primaryRelations = BuildPrimaryAnchorDisplayRelations(graph, map);
 
-            // 방향별 lane 분리
-            var laneCounters = new Dictionary<AnchorRelativePosition, int>
+            var primaryLaneCounters = new Dictionary<AnchorRelativePosition, int>
             {
                 [AnchorRelativePosition.Left] = 0,
                 [AnchorRelativePosition.Right] = 0,
@@ -722,12 +1334,14 @@ namespace FluxCAD.BricsCAD.Plugin26
                 [AnchorRelativePosition.Below] = 0
             };
 
-            foreach (var rel in anchorRelations
+            foreach (var rel in primaryRelations
                 .OrderByDescending(x => x.Score)
                 .ThenBy(x => x.TargetViewId))
             {
+                var source = graph.FindNode(rel.SourceViewId);
                 var target = graph.FindNode(rel.TargetViewId);
-                if (target == null)
+
+                if (source == null || target == null)
                     continue;
 
                 var colorIndex = ResolveAnchorRelationColor(rel.Position, rel.Score);
@@ -736,15 +1350,15 @@ namespace FluxCAD.BricsCAD.Plugin26
                     db,
                     tr,
                     layerName,
-                    anchor.Center,
+                    source.Center,
                     target.Center,
                     colorIndex);
 
-                var laneIndex = laneCounters[rel.Position];
-                laneCounters[rel.Position] = laneIndex + 1;
+                var laneIndex = primaryLaneCounters[rel.Position];
+                primaryLaneCounters[rel.Position] = laneIndex + 1;
 
                 var labelPos = ComputeRelationLabelPosition(
-                    anchor.Center,
+                    source.Center,
                     target.Center,
                     laneIndex,
                     baseOffset: 18.0,
@@ -759,7 +1373,67 @@ namespace FluxCAD.BricsCAD.Plugin26
                     colorIndex,
                     7.0);
             }
+
+
+            // ------------------------------------------------------------
+            // 3) secondary relation: indirect / sibling 기반
+            //    예: Anchor 아래 대표 뷰의 좌측 sibling
+            // ------------------------------------------------------------
+            var secondaryRelations = BuildSecondaryAnchorDisplayRelations(graph, map);
+
+            foreach (var rel in secondaryRelations
+                .OrderByDescending(x => x.Score)
+                .ThenBy(x => x.SourceViewId)
+                .ThenBy(x => x.TargetViewId))
+            {
+                var source = graph.FindNode(rel.SourceViewId);
+                var target = graph.FindNode(rel.TargetViewId);
+
+                if (source == null || target == null)
+                    continue;
+
+                const short secondaryColor = 8; // gray
+
+                DrawDebugLine(
+                    db,
+                    tr,
+                    layerName,
+                    source.Center,
+                    target.Center,
+                    secondaryColor);
+
+                var labelPos = ComputeRelationLabelPosition(
+                    source.Center,
+                    target.Center,
+                    laneIndex: 1,
+                    baseOffset: 14.0,
+                    laneSpacing: 10.0);
+
+                DrawDebugText(
+                    db,
+                    tr,
+                    layerName,
+                    labelPos,
+                    BuildSecondaryRelationLabel(rel.Reason, rel.Score),
+                    secondaryColor,
+                    6.5);
+            }
         }
+
+        private static string BuildAnchorRelationLabel(AnchorDisplayRelation rel)
+        {
+            var dir = rel.Position switch
+            {
+                AnchorRelativePosition.Left => "L",
+                AnchorRelativePosition.Right => "R",
+                AnchorRelativePosition.Above => "A",
+                AnchorRelativePosition.Below => "B",
+                _ => "?"
+            };
+
+            return $"{dir} {rel.Score:0.00}";
+        }
+
 
         private static void DrawViewGraphOverlays_old(
     Database db,
@@ -978,7 +1652,7 @@ namespace FluxCAD.BricsCAD.Plugin26
         }
 
 
-        private static string BuildViewGraphNodeLabel(
+        private static string BuildViewGraphNodeLabel_old2(
     ViewCluster node,
     ViewGraph graph,
     RelativePositionMap map,
