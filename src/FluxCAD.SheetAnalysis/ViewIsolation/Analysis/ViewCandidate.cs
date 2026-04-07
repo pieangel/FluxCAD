@@ -79,6 +79,12 @@ namespace FluxCAD.SheetAnalysis.ViewIsolation.Analysis
         public int? BestProjectionSourceIslandId { get; set; }
         public string BestProjectionPosition { get; set; } = string.Empty;
 
+        public bool IsRepresentativePrimaryView { get; set; }
+
+        public double RepresentativePrimaryScore { get; set; }
+
+        public string? RepresentativePrimaryReason { get; set; }
+
 
 
         public double AspectRatio

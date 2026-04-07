@@ -1,6 +1,7 @@
 ﻿using System;
 using System.Collections.Generic;
 using System.Linq;
+using System.Text;
 
 namespace FluxCAD.SheetAnalysis.ViewIsolation.Analysis
 {
@@ -80,6 +81,169 @@ namespace FluxCAD.SheetAnalysis.ViewIsolation.Analysis
 
             // 6) 마지막에 primary view 판정
             ResolvePrimaryViews(candidates);
+
+            ResolveRepresentativePrimaryView(candidates);
+        }
+
+        private static void ResolveRepresentativePrimaryView(IList<ViewCandidate> candidates)
+        {
+            if (candidates == null || candidates.Count == 0)
+                return;
+
+            foreach (var c in candidates)
+            {
+                c.IsRepresentativePrimaryView = false;
+                c.RepresentativePrimaryScore = 0.0;
+                c.RepresentativePrimaryReason = null;
+            }
+
+            var primaryViews = candidates
+                .Where(x => x != null)
+                .Where(x => x.IsPrimaryView)
+                .Where(x => x.FinalRole == ViewIslandSemanticRole.GeometryView)
+                .ToList();
+
+            if (primaryViews.Count == 0)
+                return;
+
+            var maxDim = Math.Max(primaryViews.Max(x => x.DimensionCount), 1);
+            var maxArea = Math.Max(primaryViews.Max(x => x.Area), 1.0);
+            var maxMajor = Math.Max(primaryViews.Max(x => Math.Max(x.Width, x.Height)), 1.0);
+
+            foreach (var c in primaryViews)
+            {
+                var score = 0.0;
+                var reasons = new List<string>();
+
+                // 1) GeometryView 우선
+                if (c.FinalRole == ViewIslandSemanticRole.GeometryView)
+                {
+                    score += 6.0;
+                    reasons.Add("GeometryView(+6)");
+                }
+
+                // 2) 치수 강도
+                var dimNorm = c.DimensionCount / (double)maxDim;
+                var dimScore = dimNorm * 8.0;
+                score += dimScore;
+                reasons.Add($"DimNorm={dimNorm:0.###}(+{dimScore:0.###})");
+
+                // 3) 면적 비중
+                var areaNorm = c.Area / maxArea;
+                var areaScore = areaNorm * 4.0;
+                score += areaScore;
+                reasons.Add($"AreaNorm={areaNorm:0.###}(+{areaScore:0.###})");
+
+                // 4) major span
+                var major = Math.Max(c.Width, c.Height);
+                var majorNorm = major / maxMajor;
+                var majorScore = majorNorm * 2.0;
+                score += majorScore;
+                reasons.Add($"MajorNorm={majorNorm:0.###}(+{majorScore:0.###})");
+
+                // 5) 다른 primary view들의 projection source가 되는 정도
+                var sourceCount = primaryViews.Count(x => x.BestProjectionSourceIslandId == c.IslandId);
+                var sourceBonus = sourceCount * 2.5;
+                score += sourceBonus;
+                reasons.Add($"ProjectionSourceCount={sourceCount}(+{sourceBonus:0.###})");
+
+                // 6) 중심성
+                var centrality = Math.Max(0.0, Math.Min(1.0, EstimateRepresentativeCentrality(c, primaryViews)));
+                var centralityScore = centrality * 1.5;
+                score += centralityScore;
+                reasons.Add($"Centrality={centrality:0.###}(+{centralityScore:0.###})");
+
+                c.RepresentativePrimaryScore = score;
+                c.RepresentativePrimaryReason = string.Join(", ", reasons);
+            }
+
+            var representative = primaryViews
+                .OrderByDescending(x => x.RepresentativePrimaryScore)
+                .ThenByDescending(x => x.DimensionCount)
+                .ThenByDescending(x => x.Area)
+                .ThenBy(x => x.IslandId)
+                .FirstOrDefault();
+
+            if (representative != null)
+            {
+                representative.IsRepresentativePrimaryView = true;
+                representative.RepresentativePrimaryReason =
+                    (representative.RepresentativePrimaryReason ?? string.Empty) + ", SelectedRepresentative";
+            }
+        }
+
+        private static double EstimateHiddenHeavyPenalty(ViewCandidate candidate)
+        {
+            if (candidate == null)
+                return 0.0;
+
+            var reason = candidate.FinalReason ?? string.Empty;
+            var hiddenCount = TryExtractMetricFromReason(reason, "Hidden=");
+
+            if (hiddenCount <= 0)
+                return 0.0;
+
+            // 너무 강하게 벌점 주지 말고, 기준 뷰 후보성만 약간 낮춘다.
+            return Math.Min(hiddenCount * 0.35, 3.0);
+        }
+
+
+        private static int TryExtractMetricFromReason(string reason, string key)
+        {
+            if (string.IsNullOrWhiteSpace(reason) || string.IsNullOrWhiteSpace(key))
+                return 0;
+
+            var idx = reason.IndexOf(key, StringComparison.OrdinalIgnoreCase);
+            if (idx < 0)
+                return 0;
+
+            idx += key.Length;
+
+            var sb = new StringBuilder();
+            while (idx < reason.Length)
+            {
+                var ch = reason[idx];
+                if (!char.IsDigit(ch))
+                    break;
+
+                sb.Append(ch);
+                idx++;
+            }
+
+            if (sb.Length == 0)
+                return 0;
+
+            if (int.TryParse(sb.ToString(), out var value))
+                return value;
+
+            return 0;
+        }
+
+        private static double EstimateRepresentativeCentrality(
+    ViewCandidate candidate,
+    IReadOnlyList<ViewCandidate> primaryViews)
+        {
+            if (candidate == null || primaryViews == null || primaryViews.Count == 0)
+                return 0.0;
+
+            var minX = primaryViews.Min(x => x.Bounds.MinX);
+            var minY = primaryViews.Min(x => x.Bounds.MinY);
+            var maxX = primaryViews.Max(x => x.Bounds.MaxX);
+            var maxY = primaryViews.Max(x => x.Bounds.MaxY);
+
+            var centerX = (minX + maxX) * 0.5;
+            var centerY = (minY + maxY) * 0.5;
+
+            var dx = Math.Abs(candidate.Center.X - centerX);
+            var dy = Math.Abs(candidate.Center.Y - centerY);
+
+            var spanX = Math.Max(maxX - minX, 1e-9);
+            var spanY = Math.Max(maxY - minY, 1e-9);
+
+            var nx = 1.0 - Math.Min(1.0, dx / spanX);
+            var ny = 1.0 - Math.Min(1.0, dy / spanY);
+
+            return (nx + ny) * 0.5;
         }
 
         private static void ResolvePrimaryViews(IEnumerable<ViewCandidate> candidates)
