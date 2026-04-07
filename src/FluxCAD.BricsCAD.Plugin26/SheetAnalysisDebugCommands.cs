@@ -397,40 +397,42 @@ namespace FluxCAD.BricsCAD.Plugin26
             if (fullEntities == null)
                 throw new ArgumentNullException(nameof(fullEntities));
 
+            var sheetBounds = Bounds2DHelper.FromEntities(fullEntities);
+            var semanticPool = BuildSemanticEvidencePool(fullEntities, sheetBounds, ed);
+
             foreach (var island in islands)
             {
                 var dynamicTolerance = Math.Max(
                     3.0,
                     Math.Min(island.Bounds.Width, island.Bounds.Height) * 0.5);
 
-                var semanticEntities = CollectIslandSemanticEntities(
-                    fullEntities,
+                var semanticEntities = CollectIslandSemanticEntitiesFromPool(
+                    semanticPool,
                     island,
                     tolerance: dynamicTolerance);
 
                 var role = DetermineIslandSemanticRoleFromContext(island, semanticEntities);
                 island.SemanticRole = role;
 
-                var centerCount = semanticEntities.Count(x => x.IsCenterLine);
-                var hiddenCount = semanticEntities.Count(x => x.IsHiddenLine);
+                var centerCount = semanticEntities.Count(x => x.IsCenterLine || LooksLikeCenterEvidence(x));
+                var hiddenCount = semanticEntities.Count(x => x.IsHiddenLine || LooksLikeHiddenEvidence(x));
                 var dimCount = semanticEntities.Count(x => x.IsDimensionLike);
                 var tableCount = semanticEntities.Count(x => x.IsTableLikeLayer);
                 var titleCount = semanticEntities.Count(x => x.IsTitleLikeLayer);
                 var geomCount = semanticEntities.Count(x => x.IsGeometryLike && !x.IsTextLike && !x.IsDimensionLike);
                 var textCount = semanticEntities.Count(x => x.IsTextLike);
-                var blockCount = semanticEntities.Count(x => x.IsBlockReference);
 
                 island.SemanticReason =
                     $"Reassigned Role={role}, Geom={geomCount}, Text={textCount}, Dim={dimCount}, " +
                     $"Center={centerCount}, Hidden={hiddenCount}, Table={tableCount}, Title={titleCount}, " +
-                    $"Block={blockCount}, Tol={dynamicTolerance:0.##}";
+                    $"Tol={dynamicTolerance:0.##}";
 
                 ed.WriteMessage(
                     $"\n[FluxCAD] IslandRoleReassign I:{island.Id}, " +
                     $"Role={role}, Entities={semanticEntities.Count}, " +
                     $"Geom={geomCount}, Text={textCount}, Dim={dimCount}, " +
                     $"Center={centerCount}, Hidden={hiddenCount}, " +
-                    $"Table={tableCount}, Title={titleCount}, Block={blockCount}, Tol={dynamicTolerance:0.##}");
+                    $"Table={tableCount}, Title={titleCount}, Tol={dynamicTolerance:0.##}");
             }
         }
 
@@ -523,19 +525,96 @@ namespace FluxCAD.BricsCAD.Plugin26
             if (island == null)
                 throw new ArgumentNullException(nameof(island));
 
+            var sheetBounds = Bounds2DHelper.FromEntities(
+                entities.Where(x => x != null && !Bounds2DHelper.IsEmpty(x.Bounds)).ToList());
+
             var islandBounds = Bounds2DHelper.Inflate(island.Bounds, tolerance);
 
             var result = entities
                 .Where(x => x != null)
                 .Where(x => x.IsVisible)
-                .Where(x => !Bounds2DHelper.IsEmpty(x.Bounds))
-                .Where(x => Bounds2DHelper.Intersects(islandBounds, x.Bounds, tolerance: 0))
-                .Where(x => !GhostEntityPolicy.IsIgnorableGhostEntity(x, islandBounds))
-                // 핵심: semantic evidence 수집에서는 block container를 기본 제외
-                .Where(x => !x.IsBlockReference)
-                .ToList();
+                .Where(x => !x.IsBlockReference) // block container 제외 유지
+                .Select(CloneWithFallbackBounds)
+                .Where(x => x != null)
+                .Where(x => !Bounds2DHelper.IsEmpty(x!.Bounds))
+                .Where(x => Bounds2DHelper.Intersects(islandBounds, x!.Bounds, tolerance: 0))
+                .Where(x => !GhostEntityPolicy.IsIgnorableGhostEntity(x!, islandBounds))
+                .Where(x => !IsSemanticFrameLikeEntity(x!, sheetBounds))
+                .Where(x => !IsOversizedSemanticEntityForIsland(x!, island, tolerance))
+                .ToList()!;
 
             return result;
+        }
+
+        private static bool IsSemanticFrameLikeEntity(
+            SheetEntity entity,
+            Bounds2D sheetBounds,
+            double tolerance = 2.0)
+        {
+            if (entity == null || entity.Bounds.IsEmpty || sheetBounds.IsEmpty)
+                return false;
+
+            var eb = entity.Bounds;
+
+            var matchesSheet =
+                Math.Abs(eb.MinX - sheetBounds.MinX) <= tolerance &&
+                Math.Abs(eb.MinY - sheetBounds.MinY) <= tolerance &&
+                Math.Abs(eb.MaxX - sheetBounds.MaxX) <= tolerance &&
+                Math.Abs(eb.MaxY - sheetBounds.MaxY) <= tolerance;
+
+            if (matchesSheet)
+                return true;
+
+            var widthRatio = eb.Width / Math.Max(sheetBounds.Width, 1e-9);
+            var heightRatio = eb.Height / Math.Max(sheetBounds.Height, 1e-9);
+
+            // 거의 시트 전체를 차지하는 외곽선/배경성 엔티티 차단
+            if (widthRatio >= 0.92 && heightRatio >= 0.92)
+                return true;
+
+            return false;
+        }
+
+        private static bool IsOversizedSemanticEntityForIsland(
+            SheetEntity entity,
+            OccupancyHitIsland island,
+            double tolerance)
+        {
+            if (entity == null || island == null)
+                return false;
+
+            var eb = entity.Bounds;
+            var ib = island.Bounds;
+
+            if (eb.IsEmpty || ib.IsEmpty)
+                return false;
+
+            // island 자체를 감싸는 지나치게 큰 엔티티는 제외
+            var containsIsland =
+                eb.MinX <= ib.MinX + tolerance &&
+                eb.MinY <= ib.MinY + tolerance &&
+                eb.MaxX >= ib.MaxX - tolerance &&
+                eb.MaxY >= ib.MaxY - tolerance;
+
+            if (!containsIsland)
+                return false;
+
+            var widthRatio = eb.Width / Math.Max(ib.Width, 1e-9);
+            var heightRatio = eb.Height / Math.Max(ib.Height, 1e-9);
+            var areaRatio = eb.Area / Math.Max(ib.Area, 1e-9);
+
+            // 단, dimension/text는 의미 증거가 될 수 있으므로 너무 공격적으로 제거하지 않음
+            if (entity.IsDimensionLike || entity.IsTextLike)
+                return areaRatio >= 12.0;
+
+            // geometry 계열은 더 엄격하게 제거
+            if (entity.IsGeometryLike)
+            {
+                if (widthRatio >= 1.8 || heightRatio >= 1.8 || areaRatio >= 4.0)
+                    return true;
+            }
+
+            return false;
         }
 
 
@@ -2052,6 +2131,9 @@ namespace FluxCAD.BricsCAD.Plugin26
             if (semanticResults == null || semanticResults.Count == 0)
                 return rebuilt;
 
+            var sheetBounds = Bounds2DHelper.FromEntities(fullEntities);
+            var semanticPool = BuildSemanticEvidencePool(fullEntities, sheetBounds, ed);
+
             foreach (var result in semanticResults)
             {
                 if (result == null || result.Island == null)
@@ -2063,8 +2145,8 @@ namespace FluxCAD.BricsCAD.Plugin26
                     3.0,
                     Math.Min(island.Bounds.Width, island.Bounds.Height) * 0.5);
 
-                var semanticEntities = CollectIslandSemanticEntities(
-                    fullEntities,
+                var semanticEntities = CollectIslandSemanticEntitiesFromPool(
+                    semanticPool,
                     island,
                     tolerance: dynamicTolerance);
 
@@ -2072,8 +2154,8 @@ namespace FluxCAD.BricsCAD.Plugin26
                     island,
                     semanticEntities);
 
-                var centerCount = semanticEntities.Count(x => x.IsCenterLine);
-                var hiddenCount = semanticEntities.Count(x => x.IsHiddenLine);
+                var centerCount = semanticEntities.Count(x => x.IsCenterLine || LooksLikeCenterEvidence(x));
+                var hiddenCount = semanticEntities.Count(x => x.IsHiddenLine || LooksLikeHiddenEvidence(x));
                 var dimCount = semanticEntities.Count(x => x.IsDimensionLike);
                 var tableCount = semanticEntities.Count(x => x.IsTableLikeLayer);
                 var titleCount = semanticEntities.Count(x => x.IsTitleLikeLayer);
@@ -2105,24 +2187,162 @@ namespace FluxCAD.BricsCAD.Plugin26
                     $"Geom={geomCount}, Text={textCount}, Dim={dimCount}, " +
                     $"Center={centerCount}, Hidden={hiddenCount}, " +
                     $"Table={tableCount}, Title={titleCount}, Tol={dynamicTolerance:0.##}");
-
-                if (island.Id == 2 || island.Id == 3 || island.Id == 4)
-                {
-                    foreach (var x in semanticEntities)
-                    {
-                        ed.WriteMessage(
-                            $"\n  [SemanticEntity I:{island.Id}] " +
-                            $"Handle={x.Handle}, Kind={x.Kind}, Layer={x.Layer}, " +
-                            $"LT={x.LinetypeName}, EffLT={x.EffectiveLinetypeName}, " +
-                            $"Center={x.IsCenterLine}, Hidden={x.IsHiddenLine}, " +
-                            $"Bounds=({x.Bounds.MinX:0.##},{x.Bounds.MinY:0.##})-({x.Bounds.MaxX:0.##},{x.Bounds.MaxY:0.##})");
-                    }
-                }
             }
 
             return rebuilt;
         }
 
+        private static bool LooksLikeCenterEvidence(SheetEntity entity)
+        {
+            if (entity == null)
+                return false;
+
+            if (entity.IsCenterLine)
+                return true;
+
+            return IsHiddenOrCenterLinetype(entity.LinetypeName)
+                && NormalizeLinetypeName(entity.LinetypeName).Contains("CENTER");
+        }
+
+        private static bool LooksLikeHiddenEvidence(SheetEntity entity)
+        {
+            if (entity == null)
+                return false;
+
+            if (entity.IsHiddenLine)
+                return true;
+
+            var raw = NormalizeLinetypeName(entity.LinetypeName);
+            var eff = NormalizeLinetypeName(entity.EffectiveLinetypeName);
+            var layer = (entity.Layer ?? string.Empty).Trim().ToUpperInvariant();
+
+            return raw.Contains("HIDDEN")
+                || eff.Contains("HIDDEN")
+                || layer.Contains("HIDDEN")
+                || layer.Contains("은선")
+                || layer.Contains("숨은");
+        }
+
+
+        private static IReadOnlyList<SheetEntity> BuildSemanticEvidencePool(
+    IReadOnlyList<SheetEntity> fullEntities,
+    Bounds2D sheetBounds,
+    Bricscad.EditorInput.Editor ed)
+        {
+            if (fullEntities == null)
+                throw new ArgumentNullException(nameof(fullEntities));
+
+            var pool = fullEntities
+                .Where(x => x != null)
+                .Where(x => x.IsVisible)
+                .Where(x => !x.IsBlockReference)                 // container 제외
+                .Select(CloneWithFallbackBounds)                 // fallback bounds 적용
+                .Where(x => x != null)
+                .Where(x => !Bounds2DHelper.IsEmpty(x!.Bounds))
+                .Where(x => !GhostEntityPolicy.IsIgnorableGhostEntity(x!, sheetBounds))
+                .Where(x => IsSemanticEvidenceCandidate(x!, sheetBounds))
+                .ToList()!;
+
+            ed.WriteMessage($"\n[FluxCAD] SemanticEvidencePool total={pool.Count}");
+
+            var centerCount = pool.Count(x => x.IsCenterLine || IsHiddenOrCenterEntity(x));
+            var hiddenCount = pool.Count(x => x.IsHiddenLine || IsHiddenOrCenterEntity(x));
+            var geomCount = pool.Count(x => x.IsGeometryLike && !x.IsTextLike && !x.IsDimensionLike);
+            var textCount = pool.Count(x => x.IsTextLike);
+            var dimCount = pool.Count(x => x.IsDimensionLike);
+
+            ed.WriteMessage(
+                $"\n[FluxCAD] SemanticEvidencePool geom={geomCount}, text={textCount}, dim={dimCount}, " +
+                $"centerOrHiddenApprox={centerCount + hiddenCount}");
+
+            return pool;
+        }
+
+        private static bool IsSemanticEvidenceCandidate(
+            SheetEntity entity,
+            Bounds2D sheetBounds)
+        {
+            if (entity == null)
+                return false;
+
+            if (entity.Bounds.IsEmpty)
+                return false;
+
+            // giant frame / sheet boundary 제외
+            if (IsSheetFrameLikeEntity(entity, sheetBounds, tolerance: 2.0))
+                return false;
+
+            return true;
+        }
+
+        private static bool IsSheetFrameLikeEntity(
+            SheetEntity entity,
+            Bounds2D sheetBounds,
+            double tolerance)
+        {
+            if (entity == null || entity.Bounds.IsEmpty || sheetBounds.IsEmpty)
+                return false;
+
+            var eb = entity.Bounds;
+
+            var matchesSheet =
+                Math.Abs(eb.MinX - sheetBounds.MinX) <= tolerance &&
+                Math.Abs(eb.MinY - sheetBounds.MinY) <= tolerance &&
+                Math.Abs(eb.MaxX - sheetBounds.MaxX) <= tolerance &&
+                Math.Abs(eb.MaxY - sheetBounds.MaxY) <= tolerance;
+
+            if (matchesSheet)
+                return true;
+
+            var widthRatio = eb.Width / Math.Max(sheetBounds.Width, 1e-9);
+            var heightRatio = eb.Height / Math.Max(sheetBounds.Height, 1e-9);
+
+            return widthRatio >= 0.92 && heightRatio >= 0.92;
+        }
+
+
+        private static IReadOnlyList<SheetEntity> CollectIslandSemanticEntitiesFromPool(
+    IReadOnlyList<SheetEntity> semanticPool,
+    OccupancyHitIsland island,
+    double tolerance)
+        {
+            if (semanticPool == null)
+                throw new ArgumentNullException(nameof(semanticPool));
+            if (island == null)
+                throw new ArgumentNullException(nameof(island));
+
+            var islandBounds = Bounds2DHelper.Inflate(island.Bounds, tolerance);
+
+            var result = semanticPool
+                .Where(x => Bounds2DHelper.Intersects(islandBounds, x.Bounds, tolerance: 0))
+                .Where(x => !IsObviouslyOversizedForIsland(x, island, islandBounds))
+                .ToList();
+
+            return result;
+        }
+
+        private static bool IsObviouslyOversizedForIsland(
+            SheetEntity entity,
+            OccupancyHitIsland island,
+            Bounds2D islandBounds)
+        {
+            if (entity == null || entity.Bounds.IsEmpty || island == null)
+                return false;
+
+            var eb = entity.Bounds;
+            var ib = island.Bounds;
+
+            if (eb.Width > ib.Width * 1.8 || eb.Height > ib.Height * 1.8)
+            {
+                if (eb.MinX <= ib.MinX &&
+                    eb.MinY <= ib.MinY &&
+                    eb.MaxX >= ib.MaxX &&
+                    eb.MaxY >= ib.MaxY)
+                    return true;
+            }
+
+            return false;
+        }
 
         [CommandMethod("FLUX_DEBUG_VIEW_ISLAND_HIERARCHY")]
         public void FluxDebugViewIslandHierarchy()
