@@ -4,6 +4,138 @@ using System.Linq;
 
 namespace FluxCAD.SheetAnalysis.ViewProjection
 {
+    public enum AnchorRelativePosition
+    {
+        Unknown = 0,
+        Left,
+        Right,
+        Above,
+        Below
+    }
+
+    public sealed class AnchorRelativeNode
+    {
+        public int ViewId { get; init; }
+        public AnchorRelativePosition Position { get; init; }
+        public double Score { get; init; }
+        public string Reason { get; init; } = string.Empty;
+    }
+
+    public sealed class RelativePositionMap
+    {
+        public int AnchorViewId { get; init; }
+
+        public IReadOnlyDictionary<AnchorRelativePosition, IReadOnlyList<AnchorRelativeNode>> Groups
+        { get; init; }
+            = new Dictionary<AnchorRelativePosition, IReadOnlyList<AnchorRelativeNode>>();
+    }
+
+    public sealed class RelativePositionMapBuilder
+    {
+        public RelativePositionMap Build(ViewGraph graph, double minScore = 0.40)
+        {
+            if (graph == null)
+                throw new ArgumentNullException(nameof(graph));
+
+            var anchorId = graph.Anchor.Id;
+
+            var groups = new Dictionary<AnchorRelativePosition, List<AnchorRelativeNode>>
+            {
+                [AnchorRelativePosition.Left] = new(),
+                [AnchorRelativePosition.Right] = new(),
+                [AnchorRelativePosition.Above] = new(),
+                [AnchorRelativePosition.Below] = new()
+            };
+
+            foreach (var node in graph.Nodes)
+            {
+                if (node.Id == anchorId)
+                    continue;
+
+                var rel = ResolveAgainstAnchor(graph, anchorId, node.Id, minScore);
+                if (rel == null || rel.Position == AnchorRelativePosition.Unknown)
+                    continue;
+
+                groups[rel.Position].Add(rel);
+            }
+
+            var finalized = groups.ToDictionary(
+                kv => kv.Key,
+                kv => (IReadOnlyList<AnchorRelativeNode>)kv.Value
+                    .OrderByDescending(x => x.Score)
+                    .ToList());
+
+            return new RelativePositionMap
+            {
+                AnchorViewId = anchorId,
+                Groups = finalized
+            };
+        }
+
+        private AnchorRelativeNode? ResolveAgainstAnchor(
+            ViewGraph graph,
+            int anchorId,
+            int targetId,
+            double minScore)
+        {
+            // 1) anchor -> target 직접 relation
+            var direct = graph.GetOutgoing(anchorId, minScore)
+                .FirstOrDefault(x => x.TargetViewId == targetId);
+
+            if (direct != null)
+            {
+                return new AnchorRelativeNode
+                {
+                    ViewId = targetId,
+                    Position = ToAnchorRelative(direct.Direction),
+                    Score = direct.Score,
+                    Reason = $"direct: {direct.Reason}"
+                };
+            }
+
+            // 2) target -> anchor 역방향 relation
+            var reverse = graph.GetOutgoing(targetId, minScore)
+                .FirstOrDefault(x => x.TargetViewId == anchorId);
+
+            if (reverse != null)
+            {
+                return new AnchorRelativeNode
+                {
+                    ViewId = targetId,
+                    Position = Reverse(ToAnchorRelative(reverse.Direction)),
+                    Score = reverse.Score,
+                    Reason = $"reverse: {reverse.Reason}"
+                };
+            }
+
+            return null;
+        }
+
+        private AnchorRelativePosition ToAnchorRelative(ProjectionDirection dir)
+        {
+            return dir switch
+            {
+                ProjectionDirection.LeftOf => AnchorRelativePosition.Left,
+                ProjectionDirection.RightOf => AnchorRelativePosition.Right,
+                ProjectionDirection.Above => AnchorRelativePosition.Above,
+                ProjectionDirection.Below => AnchorRelativePosition.Below,
+                _ => AnchorRelativePosition.Unknown
+            };
+        }
+
+        private AnchorRelativePosition Reverse(AnchorRelativePosition pos)
+        {
+            return pos switch
+            {
+                AnchorRelativePosition.Left => AnchorRelativePosition.Right,
+                AnchorRelativePosition.Right => AnchorRelativePosition.Left,
+                AnchorRelativePosition.Above => AnchorRelativePosition.Below,
+                AnchorRelativePosition.Below => AnchorRelativePosition.Above,
+                _ => AnchorRelativePosition.Unknown
+            };
+        }
+    }
+
     public sealed class ProjectionLayoutAnalyzer
     {
         public ProjectionLayoutResult Analyze(
