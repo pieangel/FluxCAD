@@ -3329,12 +3329,15 @@ namespace FluxCAD.BricsCAD.Plugin26
                 return ProjectionDirection.Overlapping;
 
             // relation이 target -> member 인 경우
+            // relation.Direction은 "member가 target에 대해 어디 있는가" 이므로
+            // 우리가 원하는 "target이 member에 대해 어디 있는가"로 반전해야 함
             if (relation.SourceViewId == targetId && relation.TargetViewId == memberId)
-                return relation.Direction;
-
-            // relation이 member -> target 인 경우 반전
-            if (relation.SourceViewId == memberId && relation.TargetViewId == targetId)
                 return ReverseProjectionDirection(relation.Direction);
+
+            // relation이 member -> target 인 경우
+            // relation.Direction이 이미 "target이 member에 대해 어디 있는가" 이므로 그대로 사용
+            if (relation.SourceViewId == memberId && relation.TargetViewId == targetId)
+                return relation.Direction;
 
             return ProjectionDirection.Overlapping;
         }
