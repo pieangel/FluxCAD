@@ -93,6 +93,24 @@ namespace FluxCAD.BricsCAD.Plugin26
             public ViewIntentSemantic IntentSemantic { get; init; } = ViewIntentSemantic.Unknown;
         }
 
+        private sealed class ProjectionGroupMember
+        {
+            public int ViewId { get; init; }
+            public double Score { get; init; }
+            public ProjectionDirection? SiblingDirection { get; init; }
+            public ViewIntentSemantic IntentSemantic { get; init; } = ViewIntentSemantic.Unknown;
+            public string Reason { get; init; } = string.Empty;
+        }
+
+        private sealed class ProjectionGroup
+        {
+            public AnchorRelativePosition Direction { get; init; }
+
+            public int? RepresentativeViewId { get; set; }
+
+            public List<ProjectionGroupMember> SecondaryMembers { get; } = new();
+        }
+
         [CommandMethod("FLUX_DEBUG_VIEW_GRAPH")]
         public void FluxDebugViewGraph()
         {
@@ -214,14 +232,18 @@ namespace FluxCAD.BricsCAD.Plugin26
                 // 4) anchor 기준 relative map
                 var positionMap = BuildRelativePositionMap(graph, minScore: 0.40);
 
-                // 5) 간단 chain
+                // 새 그룹 구조화
+                var projectionGroups = BuildProjectionGroups(graph, positionMap);
+
+                // 기존 chain은 유지
                 var chains = BuildProjectionChains(graph, positionMap);
 
-                // 6) 로그
+                // 로그
                 ed.WriteMessage("\n");
                 ed.WriteMessage("\n================ VIEW GRAPH DEBUG ================");
                 ed.WriteMessage("\n" + FormatViewGraph(graph, anchorCandidate, positionMap));
                 ed.WriteMessage("\n" + FormatRelativePositionMap(positionMap));
+                ed.WriteMessage("\n" + FormatProjectionGroups(graph, projectionGroups));
                 ed.WriteMessage("\n" + FormatProjectionChains(chains));
                 ed.WriteMessage("\n================ END VIEW GRAPH DEBUG ================");
 
@@ -251,6 +273,161 @@ namespace FluxCAD.BricsCAD.Plugin26
             }
         }
 
+
+        private static List<ProjectionGroup> BuildProjectionGroups(
+    ViewGraph graph,
+    RelativePositionMap map)
+        {
+            var result = new List<ProjectionGroup>();
+
+            if (graph == null || map == null)
+                return result;
+
+            foreach (var kv in map.Groups)
+            {
+                var direction = kv.Key;
+                var nodes = kv.Value;
+
+                if (nodes == null || nodes.Count == 0)
+                    continue;
+
+                var group = new ProjectionGroup
+                {
+                    Direction = direction
+                };
+
+                // 1. representative 선택
+                group.RepresentativeViewId = SelectGroupRepresentativeViewId(graph, nodes);
+
+                // 2. representative 제외한 나머지를 secondary로 편입
+                foreach (var node in nodes)
+                {
+                    if (node == null)
+                        continue;
+
+                    if (group.RepresentativeViewId.HasValue &&
+                        node.ViewId == group.RepresentativeViewId.Value)
+                        continue;
+
+                    ProjectionDirection? siblingDir = null;
+                    ViewIntentSemantic intent = ViewIntentSemantic.Unknown;
+
+                    if (IsIndirectReason(node.Reason))
+                    {
+                        siblingDir = TryParseProjectionDirection(node.Reason, "sibling");
+                        intent = TryParseViewIntentSemantic(node.Reason, "intent");
+                    }
+
+                    group.SecondaryMembers.Add(new ProjectionGroupMember
+                    {
+                        ViewId = node.ViewId,
+                        Score = node.Score,
+                        SiblingDirection = siblingDir,
+                        IntentSemantic = intent,
+                        Reason = node.Reason ?? string.Empty
+                    });
+                }
+
+                result.Add(group);
+            }
+
+            return result
+                .OrderBy(g => g.Direction.ToString())
+                .ToList();
+        }
+
+        private static string FormatProjectionGroups(
+    ViewGraph graph,
+    IReadOnlyList<ProjectionGroup> groups)
+        {
+            var sb = new StringBuilder();
+
+            sb.AppendLine("[ProjectionGroups]");
+
+            if (groups == null || groups.Count == 0)
+            {
+                sb.AppendLine("- (none)");
+                return sb.ToString();
+            }
+
+            foreach (var group in groups)
+            {
+                sb.AppendLine($"- {group.Direction}:");
+
+                if (group.RepresentativeViewId.HasValue)
+                    sb.AppendLine($"    Representative = {group.RepresentativeViewId.Value}");
+                else
+                    sb.AppendLine($"    Representative = (none)");
+
+                if (group.SecondaryMembers.Count == 0)
+                {
+                    sb.AppendLine("    Secondary = (none)");
+                    continue;
+                }
+
+                foreach (var member in group.SecondaryMembers
+                             .OrderByDescending(x => x.Score)
+                             .ThenBy(x => x.ViewId))
+                {
+                    var sibling = member.SiblingDirection?.ToString() ?? "Unknown";
+                    var intent = member.IntentSemantic.ToString();
+
+                    sb.AppendLine(
+                        $"    Secondary = {member.ViewId}, " +
+                        $"sibling={sibling}, intent={intent}, score={member.Score:0.000}");
+                }
+            }
+
+            return sb.ToString();
+        }
+
+
+
+
+        private static int? SelectGroupRepresentativeViewId(
+    ViewGraph graph,
+    IReadOnlyList<AnchorRelativeNode> nodes)
+        {
+            if (graph == null || nodes == null || nodes.Count == 0)
+                return null;
+
+            double bestScore = double.MinValue;
+            int? bestViewId = null;
+
+            foreach (var node in nodes)
+            {
+                if (node == null)
+                    continue;
+
+                var view = graph.FindNode(node.ViewId);
+                if (view == null)
+                    continue;
+
+                double score = 0.0;
+
+                // 1. anchor relation score 우선
+                score += node.Score * 10.0;
+
+                // 2. area
+                score += view.Area * 0.001;
+
+                // 3. 너무 얇은 뷰는 살짝 감점
+                var minor = Math.Max(Math.Min(view.Width, view.Height), 1e-6);
+                var major = Math.Max(view.Width, view.Height);
+                var aspect = major / minor;
+
+                if (aspect >= 10.0)
+                    score -= 2.0;
+
+                if (score > bestScore)
+                {
+                    bestScore = score;
+                    bestViewId = node.ViewId;
+                }
+            }
+
+            return bestViewId;
+        }
 
         private static ProjectionDirection ResolveTargetRelativeDirection(
     ViewCluster source,
