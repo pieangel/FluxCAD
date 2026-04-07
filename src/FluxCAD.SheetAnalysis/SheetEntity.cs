@@ -82,6 +82,22 @@ namespace FluxCAD.SheetAnalysis
 
         public StrokeSemanticType StrokeSemantic { get; set; } = StrokeSemanticType.Unknown;
 
+        public string? LinetypeName { get; set; }
+        public string? EffectiveLinetypeName { get; set; }
+        public bool IsByLayerLinetype { get; set; }
+        public bool IsByBlockLinetype { get; set; }
+
+        public string? LayerNormalized { get; set; }
+
+        public bool IsCenterLine { get; set; }
+        public bool IsHiddenLine { get; set; }
+
+        public bool IsTitleLikeLayer { get; set; }
+        public bool IsTableLikeLayer { get; set; }
+        public bool IsOuterContourLikeLayer { get; set; }
+
+        public bool IsLikelySemanticNoise { get; set; }
+
         public bool HasText =>
             !string.IsNullOrWhiteSpace(TextNormalized) ||
             !string.IsNullOrWhiteSpace(Text);

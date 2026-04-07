@@ -18,6 +18,10 @@ using Teigha.Geometry;
 using Teigha.GraphicsInterface;
 using Teigha.Runtime;
 using Bricscad.ApplicationServices.Core;
+
+using FluxCAD.SheetAnalysis.ViewIsolation.Loops;
+using System.Linq;
+
 using TeighaColor = Teigha.Colors.Color;
 
 namespace FluxCAD.BricsCAD.Plugin26
@@ -47,6 +51,1364 @@ namespace FluxCAD.BricsCAD.Plugin26
             public IReadOnlyList<ViewIslandEntityGroup> Groups { get; init; } = Array.Empty<ViewIslandEntityGroup>();
 
             public IReadOnlyList<ViewIslandSemanticResult> SemanticResults { get; init; } = Array.Empty<ViewIslandSemanticResult>();
+        }
+
+        private sealed class ViewIslandClosedLoopDebugResult
+        {
+            public OccupancyHitIsland Island { get; init; } = default!;
+            public IReadOnlyList<SheetEntity> Entities { get; init; } = Array.Empty<SheetEntity>();
+            public ClosedLoopExtractionResult ExtractionResult { get; init; } = default!;
+        }
+
+        private sealed class VisibleOnlyIslandPipelineContext
+        {
+            public IReadOnlyList<SheetEntity> FullEntities { get; init; } = Array.Empty<SheetEntity>();
+            public IReadOnlyList<SheetEntity> VisibleOnlyEntities { get; init; } = Array.Empty<SheetEntity>();
+
+            public Bounds2D AllBounds { get; init; } = Bounds2D.Empty;
+            public Bounds2D RobustBounds { get; init; } = Bounds2D.Empty;
+
+            public OccupancyGridHitMapResult HitMap { get; init; } = default!;
+            public IReadOnlyList<OccupancyHitIsland> Islands { get; init; } = Array.Empty<OccupancyHitIsland>();
+        }
+
+        [CommandMethod("FLUX_DEBUG_VIEW_ISLAND_CLOSED_LOOP_V2")]
+        public void FluxDebugViewIslandClosedLoopV2()
+        {
+            var doc = Bricscad.ApplicationServices.Application.DocumentManager.MdiActiveDocument;
+            if (doc == null)
+                return;
+
+            var db = doc.Database;
+            var ed = doc.Editor;
+
+            try
+            {
+                var sheetFilePath = db.Filename;
+                if (string.IsNullOrWhiteSpace(sheetFilePath))
+                {
+                    ed.WriteMessage("\n[FluxCAD] 저장된 DWG 파일이 아닙니다.");
+                    return;
+                }
+
+                IEntitySnapshotBuilder snapshotBuilder = new SimpleSheetFileSnapshotBuilder();
+                var fullEntities = snapshotBuilder.Build(sheetFilePath);
+
+                if (fullEntities == null || fullEntities.Count == 0)
+                {
+                    ed.WriteMessage("\n[FluxCAD] snapshot이 비어 있습니다.");
+                    return;
+                }
+
+                var context = TryBuildVisibleOnlyIslandPipelineContext(
+                    fullEntities,
+                    ed,
+                    closeSingleCellGaps: false,
+                    targetCellSize: 12.0);
+
+                if (context == null || context.Islands == null || context.Islands.Count == 0)
+                {
+                    ed.WriteMessage("\n[FluxCAD] visible-only island pipeline 결과가 비어 있습니다.");
+                    return;
+                }
+
+                AssignIslandRolesFromFullEntities(
+                    context.Islands,
+                    context.FullEntities,
+                    ed);
+
+                var loopOptions = new LoopExtractionOptions
+                {
+                    EndpointTolerance = 0.5,
+                    GapTolerance = 1.0,
+                    ArcStepDegrees = 8.0,
+                    MaxSegmentLength = 2.0,
+                    IncludeInteriorDivider = false,
+                    EnableGapHealing = true,
+                    ClosureTolerance = 1.0
+                };
+
+                var loopResults = RunViewIslandClosedLoopDebug(
+                    context.VisibleOnlyEntities,
+                    context.Islands,
+                    loopOptions);
+
+                WriteClosedLoopDebugReport(ed, loopResults);
+
+                using (doc.LockDocument())
+                using (var tr = db.TransactionManager.StartTransaction())
+                {
+                    DrawClosedLoopDebugOverlays(
+                        db,
+                        tr,
+                        loopResults,
+                        clearLayerFirst: true,
+                        drawLabels: true);
+
+                    tr.Commit();
+                }
+
+                ed.WriteMessage(
+                    $"\n[FluxCAD] ViewIslandClosedLoopV2 islands={loopResults.Count}, " +
+                    $"closed={loopResults.Count(x => x.ExtractionResult.IsClosed)}, " +
+                    $"open={loopResults.Count(x => !x.ExtractionResult.IsClosed)}");
+            }
+            catch (System.Exception ex)
+            {
+                ed.WriteMessage($"\n[FluxCAD] FLUX_DEBUG_VIEW_ISLAND_CLOSED_LOOP_V2 failed: {ex}");
+            }
+        }
+
+
+        private static VisibleOnlyIslandPipelineContext? TryBuildVisibleOnlyIslandPipelineContext(
+    IReadOnlyList<SheetEntity> fullEntities,
+    Bricscad.EditorInput.Editor ed,
+    bool closeSingleCellGaps,
+    double targetCellSize)
+        {
+            if (fullEntities == null || fullEntities.Count == 0)
+                return null;
+
+            var allBounds = Bounds2DHelper.FromEntities(fullEntities);
+            if (allBounds.IsEmpty)
+                return null;
+
+            var visibleOnlyEntities = fullEntities
+                .Where(x => x != null)
+                .Where(x => x.IsVisible)
+                .Where(x => x.IsGeometryLike)
+                .Where(x => !x.IsTextLike)
+                .Where(x => !x.IsDimensionLike)
+                .Where(x => !x.IsBlockReference)
+                .Where(x => !IsHiddenOrCenterEntity(x))
+                .ToList();
+
+            if (visibleOnlyEntities.Count == 0)
+                return null;
+
+            var boundsSource = visibleOnlyEntities
+                .Where(x => !Bounds2DHelper.IsEmpty(x.Bounds))
+                .Where(x => !GhostEntityPolicy.IsIgnorableGhostEntity(x, Bounds2D.Empty))
+                .ToList();
+
+            if (boundsSource.Count == 0)
+                boundsSource = visibleOnlyEntities
+                    .Where(x => !Bounds2DHelper.IsEmpty(x.Bounds))
+                    .ToList();
+
+            if (boundsSource.Count == 0)
+                return null;
+
+            var robustBounds = ComputeRobustGeometryBounds(
+                boundsSource,
+                out var rejectedOutliers,
+                trimRatio: 0.02,
+                minKeepCount: 20);
+
+            if (robustBounds.IsEmpty)
+                robustBounds = allBounds;
+
+            var filteredBoundsSource = GhostEntityPolicy.ExcludeGhosts(
+                boundsSource,
+                robustBounds,
+                out var rejectedGhosts).ToList();
+
+            if (filteredBoundsSource.Count > 0)
+            {
+                var refinedBounds = ComputeRobustGeometryBounds(
+                    filteredBoundsSource,
+                    out var rejectedOutliers2,
+                    trimRatio: 0.02,
+                    minKeepCount: 20);
+
+                if (!refinedBounds.IsEmpty)
+                {
+                    robustBounds = refinedBounds;
+                    rejectedOutliers = rejectedOutliers2;
+                }
+            }
+
+            var gridInput = PrepareOccupancyInput(
+                visibleOnlyEntities,
+                robustBounds,
+                ed,
+                OccupancyInputMode.RawAllGeometrySeeds);
+
+            if (gridInput == null || gridInput.Count == 0)
+                return null;
+
+            var cols = Clamp((int)Math.Ceiling(robustBounds.Width / targetCellSize), 120, 420);
+            var rows = Clamp((int)Math.Ceiling(robustBounds.Height / targetCellSize), 120, 420);
+
+            var hitMapBuilder = new StrokeOccupancyGridHitMapBuilder();
+            var hitMap = hitMapBuilder.Build(
+                gridInput,
+                robustBounds,
+                rows,
+                cols);
+
+            var visibleOnlyPipeline = BuildSemanticIslandPipeline(
+                visibleOnlyEntities,
+                ed,
+                closeSingleCellGaps: closeSingleCellGaps,
+                targetCellSize: targetCellSize,
+                excludeSparseBridgeFromGroups: false);
+
+            if (visibleOnlyPipeline == null || visibleOnlyPipeline.Islands == null || visibleOnlyPipeline.Islands.Count == 0)
+                return null;
+
+            var sheetBounds = Bounds2DHelper.FromEntities(fullEntities);
+
+            var filteredIslands = RemoveContainedIslands(
+                visibleOnlyPipeline.Islands,
+                sheetBounds,
+                ed,
+                containTolerance: 2.0);
+
+            var islands = filteredIslands;
+
+            ed.WriteMessage($"\n[FluxCAD] VisibleOnlyPipeline all={fullEntities.Count}, visibleOnly={visibleOnlyEntities.Count}");
+            ed.WriteMessage($"\n[FluxCAD] VisibleOnlyPipeline rejectedOutliers={rejectedOutliers.Count}, rejectedGhosts={rejectedGhosts.Count}");
+            ed.WriteMessage($"\n[FluxCAD] VisibleOnlyPipeline robustBounds={robustBounds}");
+            ed.WriteMessage($"\n[FluxCAD] VisibleOnlyPipeline hitmap rows={rows}, cols={cols}, on={hitMap.OnCount}, islands={islands.Count}");
+
+            return new VisibleOnlyIslandPipelineContext
+            {
+                FullEntities = fullEntities,
+                VisibleOnlyEntities = visibleOnlyEntities,
+                AllBounds = allBounds,
+                RobustBounds = robustBounds,
+                HitMap = hitMap,
+                Islands = islands
+            };
+        }
+
+        private static bool IsContainedIslandCandidate(
+    OccupancyHitIsland child,
+    OccupancyHitIsland parent,
+    double tolerance)
+        {
+            if (child == null || parent == null)
+                return false;
+
+            if (child.Id == parent.Id)
+                return false;
+
+            var cb = child.Bounds;
+            var pb = parent.Bounds;
+
+            if (cb.IsEmpty || pb.IsEmpty)
+                return false;
+
+            var contained =
+                cb.MinX >= pb.MinX - tolerance &&
+                cb.MinY >= pb.MinY - tolerance &&
+                cb.MaxX <= pb.MaxX + tolerance &&
+                cb.MaxY <= pb.MaxY + tolerance;
+
+            if (!contained)
+                return false;
+
+            // 거의 같은 크기의 중복 섬은 제거하지 않음
+            var parentArea = Math.Max(pb.Area, 1.0);
+            var childArea = cb.Area;
+            var ratio = childArea / parentArea;
+
+            return ratio < 0.8;
+        }
+
+        private static IReadOnlyList<OccupancyHitIsland> RemoveContainedIslands(
+     IReadOnlyList<OccupancyHitIsland> islands,
+     Bounds2D sheetBounds,
+     Bricscad.EditorInput.Editor ed,
+     double containTolerance = 2.0)
+        {
+            if (islands == null || islands.Count == 0)
+                return Array.Empty<OccupancyHitIsland>();
+
+            var frameRemoved = islands
+                .Where(x => x != null)
+                .Where(x => !IsFrameViewCandidate(x, sheetBounds, tolerance: 2.0))
+                .Where(x => x.SemanticRole != ViewIslandSemanticRole.SparseBridge)
+                .ToList();
+
+            ed.WriteMessage($"\n[FluxCAD] ContainmentCheck input={islands.Count}, frameRemoved={frameRemoved.Count}");
+
+            var removedIds = new HashSet<int>();
+
+            for (int i = 0; i < frameRemoved.Count; i++)
+            {
+                var child = frameRemoved[i];
+
+                for (int j = 0; j < frameRemoved.Count; j++)
+                {
+                    if (i == j)
+                        continue;
+
+                    var parent = frameRemoved[j];
+
+                    if (!IsContainedIslandCandidate(child, parent, containTolerance))
+                        continue;
+
+                    ed.WriteMessage(
+                        $"\n[FluxCAD] Contained: child={child.Id} in parent={parent.Id}");
+
+                    removedIds.Add(child.Id);
+                    break;
+                }
+            }
+
+            var result = frameRemoved
+                .Where(x => !removedIds.Contains(x.Id))
+                .ToList();
+
+            ed.WriteMessage($"\n[FluxCAD] ContainmentCheck removed={removedIds.Count}, remain={result.Count}");
+
+            return result;
+        }
+
+        private static bool IsFrameViewCandidate(
+    OccupancyHitIsland island,
+    Bounds2D sheetBounds,
+    double tolerance)
+        {
+            if (island == null)
+                return false;
+
+            var b = island.Bounds;
+            if (b.IsEmpty || sheetBounds.IsEmpty)
+                return false;
+
+            return
+                Math.Abs(b.MinX - sheetBounds.MinX) <= tolerance &&
+                Math.Abs(b.MinY - sheetBounds.MinY) <= tolerance &&
+                Math.Abs(b.MaxX - sheetBounds.MaxX) <= tolerance &&
+                Math.Abs(b.MaxY - sheetBounds.MaxY) <= tolerance;
+        }
+
+
+        private static void AssignIslandRolesFromFullEntities(
+    IReadOnlyList<OccupancyHitIsland> islands,
+    IReadOnlyList<SheetEntity> fullEntities,
+    Bricscad.EditorInput.Editor ed)
+        {
+            if (islands == null)
+                throw new ArgumentNullException(nameof(islands));
+            if (fullEntities == null)
+                throw new ArgumentNullException(nameof(fullEntities));
+
+            foreach (var island in islands)
+            {
+                var dynamicTolerance = Math.Max(
+                    3.0,
+                    Math.Min(island.Bounds.Width, island.Bounds.Height) * 0.5);
+
+                var semanticEntities = CollectIslandSemanticEntities(
+                    fullEntities,
+                    island,
+                    tolerance: dynamicTolerance);
+
+                var role = DetermineIslandSemanticRoleFromContext(island, semanticEntities);
+                island.SemanticRole = role;
+
+                var centerCount = semanticEntities.Count(x => x.IsCenterLine);
+                var hiddenCount = semanticEntities.Count(x => x.IsHiddenLine);
+                var dimCount = semanticEntities.Count(x => x.IsDimensionLike);
+                var tableCount = semanticEntities.Count(x => x.IsTableLikeLayer);
+                var titleCount = semanticEntities.Count(x => x.IsTitleLikeLayer);
+                var geomCount = semanticEntities.Count(x => x.IsGeometryLike && !x.IsTextLike && !x.IsDimensionLike);
+                var textCount = semanticEntities.Count(x => x.IsTextLike);
+                var blockCount = semanticEntities.Count(x => x.IsBlockReference);
+
+                island.SemanticReason =
+                    $"Reassigned Role={role}, Geom={geomCount}, Text={textCount}, Dim={dimCount}, " +
+                    $"Center={centerCount}, Hidden={hiddenCount}, Table={tableCount}, Title={titleCount}, " +
+                    $"Block={blockCount}, Tol={dynamicTolerance:0.##}";
+
+                ed.WriteMessage(
+                    $"\n[FluxCAD] IslandRoleReassign I:{island.Id}, " +
+                    $"Role={role}, Entities={semanticEntities.Count}, " +
+                    $"Geom={geomCount}, Text={textCount}, Dim={dimCount}, " +
+                    $"Center={centerCount}, Hidden={hiddenCount}, " +
+                    $"Table={tableCount}, Title={titleCount}, Block={blockCount}, Tol={dynamicTolerance:0.##}");
+            }
+        }
+
+
+        private static ViewIslandSemanticRole DetermineIslandSemanticRoleFromContext(
+    OccupancyHitIsland island,
+    IReadOnlyList<SheetEntity> semanticEntities)
+        {
+            if (island == null)
+                return ViewIslandSemanticRole.Unknown;
+
+            if (semanticEntities == null || semanticEntities.Count == 0)
+                return ViewIslandSemanticRole.Unknown;
+
+            var textCount = semanticEntities.Count(x => x.IsTextLike);
+            var dimCount = semanticEntities.Count(x => x.IsDimensionLike);
+            var blockCount = semanticEntities.Count(x => x.IsBlockReference);
+            var geomCount = semanticEntities.Count(x => x.IsGeometryLike && !x.IsTextLike && !x.IsDimensionLike);
+
+            var centerCount = semanticEntities.Count(x => x.IsCenterLine);
+            var hiddenCount = semanticEntities.Count(x => x.IsHiddenLine);
+            var titleLayerCount = semanticEntities.Count(x => x.IsTitleLikeLayer);
+            var tableLayerCount = semanticEntities.Count(x => x.IsTableLikeLayer);
+            var noiseCount = semanticEntities.Count(x => x.IsLikelySemanticNoise);
+
+            // 1. sparse bridge 우선 차단
+            if (island.IsSparseBridgeLike)
+                return ViewIslandSemanticRole.SparseBridge;
+
+            // 2. direct evidence
+            if (centerCount > 0 || hiddenCount > 0)
+                return ViewIslandSemanticRole.GeometryView;
+
+            // 3. dimension evidence
+            if (dimCount > 0)
+                return ViewIslandSemanticRole.GeometryView;
+
+            // 4. 치수는 없지만 실제 투영 뷰처럼 보이는 얇은 형상 뷰 구제
+            var major = Math.Max(island.Width, island.Height);
+            var minor = Math.Max(Math.Min(island.Width, island.Height), 1e-9);
+            var aspect = major / minor;
+
+            var isSlenderGeometryLike =
+                geomCount >= 2 &&
+                textCount == 0 &&
+                blockCount == 0 &&
+                noiseCount == 0 &&
+                aspect >= 3.0;
+
+            if (isSlenderGeometryLike)
+                return ViewIslandSemanticRole.GeometryView;
+
+            // 5. title / table 계열은 geometry fallback 전에 차단
+            if ((tableLayerCount > 0 || titleLayerCount > 0) &&
+                centerCount == 0 &&
+                hiddenCount == 0 &&
+                dimCount == 0)
+            {
+                return ViewIslandSemanticRole.AnnotationLike;
+            }
+
+            // 6. annotation / badge
+            if (geomCount <= 4 && textCount > 0)
+                return ViewIslandSemanticRole.AnnotationLike;
+
+            if (geomCount <= 6 && blockCount > 0 && textCount > 0)
+                return ViewIslandSemanticRole.BadgeMarker;
+
+            // 7. 보수적인 geometry fallback
+            if (geomCount >= 3 &&
+                noiseCount == 0 &&
+                textCount == 0 &&
+                blockCount == 0 &&
+                !island.IsSparseBridgeLike)
+            {
+                return ViewIslandSemanticRole.GeometryView;
+            }
+
+            return ViewIslandSemanticRole.Unknown;
+        }
+
+
+        private static IReadOnlyList<SheetEntity> CollectIslandSemanticEntities(
+    IReadOnlyList<SheetEntity> entities,
+    OccupancyHitIsland island,
+    double tolerance)
+        {
+            if (entities == null)
+                throw new ArgumentNullException(nameof(entities));
+            if (island == null)
+                throw new ArgumentNullException(nameof(island));
+
+            var islandBounds = Bounds2DHelper.Inflate(island.Bounds, tolerance);
+
+            var result = entities
+                .Where(x => x != null)
+                .Where(x => x.IsVisible)
+                .Where(x => !Bounds2DHelper.IsEmpty(x.Bounds))
+                .Where(x => Bounds2DHelper.Intersects(islandBounds, x.Bounds, tolerance: 0))
+                .Where(x => !GhostEntityPolicy.IsIgnorableGhostEntity(x, islandBounds))
+                // 핵심: semantic evidence 수집에서는 block container를 기본 제외
+                .Where(x => !x.IsBlockReference)
+                .ToList();
+
+            return result;
+        }
+
+
+        [CommandMethod("FLUX_DEBUG_VIEW_ISLAND_CLOSED_LOOP_VISIBLE_ONLY")]
+        public void FluxDebugViewIslandClosedLoopVisibleOnly()
+        {
+            var doc = Bricscad.ApplicationServices.Application.DocumentManager.MdiActiveDocument;
+            if (doc == null)
+                return;
+
+            var db = doc.Database;
+            var ed = doc.Editor;
+
+            try
+            {
+                var sheetFilePath = db.Filename;
+                if (string.IsNullOrWhiteSpace(sheetFilePath))
+                {
+                    ed.WriteMessage("\n[FluxCAD] 저장된 DWG 파일이 아닙니다.");
+                    return;
+                }
+
+                if (!TryBuildVisibleOnlySemanticIslandPipeline(
+                    sheetFilePath,
+                    ed,
+                    out var entities,
+                    out var pipeline))
+                {
+                    return;
+                }
+
+                var loopOptions = new LoopExtractionOptions
+                {
+                    EndpointTolerance = 0.5,
+                    GapTolerance = 1.0,
+                    ArcStepDegrees = 8.0,
+                    MaxSegmentLength = 2.0,
+                    IncludeInteriorDivider = false,
+                    EnableGapHealing = true,
+                    ClosureTolerance = 1.0
+                };
+
+                var loopResults = RunViewIslandClosedLoopDebug(
+                    entities,
+                    pipeline.Islands,
+                    loopOptions);
+
+
+                WriteClosedLoopDebugReport(ed, loopResults);
+
+                using (doc.LockDocument())
+                using (var tr = db.TransactionManager.StartTransaction())
+                {
+                    DrawClosedLoopDebugOverlays(
+                        db,
+                        tr,
+                        loopResults,
+                        clearLayerFirst: true,
+                        drawLabels: true);
+
+                    tr.Commit();
+                }
+
+                ed.WriteMessage(
+                    $"\n[FluxCAD] ViewIslandClosedLoop(VisibleOnly) islands={loopResults.Count}, " +
+                    $"closed={loopResults.Count(x => x.ExtractionResult.IsClosed)}, " +
+                    $"open={loopResults.Count(x => !x.ExtractionResult.IsClosed)}");
+            }
+            catch (System.Exception ex)
+            {
+                ed.WriteMessage($"\n[FluxCAD] FLUX_DEBUG_VIEW_ISLAND_CLOSED_LOOP_VISIBLE_ONLY failed: {ex}");
+            }
+        }
+
+        private static bool TryBuildVisibleOnlySemanticIslandPipeline(
+    string sheetFilePath,
+    Bricscad.EditorInput.Editor ed,
+    out IReadOnlyList<SheetEntity> entities,
+    out SemanticIslandPipelineResult pipeline)
+        {
+            entities = Array.Empty<SheetEntity>();
+            pipeline = default!;
+
+            if (string.IsNullOrWhiteSpace(sheetFilePath))
+            {
+                ed.WriteMessage("\n[FluxCAD] 저장된 DWG 파일이 아닙니다.");
+                return false;
+            }
+
+            IEntitySnapshotBuilder snapshotBuilder = new SimpleSheetFileSnapshotBuilder();
+            var allEntities = snapshotBuilder.Build(sheetFilePath);
+
+            if (allEntities == null || allEntities.Count == 0)
+            {
+                ed.WriteMessage("\n[FluxCAD] snapshot이 비어 있습니다.");
+                return false;
+            }
+
+            // ------------------------------------------------------------
+            // visible-only entity 집합
+            // - hidden / center 제외
+            // - text / dimension / blockref 제외
+            // - geometry만 유지
+            // - Bounds empty는 유지 (PrepareOccupancyInput 계열과 일관성 유지 목적)
+            // ------------------------------------------------------------
+            var visibleOnlyEntities = allEntities
+                .Where(x => x != null)
+                .Where(x => x.IsVisible)
+                .Where(x => x.IsGeometryLike)
+                .Where(x => !x.IsTextLike)
+                .Where(x => !x.IsDimensionLike)
+                .Where(x => !x.IsBlockReference)
+                .Where(x => !IsHiddenOrCenterEntity(x))
+                .ToList();
+
+            if (visibleOnlyEntities.Count == 0)
+            {
+                ed.WriteMessage("\n[FluxCAD] visible-only entity가 비어 있습니다.");
+                return false;
+            }
+
+            entities = visibleOnlyEntities;
+
+            ed.WriteMessage($"\n[FluxCAD] VisibleOnlyPipeline source={visibleOnlyEntities.Count}");
+
+            // ------------------------------------------------------------
+            // 기존 pipeline builder 재사용
+            // 핵심: 전체 snapshot이 아니라 visible-only entity 집합을 넣는다
+            // ------------------------------------------------------------
+            var builtPipeline = BuildSemanticIslandPipeline(
+                visibleOnlyEntities,
+                ed,
+                closeSingleCellGaps: false,
+                targetCellSize: 12.0,
+                excludeSparseBridgeFromGroups: false);
+
+            if (builtPipeline == null || builtPipeline.Islands == null || builtPipeline.Islands.Count == 0)
+            {
+                ed.WriteMessage("\n[FluxCAD] visible-only semantic island pipeline 결과가 비어 있습니다.");
+                return false;
+            }
+
+            pipeline = builtPipeline;
+
+            ed.WriteMessage(
+                $"\n[FluxCAD] VisibleOnlyPipeline islands={pipeline.Islands.Count}, " +
+                $"topLevel={pipeline.Islands.Count(x => x != null)}");
+
+            return true;
+        }
+
+        private static IReadOnlyList<ViewIslandClosedLoopDebugResult> RunViewIslandClosedLoopDebug(
+     IReadOnlyList<SheetEntity> entities,
+     IReadOnlyList<OccupancyHitIsland> islands,
+     LoopExtractionOptions loopOptions)
+        {
+            var loopResults = new List<ViewIslandClosedLoopDebugResult>();
+
+            if (entities == null || entities.Count == 0)
+                return loopResults;
+
+            if (islands == null || islands.Count == 0)
+                return loopResults;
+
+            // stroke semantic 1차 적용
+            foreach (var entity in entities)
+            {
+                if (entity == null)
+                    continue;
+
+                StrokeSemanticClassifier.Apply(entity);
+            }
+
+            var extractor = new ClosedLoopExtractor();
+
+            foreach (var island in islands.OrderBy(x => x.Id))
+            {
+                if (island == null)
+                    continue;
+
+                // 현재 단계 원칙:
+                // island를 다시 쪼개지 않고, bounds 기준으로 내부 geometry entity를 모아
+                // outer closed loop 존재 여부만 본다.
+                var islandEntities = CollectIslandLoopEntities(
+                    entities,
+                    island,
+                    tolerance: 0.0);
+
+                var loopResult = extractor.Extract(islandEntities, loopOptions);
+
+                loopResults.Add(new ViewIslandClosedLoopDebugResult
+                {
+                    Island = island,
+                    Entities = islandEntities,
+                    ExtractionResult = loopResult
+                });
+            }
+
+            return loopResults;
+        }
+
+
+        private static bool TryBuildVisibleOnlyHitMap(
+    string sheetFilePath,
+    Bricscad.EditorInput.Editor ed,
+    out IReadOnlyList<SheetEntity> entities,
+    out IReadOnlyList<SheetEntity> occupancySourceEntities,
+    out Bounds2D allBounds,
+    out Bounds2D robustBounds,
+    out OccupancyGridHitMapResult hitMap)
+        {
+            entities = Array.Empty<SheetEntity>();
+            occupancySourceEntities = Array.Empty<SheetEntity>();
+            allBounds = Bounds2D.Empty;
+            robustBounds = Bounds2D.Empty;
+            hitMap = default!;
+
+            IEntitySnapshotBuilder snapshotBuilder = new SimpleSheetFileSnapshotBuilder();
+            var built = snapshotBuilder.Build(sheetFilePath);
+
+            if (built == null || built.Count == 0)
+            {
+                ed.WriteMessage("\n[FluxCAD] snapshot이 비어 있습니다.");
+                return false;
+            }
+
+            entities = built;
+            allBounds = Bounds2DHelper.FromEntities(built);
+
+            if (allBounds.IsEmpty)
+            {
+                ed.WriteMessage("\n[FluxCAD] sheet bounds가 비어 있습니다.");
+                return false;
+            }
+
+            var occSource = built
+                .Where(x => x != null)
+                .Where(x => x.IsVisible)
+                .Where(x => x.IsGeometryLike)
+                .Where(x => !x.IsTextLike)
+                .Where(x => !x.IsDimensionLike)
+                .Where(x => !x.IsBlockReference)
+                .Where(x => !IsHiddenOrCenterEntity(x))
+                .ToList();
+
+            if (occSource.Count == 0)
+            {
+                ed.WriteMessage("\n[FluxCAD] visible-only occupancy source entity가 비어 있습니다.");
+                return false;
+            }
+
+            occupancySourceEntities = occSource;
+
+            var boundsSource = occSource
+                .Where(x => !Bounds2DHelper.IsEmpty(x.Bounds))
+                .ToList();
+
+            if (boundsSource.Count == 0)
+            {
+                ed.WriteMessage("\n[FluxCAD] visible-only geometry entity(for bounds)가 비어 있습니다.");
+                return false;
+            }
+
+            var geometryEntitiesForBounds2 = boundsSource
+                .Where(x => !GhostEntityPolicy.IsIgnorableGhostEntity(x, Bounds2D.Empty))
+                .ToList();
+
+            if (geometryEntitiesForBounds2.Count == 0)
+                geometryEntitiesForBounds2 = boundsSource.ToList();
+
+            robustBounds = ComputeRobustGeometryBounds(
+                geometryEntitiesForBounds2,
+                out var rejectedOutliers,
+                trimRatio: 0.02,
+                minKeepCount: 20);
+
+            if (robustBounds.IsEmpty)
+                robustBounds = allBounds;
+
+            var filteredGeometryEntities = GhostEntityPolicy.ExcludeGhosts(
+                geometryEntitiesForBounds2,
+                robustBounds,
+                out var rejectedGhosts).ToList();
+
+            if (filteredGeometryEntities.Count > 0)
+            {
+                var refinedBounds = ComputeRobustGeometryBounds(
+                    filteredGeometryEntities,
+                    out var rejectedOutliers2,
+                    trimRatio: 0.02,
+                    minKeepCount: 20);
+
+                if (!refinedBounds.IsEmpty)
+                {
+                    robustBounds = refinedBounds;
+                    rejectedOutliers = rejectedOutliers2;
+                }
+            }
+
+            ed.WriteMessage($"\n[FluxCAD] VisibleOnly AllBounds={allBounds}");
+            ed.WriteMessage($"\n[FluxCAD] VisibleOnly RobustBounds={robustBounds}");
+            ed.WriteMessage($"\n[FluxCAD] VisibleOnly rejectedOutliers={rejectedOutliers.Count}");
+            ed.WriteMessage($"\n[FluxCAD] VisibleOnly rejectedGhosts={rejectedGhosts.Count}");
+            ed.WriteMessage($"\n[FluxCAD] VisibleOnly occupancySource={occSource.Count}");
+            ed.WriteMessage($"\n[FluxCAD] VisibleOnly boundsSource={boundsSource.Count}");
+
+            var excludedCount = built
+                .Where(x => x != null)
+                .Where(x => x.IsVisible)
+                .Where(x => x.IsGeometryLike)
+                .Count(x => IsHiddenOrCenterEntity(x));
+
+            ed.WriteMessage($"\n[FluxCAD] VisibleOnly hidden/center excluded={excludedCount}");
+
+            var gridInput = PrepareOccupancyInput(
+                occSource,
+                robustBounds,
+                ed,
+                OccupancyInputMode.RawAllGeometrySeeds);
+
+            if (gridInput == null || gridInput.Count == 0)
+            {
+                ed.WriteMessage("\n[FluxCAD] visible-only occupancy stroke input이 비어 있습니다.");
+                return false;
+            }
+
+            const double targetCellSize = 12.0;
+
+            var cols = Clamp((int)Math.Ceiling(robustBounds.Width / targetCellSize), 120, 420);
+            var rows = Clamp((int)Math.Ceiling(robustBounds.Height / targetCellSize), 120, 420);
+
+            var hitMapBuilder = new StrokeOccupancyGridHitMapBuilder();
+            hitMap = hitMapBuilder.Build(
+                gridInput,
+                robustBounds,
+                rows,
+                cols);
+
+            ed.WriteMessage(
+                $"\n[FluxCAD] StrokeHitMap(VisibleOnly) rows={hitMap.Rows}, cols={hitMap.Cols}, input={gridInput.Count}, " +
+                $"on={hitMap.OnCount}, both={hitMap.BothCount}, boundsOnly={hitMap.BoundsOnlyCount}, repOnly={hitMap.RepOnlyCount}");
+
+            return true;
+        }
+
+
+
+        [CommandMethod("FLUX_DEBUG_OCC_GRID_STROKE_RAW_VISIBLE_ONLY")]
+        public void FluxDebugOccGridStrokeRawVisibleOnly()
+        {
+            var doc = Bricscad.ApplicationServices.Application.DocumentManager.MdiActiveDocument;
+            if (doc == null)
+                return;
+
+            var db = doc.Database;
+            var ed = doc.Editor;
+
+            try
+            {
+                var sheetFilePath = db.Filename;
+                if (string.IsNullOrWhiteSpace(sheetFilePath))
+                {
+                    ed.WriteMessage("\n[FluxCAD] 저장된 DWG 파일이 아닙니다.");
+                    return;
+                }
+
+                IEntitySnapshotBuilder snapshotBuilder = new SimpleSheetFileSnapshotBuilder();
+                var entities = snapshotBuilder.Build(sheetFilePath);
+
+                if (entities == null || entities.Count == 0)
+                {
+                    ed.WriteMessage("\n[FluxCAD] snapshot이 비어 있습니다.");
+                    return;
+                }
+
+                var allBounds = Bounds2DHelper.FromEntities(entities);
+                if (allBounds.IsEmpty)
+                {
+                    ed.WriteMessage("\n[FluxCAD] sheet bounds가 비어 있습니다.");
+                    return;
+                }
+
+                // ------------------------------------------------------------------
+                // 1) 실제 occupancy 입력용 source
+                //    - Bounds empty라도 살려 둔다
+                //    - PrepareOccupancyInput 내부의 emptyRecovered 경로를 살리기 위함
+                // ------------------------------------------------------------------
+                var occupancySourceEntities = entities
+                    .Where(x => x != null)
+                    .Where(x => x.IsVisible)
+                    .Where(x => x.IsGeometryLike)
+                    .Where(x => !x.IsTextLike)
+                    .Where(x => !x.IsDimensionLike)
+                    .Where(x => !x.IsBlockReference)
+                    .Where(x => !IsHiddenOrCenterEntity(x))
+                    .ToList();
+
+                if (occupancySourceEntities.Count == 0)
+                {
+                    ed.WriteMessage("\n[FluxCAD] visible-only occupancy source entity가 비어 있습니다.");
+                    return;
+                }
+
+                // ------------------------------------------------------------------
+                // 2) robust bounds 계산용 source
+                //    - 여기서는 Bounds empty 제외
+                // ------------------------------------------------------------------
+                var geometryEntitiesForBounds = occupancySourceEntities
+                    .Where(x => !Bounds2DHelper.IsEmpty(x.Bounds))
+                    .ToList();
+
+                if (geometryEntitiesForBounds.Count == 0)
+                {
+                    ed.WriteMessage("\n[FluxCAD] visible-only geometry entity(for bounds)가 비어 있습니다.");
+                    return;
+                }
+
+                // 1차 robust bounds 계산용: obvious ghost 제거
+                var geometryEntitiesForBounds2 = geometryEntitiesForBounds
+                    .Where(x => !GhostEntityPolicy.IsIgnorableGhostEntity(x, Bounds2D.Empty))
+                    .ToList();
+
+                if (geometryEntitiesForBounds2.Count == 0)
+                    geometryEntitiesForBounds2 = geometryEntitiesForBounds.ToList();
+
+                var robustBounds = ComputeRobustGeometryBounds(
+                    geometryEntitiesForBounds2,
+                    out var rejectedOutliers,
+                    trimRatio: 0.02,
+                    minKeepCount: 20);
+
+                if (robustBounds.IsEmpty)
+                    robustBounds = allBounds;
+
+                // 2차: provisional robust bounds 기준으로 far-out ghost 재제거
+                var filteredGeometryEntities = GhostEntityPolicy.ExcludeGhosts(
+                    geometryEntitiesForBounds2,
+                    robustBounds,
+                    out var rejectedGhosts).ToList();
+
+                if (filteredGeometryEntities.Count > 0)
+                {
+                    var refinedBounds = ComputeRobustGeometryBounds(
+                        filteredGeometryEntities,
+                        out var rejectedOutliers2,
+                        trimRatio: 0.02,
+                        minKeepCount: 20);
+
+                    if (!refinedBounds.IsEmpty)
+                    {
+                        robustBounds = refinedBounds;
+                        rejectedOutliers = rejectedOutliers2;
+                    }
+                }
+
+                ed.WriteMessage($"\n[FluxCAD] VisibleOnly AllBounds={allBounds}");
+                ed.WriteMessage($"\n[FluxCAD] VisibleOnly RobustBounds={robustBounds}");
+                ed.WriteMessage($"\n[FluxCAD] VisibleOnly rejectedOutliers={rejectedOutliers.Count}");
+                ed.WriteMessage($"\n[FluxCAD] VisibleOnly rejectedGhosts={rejectedGhosts.Count}");
+                ed.WriteMessage($"\n[FluxCAD] VisibleOnly occupancySource={occupancySourceEntities.Count}");
+                ed.WriteMessage($"\n[FluxCAD] VisibleOnly boundsSource={geometryEntitiesForBounds.Count}");
+
+                var excludedCount = entities
+                    .Where(x => x != null)
+                    .Where(x => x.IsVisible)
+                    .Where(x => x.IsGeometryLike)
+                    .Count(x => IsHiddenOrCenterEntity(x));
+
+                ed.WriteMessage($"\n[FluxCAD] VisibleOnly hidden/center excluded={excludedCount}");
+
+                // ------------------------------------------------------------------
+                // 3) occupancy input 생성
+                //    - 반드시 occupancySourceEntities를 넣는다
+                // ------------------------------------------------------------------
+                var gridInput = PrepareOccupancyInput(
+                    occupancySourceEntities,
+                    robustBounds,
+                    ed,
+                    OccupancyInputMode.RawAllGeometrySeeds);
+
+                if (gridInput == null || gridInput.Count == 0)
+                {
+                    ed.WriteMessage("\n[FluxCAD] visible-only occupancy stroke input이 비어 있습니다.");
+                    return;
+                }
+
+                const double targetCellSize = 12.0;
+
+                var cols = Clamp((int)Math.Ceiling(robustBounds.Width / targetCellSize), 120, 420);
+                var rows = Clamp((int)Math.Ceiling(robustBounds.Height / targetCellSize), 120, 420);
+
+                var cellWidth = robustBounds.Width / cols;
+                var cellHeight = robustBounds.Height / rows;
+
+                ed.WriteMessage(
+                    $"\n[FluxCAD] VisibleOnly Grid sheet=({robustBounds.Width:F2} x {robustBounds.Height:F2}), " +
+                    $"rows={rows}, cols={cols}, cell=({cellWidth:F2} x {cellHeight:F2})");
+
+                var hitMapBuilder = new StrokeOccupancyGridHitMapBuilder();
+                var hitMap = hitMapBuilder.Build(
+                    gridInput,
+                    robustBounds,
+                    rows,
+                    cols);
+
+                using (doc.LockDocument())
+                using (var tr = db.TransactionManager.StartTransaction())
+                {
+                    var drawer = new OccupancyDebugDrawer();
+
+                    drawer.DrawHitMap(
+                        db,
+                        tr,
+                        hitMap,
+                        clearLayerFirst: true);
+
+                    tr.Commit();
+                }
+
+                ed.WriteMessage(
+                    $"\n[FluxCAD] StrokeHitMap(VisibleOnly) rows={hitMap.Rows}, cols={hitMap.Cols}, input={gridInput.Count}, " +
+                    $"on={hitMap.OnCount}, both={hitMap.BothCount}, boundsOnly={hitMap.BoundsOnlyCount}, repOnly={hitMap.RepOnlyCount}");
+            }
+            catch (System.Exception ex)
+            {
+                ed.WriteMessage($"\n[FluxCAD] FLUX_DEBUG_OCC_GRID_STROKE_RAW_VISIBLE_ONLY failed: {ex}");
+            }
+        }
+
+
+        private static bool IsHiddenOrCenterEntity(SheetEntity entity)
+        {
+            if (entity == null)
+                return false;
+
+            // 0차: snapshot semantic flag
+            if (entity.IsCenterLine || entity.IsHiddenLine)
+                return true;
+
+            // 1차: stroke semantic
+            if (IsHiddenOrCenterStrokeSemantic(entity.StrokeSemantic))
+                return true;
+
+            // 2차: effective linetype
+            if (IsHiddenOrCenterLinetype(entity.EffectiveLinetypeName))
+                return true;
+
+            // 3차: raw linetype
+            if (IsHiddenOrCenterLinetype(entity.LinetypeName))
+                return true;
+
+            // 4차: layer fallback
+            var layer = (entity.Layer ?? string.Empty).Trim().ToUpperInvariant();
+            if (LooksLikeCenter(layer) || LooksLikeHidden(layer))
+                return true;
+
+            return false;
+        }
+
+        private static bool IsHiddenOrCenterStrokeSemantic(StrokeSemanticType semantic)
+        {
+            var name = semantic.ToString().Trim().ToUpperInvariant();
+
+            return name.Contains("CENTER")
+                || name.Contains("HIDDEN");
+        }
+
+        private static bool IsHiddenOrCenterLinetype(string? linetypeName)
+        {
+            var name = NormalizeLinetypeName(linetypeName);
+            if (string.IsNullOrWhiteSpace(name))
+                return false;
+
+            return name == "CENTER"
+                || name == "CENTERX2"
+                || name == "HIDDEN"
+                || name == "DOT2"
+                || name == "PHANTOM";
+        }
+
+        private static string NormalizeLinetypeName(string? value)
+        {
+            return (value ?? string.Empty).Trim().ToUpperInvariant();
+        }
+
+        private static bool LooksLikeCenter(string value)
+        {
+            if (string.IsNullOrWhiteSpace(value))
+                return false;
+
+            return value.Contains("CENTER")
+                || value.Contains("CENTRE")
+                || value.Contains("CNTR")
+                || value.Contains("CTR");
+        }
+
+        private static bool LooksLikeHidden(string value)
+        {
+            if (string.IsNullOrWhiteSpace(value))
+                return false;
+
+            return value.Contains("HIDDEN")
+                || value.Contains("HID")
+                || value.Contains("DOT")
+                || value.Contains("PHANTOM");
+        }
+
+
+        [CommandMethod("FLUX_DEBUG_VIEW_ISLAND_CLOSED_LOOP")]
+        public void FluxDebugViewIslandClosedLoop()
+        {
+            var doc = Bricscad.ApplicationServices.Application.DocumentManager.MdiActiveDocument;
+            if (doc == null)
+                return;
+
+            var db = doc.Database;
+            var ed = doc.Editor;
+
+            try
+            {
+                var sheetFilePath = db.Filename;
+                if (string.IsNullOrWhiteSpace(sheetFilePath))
+                {
+                    ed.WriteMessage("\n[FluxCAD] 저장된 DWG 파일이 아닙니다.");
+                    return;
+                }
+
+                IEntitySnapshotBuilder snapshotBuilder = new SimpleSheetFileSnapshotBuilder();
+                var entities = snapshotBuilder.Build(sheetFilePath);
+
+                if (entities == null || entities.Count == 0)
+                {
+                    ed.WriteMessage("\n[FluxCAD] snapshot이 비어 있습니다.");
+                    return;
+                }
+
+                var pipeline = BuildSemanticIslandPipeline(
+                    entities,
+                    ed,
+                    closeSingleCellGaps: false,
+                    targetCellSize: 12.0,
+                    excludeSparseBridgeFromGroups: false);
+
+                if (pipeline == null || pipeline.Islands == null || pipeline.Islands.Count == 0)
+                {
+                    ed.WriteMessage("\n[FluxCAD] island pipeline 결과가 비어 있습니다.");
+                    return;
+                }
+
+                var loopOptions = new LoopExtractionOptions
+                {
+                    EndpointTolerance = 0.5,
+                    GapTolerance = 1.0,
+                    ArcStepDegrees = 8.0,
+                    MaxSegmentLength = 2.0,
+                    IncludeInteriorDivider = false,
+                    EnableGapHealing = true,
+                    ClosureTolerance = 1.0
+                };
+
+                var loopResults = RunViewIslandClosedLoopDebug(
+                    entities,
+                    pipeline.Islands,
+                    loopOptions);
+
+                WriteClosedLoopDebugReport(ed, loopResults);
+
+                using (doc.LockDocument())
+                using (var tr = db.TransactionManager.StartTransaction())
+                {
+                    DrawClosedLoopDebugOverlays(
+                        db,
+                        tr,
+                        loopResults,
+                        clearLayerFirst: true,
+                        drawLabels: true);
+
+                    tr.Commit();
+                }
+
+                ed.WriteMessage(
+                    $"\n[FluxCAD] ViewIslandClosedLoop islands={loopResults.Count}, " +
+                    $"closed={loopResults.Count(x => x.ExtractionResult.IsClosed)}, " +
+                    $"open={loopResults.Count(x => !x.ExtractionResult.IsClosed)}");
+            }
+            catch (System.Exception ex)
+            {
+                ed.WriteMessage($"\n[FluxCAD] FLUX_DEBUG_VIEW_ISLAND_CLOSED_LOOP failed: {ex}");
+            }
+        }
+
+        private static IReadOnlyList<SheetEntity> CollectIslandLoopEntities(
+    IReadOnlyList<SheetEntity> visibleOnlyEntities,
+    OccupancyHitIsland island,
+    double tolerance)
+        {
+            if (visibleOnlyEntities == null)
+                throw new ArgumentNullException(nameof(visibleOnlyEntities));
+
+            if (island == null)
+                throw new ArgumentNullException(nameof(island));
+
+            var islandBounds = Bounds2DHelper.Inflate(island.Bounds, tolerance);
+
+            var result = visibleOnlyEntities
+                .Where(x => x != null)
+                .Where(x => x.IsVisible)
+                .Where(x => x.IsGeometryLike)
+                .Where(x => !x.IsTextLike)
+                .Where(x => !x.IsDimensionLike)
+                .Where(x => !x.IsBlockReference)
+                .Where(x => !IsHiddenOrCenterEntity(x))
+                .Where(x => !Bounds2DHelper.IsEmpty(x.Bounds))
+                .Where(x => Bounds2DHelper.Intersects(islandBounds, x.Bounds, tolerance: 0))
+                .Where(x => !GhostEntityPolicy.IsIgnorableGhostEntity(x, islandBounds))
+                .Where(x => !IsObviouslySheetFrameLike(x, island, islandBounds))
+                .Select(CloneWithFallbackBounds)
+                .Where(x => x != null && !x.Bounds.IsEmpty)
+                .ToList()!;
+
+            return result;
+        }
+
+        private static bool IsObviouslySheetFrameLike(
+    SheetEntity entity,
+    OccupancyHitIsland island,
+    Bounds2D sheetBounds,
+    double tolerance = 2.0)
+        {
+            if (entity == null || entity.Bounds.IsEmpty)
+                return false;
+
+            var eb = entity.Bounds;
+            var ib = island.Bounds;
+
+            // sheet 전체 경계와 거의 같은 경우
+            var matchesSheet =
+                Math.Abs(eb.MinX - sheetBounds.MinX) <= tolerance &&
+                Math.Abs(eb.MinY - sheetBounds.MinY) <= tolerance &&
+                Math.Abs(eb.MaxX - sheetBounds.MaxX) <= tolerance &&
+                Math.Abs(eb.MaxY - sheetBounds.MaxY) <= tolerance;
+
+            if (matchesSheet)
+                return true;
+
+            // island보다 지나치게 큰 외곽선
+            if (eb.Width > ib.Width * 1.5 || eb.Height > ib.Height * 1.5)
+            {
+                // 그리고 island를 사실상 감싸는 큰 경계라면 제외
+                if (eb.MinX <= ib.MinX + tolerance &&
+                    eb.MinY <= ib.MinY + tolerance &&
+                    eb.MaxX >= ib.MaxX - tolerance &&
+                    eb.MaxY >= ib.MaxY - tolerance)
+                    return true;
+            }
+
+            return false;
+        }
+
+        private static void WriteClosedLoopDebugReport(
+    Bricscad.EditorInput.Editor ed,
+    IReadOnlyList<ViewIslandClosedLoopDebugResult> results)
+        {
+            if (ed == null)
+                throw new ArgumentNullException(nameof(ed));
+
+            if (results == null)
+                throw new ArgumentNullException(nameof(results));
+
+            ed.WriteMessage("\n[FluxCAD] ===== View Island Closed Loop Debug =====");
+
+            foreach (var item in results.OrderBy(x => x.Island.Id))
+            {
+                var island = item.Island;
+                var loop = item.ExtractionResult;
+                var largest = loop.LargestClosedLoop;
+                var bounds = island.Bounds;
+
+                ed.WriteMessage(
+                    $"\n[Island {island.Id}] " +
+                    $"Role={island.SemanticRole}, " +
+                    $"Cells={island.CellCount}, " +
+                    $"Fill={island.FillRatio:0.###}, " +
+                    $"Bounds=({bounds.MinX:0.##},{bounds.MinY:0.##})-({bounds.MaxX:0.##},{bounds.MaxY:0.##}), " +
+                    $"Entities={item.Entities.Count}, " +
+                    $"InputSegments={loop.InputSegments.Count}, " +
+                    $"IsClosed={loop.IsClosed}, " +
+                    $"OuterLoops={loop.OuterLoopCount}, " +
+                    $"Holes={loop.HoleLoopCount}, " +
+                    $"OpenChains={loop.OpenChainCount}");
+
+                if (largest != null)
+                {
+                    ed.WriteMessage(
+                        $"\n  LargestLoop: Area={largest.Area:0.##}, " +
+                        $"Bounds=({largest.Bounds.MinX:0.##},{largest.Bounds.MinY:0.##})-({largest.Bounds.MaxX:0.##},{largest.Bounds.MaxY:0.##}), " +
+                        $"Vertices={largest.VertexCount}, " +
+                        $"Segments={largest.SegmentCount}, " +
+                        $"Gap={largest.ClosureGap:0.###}, " +
+                        $"IsHole={largest.IsHole}, " +
+                        $"Depth={largest.NestingDepth}");
+                }
+
+                if (loop.Warnings.Count > 0)
+                {
+                    foreach (var warning in loop.Warnings)
+                    {
+                        ed.WriteMessage($"\n  Warning: {warning}");
+                    }
+                }
+            }
+        }
+
+        private static void DrawClosedLoopDebugOverlays(
+    Database db,
+    Transaction tr,
+    IReadOnlyList<ViewIslandClosedLoopDebugResult> results,
+    bool clearLayerFirst,
+    bool drawLabels)
+        {
+            if (db == null)
+                throw new ArgumentNullException(nameof(db));
+            if (tr == null)
+                throw new ArgumentNullException(nameof(tr));
+            if (results == null || results.Count == 0)
+                return;
+
+            const string layerName = "FLUX_VIEW_ISLAND_LOOP";
+
+            EnsureDebugLayer(db, tr, layerName, colorIndex: 2, clearLayerFirst: clearLayerFirst);
+
+            foreach (var item in results)
+            {
+                var island = item.Island;
+                var loop = item.ExtractionResult;
+
+                short colorIndex;
+                if (loop.IsClosed)
+                    colorIndex = 3;   // green
+                else if (loop.OpenChainCount > 0)
+                    colorIndex = 1;   // red
+                else
+                    colorIndex = 2;   // yellow
+
+                DrawBoundsRectangle(db, tr, layerName, island.Bounds, colorIndex);
+
+                if (!drawLabels)
+                    continue;
+
+                var label = BuildClosedLoopLabel(item);
+
+                DrawDebugText(
+                    db,
+                    tr,
+                    layerName,
+                    island.Bounds.Center,
+                    label,
+                    colorIndex,
+                    Math.Max(8.0, Math.Min(island.Bounds.Width, island.Bounds.Height) * 0.08));
+            }
+        }
+
+        private static string BuildClosedLoopLabel(ViewIslandClosedLoopDebugResult item)
+        {
+            var island = item.Island;
+            var loop = item.ExtractionResult;
+
+            return
+                $"I:{island.Id} " +
+                $"C:{(loop.IsClosed ? "Y" : "N")} " +
+                $"OL:{loop.OuterLoopCount} " +
+                $"H:{loop.HoleLoopCount} " +
+                $"OC:{loop.OpenChainCount}";
         }
 
         [CommandMethod("FLUX_DEBUG_PRIMARY_VIEW_DIAGNOSTICS")]
@@ -581,6 +1943,7 @@ namespace FluxCAD.BricsCAD.Plugin26
             return 1; // red
         }
 
+
         private List<ViewCandidate> BuildResolvedViewCandidates(string sheetFilePath, Bricscad.EditorInput.Editor ed)
         {
             if (string.IsNullOrWhiteSpace(sheetFilePath))
@@ -599,11 +1962,14 @@ namespace FluxCAD.BricsCAD.Plugin26
                 targetCellSize: 12.0,
                 excludeSparseBridgeFromGroups: false);
 
-            var semanticResults = pipeline?.SemanticResults?
-                .Where(x => x != null)
-                .OrderBy(x => x.Island?.Id ?? -1)
-                .ToList()
-                ?? new List<ViewIslandSemanticResult>();
+            if (pipeline == null || pipeline.SemanticResults == null || pipeline.SemanticResults.Count == 0)
+                return new List<ViewCandidate>();
+
+            // 핵심: 초기 semantic 결과를 full entity context로 다시 정리한다.
+            var semanticResults = RebuildSemanticResultsWithReassignedRoles(
+                pipeline.SemanticResults,
+                entities,
+                ed);
 
             ed.WriteMessage($"\n[FluxCAD] SemanticResults={semanticResults.Count}");
 
@@ -673,6 +2039,88 @@ namespace FluxCAD.BricsCAD.Plugin26
             }
 
             return candidateListBeforeResolve;
+        }
+
+
+        private static List<ViewIslandSemanticResult> RebuildSemanticResultsWithReassignedRoles(
+    IReadOnlyList<ViewIslandSemanticResult> semanticResults,
+    IReadOnlyList<SheetEntity> fullEntities,
+    Bricscad.EditorInput.Editor ed)
+        {
+            var rebuilt = new List<ViewIslandSemanticResult>();
+
+            if (semanticResults == null || semanticResults.Count == 0)
+                return rebuilt;
+
+            foreach (var result in semanticResults)
+            {
+                if (result == null || result.Island == null)
+                    continue;
+
+                var island = result.Island;
+
+                var dynamicTolerance = Math.Max(
+                    3.0,
+                    Math.Min(island.Bounds.Width, island.Bounds.Height) * 0.5);
+
+                var semanticEntities = CollectIslandSemanticEntities(
+                    fullEntities,
+                    island,
+                    tolerance: dynamicTolerance);
+
+                var reassignedRole = DetermineIslandSemanticRoleFromContext(
+                    island,
+                    semanticEntities);
+
+                var centerCount = semanticEntities.Count(x => x.IsCenterLine);
+                var hiddenCount = semanticEntities.Count(x => x.IsHiddenLine);
+                var dimCount = semanticEntities.Count(x => x.IsDimensionLike);
+                var tableCount = semanticEntities.Count(x => x.IsTableLikeLayer);
+                var titleCount = semanticEntities.Count(x => x.IsTitleLikeLayer);
+                var geomCount = semanticEntities.Count(x => x.IsGeometryLike && !x.IsTextLike && !x.IsDimensionLike);
+                var textCount = semanticEntities.Count(x => x.IsTextLike);
+
+                var reason =
+                    $"Reassigned Role={reassignedRole}, " +
+                    $"Geom={geomCount}, Text={textCount}, Dim={dimCount}, " +
+                    $"Center={centerCount}, Hidden={hiddenCount}, " +
+                    $"Table={tableCount}, Title={titleCount}, Tol={dynamicTolerance:0.##}";
+
+                island.SemanticRole = reassignedRole;
+                island.SemanticReason = reason;
+
+                rebuilt.Add(new ViewIslandSemanticResult
+                {
+                    Island = island,
+                    Role = reassignedRole,
+                    ScoreGeometry = result.ScoreGeometry,
+                    ScoreBadge = result.ScoreBadge,
+                    ScoreAnnotation = result.ScoreAnnotation,
+                    Reason = reason
+                });
+
+                ed.WriteMessage(
+                    $"\n[FluxCAD] PipelineRoleReassign I:{island.Id}, " +
+                    $"Old={result.Role}, New={reassignedRole}, " +
+                    $"Geom={geomCount}, Text={textCount}, Dim={dimCount}, " +
+                    $"Center={centerCount}, Hidden={hiddenCount}, " +
+                    $"Table={tableCount}, Title={titleCount}, Tol={dynamicTolerance:0.##}");
+
+                if (island.Id == 2 || island.Id == 3 || island.Id == 4)
+                {
+                    foreach (var x in semanticEntities)
+                    {
+                        ed.WriteMessage(
+                            $"\n  [SemanticEntity I:{island.Id}] " +
+                            $"Handle={x.Handle}, Kind={x.Kind}, Layer={x.Layer}, " +
+                            $"LT={x.LinetypeName}, EffLT={x.EffectiveLinetypeName}, " +
+                            $"Center={x.IsCenterLine}, Hidden={x.IsHiddenLine}, " +
+                            $"Bounds=({x.Bounds.MinX:0.##},{x.Bounds.MinY:0.##})-({x.Bounds.MaxX:0.##},{x.Bounds.MaxY:0.##})");
+                    }
+                }
+            }
+
+            return rebuilt;
         }
 
 
@@ -1342,7 +2790,37 @@ namespace FluxCAD.BricsCAD.Plugin26
                     targetCellSize: 12.0,
                     excludeSparseBridgeFromGroups: false);
 
-                var rankedGroups = pipeline.Groups
+                if (pipeline == null || pipeline.SemanticResults == null || pipeline.SemanticResults.Count == 0)
+                {
+                    ed.WriteMessage("\n[FluxCAD] semantic pipeline 결과가 비어 있습니다.");
+                    return;
+                }
+
+                // 핵심: primary diagnostics와 동일한 semantic truth 사용
+                var rebuiltSemanticResults = RebuildSemanticResultsWithReassignedRoles(
+                    pipeline.SemanticResults,
+                    entities,
+                    ed);
+
+                var groupByIslandId = pipeline.Groups
+                    .Where(g => g != null && g.Island != null)
+                    .ToDictionary(g => g.Island.Id, g => g);
+
+                var rebuiltGroups = rebuiltSemanticResults
+                    .Where(r => r != null && r.Island != null)
+                    .Select(r =>
+                    {
+                        if (!groupByIslandId.TryGetValue(r.Island.Id, out var group))
+                            return null;
+
+                        group.Island.SemanticRole = r.Role;
+                        group.Island.SemanticReason = r.Reason;
+                        return group;
+                    })
+                    .Where(g => g != null)
+                    .ToList()!;
+
+                var rankedGroups = rebuiltGroups
                     .OrderByDescending(g => g.Island.SemanticRole == ViewIslandSemanticRole.GeometryView)
                     .ThenByDescending(g => g.Island.IsStrongGeometryContent)
                     .ThenBy(g => g.Island.SemanticRole == ViewIslandSemanticRole.SparseBridge)
@@ -1524,7 +3002,14 @@ namespace FluxCAD.BricsCAD.Plugin26
     Bricscad.EditorInput.Editor ed,
     IEnumerable<ViewIslandEntityGroup> groups)
         {
-            var list = groups.ToList();
+            if (ed == null)
+                throw new ArgumentNullException(nameof(ed));
+            if (groups == null)
+                throw new ArgumentNullException(nameof(groups));
+
+            var list = groups
+                .Where(x => x != null && x.Island != null)
+                .ToList();
 
             ed.WriteMessage($"\n[FluxCAD] ViewIslandEntityGroups count={list.Count}");
 
@@ -1533,6 +3018,10 @@ namespace FluxCAD.BricsCAD.Plugin26
                 var group = list[i];
                 var island = group.Island;
                 var b = island.Bounds;
+
+                var reason = island.SemanticReason ?? "-";
+                if (reason.Length > 180)
+                    reason = reason.Substring(0, 180) + "...";
 
                 ed.WriteMessage(
                     $"\n  [IslandGroup {i + 1}] " +
@@ -1543,12 +3032,7 @@ namespace FluxCAD.BricsCAD.Plugin26
                     $"Fill={island.FillRatio:0.###}, " +
                     $"DimOverlap={island.OverlapsDimension}, " +
                     $"DimCount={island.OverlapDimensionCount}, " +
-                    $"Geo={group.GeometryCount}, " +
-                    $"Curve={group.CurveCount}, " +
-                    $"Text={group.TextCount}, " +
-                    $"NumericText={group.NumericTextCount}, " +
-                    $"Other={group.OtherCount}, " +
-                    $"Reason={island.SemanticReason}");
+                    $"Reason={reason}");
             }
         }
 
@@ -3292,7 +4776,20 @@ namespace FluxCAD.BricsCAD.Plugin26
                 Center = source.Center,
                 StartAngleDeg = source.StartAngleDeg,
                 EndAngleDeg = source.EndAngleDeg,
-                EllipseRotationDeg2D = source.EllipseRotationDeg2D
+                EllipseRotationDeg2D = source.EllipseRotationDeg2D,
+
+                LinetypeName = source.LinetypeName,
+                EffectiveLinetypeName = source.EffectiveLinetypeName,
+                IsByLayerLinetype = source.IsByLayerLinetype,
+                IsByBlockLinetype = source.IsByBlockLinetype,
+
+                LayerNormalized = source.LayerNormalized,
+                IsCenterLine = source.IsCenterLine,
+                IsHiddenLine = source.IsHiddenLine,
+                IsTitleLikeLayer = source.IsTitleLikeLayer,
+                IsTableLikeLayer = source.IsTableLikeLayer,
+                IsOuterContourLikeLayer = source.IsOuterContourLikeLayer,
+                IsLikelySemanticNoise = source.IsLikelySemanticNoise,
             };
         }
 

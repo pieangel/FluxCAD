@@ -68,18 +68,18 @@ namespace FluxCAD.BricsCAD.Plugin26
         }
 
         private static void ExpandEntityRecursive(
-            Entity ent,
-            Transaction tr,
-            List<SheetEntity> result,
-            SnapshotExpansionContext context,
-            HashSet<string> blockStack)
+    Entity ent,
+    Transaction tr,
+    List<SheetEntity> result,
+    SnapshotExpansionContext context,
+    HashSet<string> blockStack)
         {
             if (ent == null || ent.IsErased)
                 return;
 
             if (ent is not BlockReference br)
             {
-                var leaf = BuildLeafSheetEntity(ent, context);
+                var leaf = BuildLeafSheetEntity(ent, tr, context);
                 if (leaf != null)
                     result.Add(leaf);
 
@@ -111,6 +111,7 @@ namespace FluxCAD.BricsCAD.Plugin26
             // 1) BlockReference 자체를 container snapshot으로 남긴다.
             var container = BuildContainerSheetEntity(
                 br,
+                tr,
                 parentContext,
                 currentBlockName,
                 nextBlockPath);
@@ -135,7 +136,7 @@ namespace FluxCAD.BricsCAD.Plugin26
                     depth: parentContext.Depth + 1,
                     isInsideBlock: true);
 
-                var attrLeaf = BuildLeafSheetEntity(attr, attrContext);
+                var attrLeaf = BuildLeafSheetEntity(attr, tr, attrContext);
                 if (attrLeaf != null)
                     result.Add(attrLeaf);
             }
@@ -244,10 +245,11 @@ namespace FluxCAD.BricsCAD.Plugin26
 
 
         private static SheetEntity? BuildContainerSheetEntity(
-            BlockReference sourceBr,
-            SnapshotExpansionContext parentContext,
-            string? currentBlockName,
-            IReadOnlyList<string> nextBlockPath)
+             BlockReference sourceBr,
+             Transaction tr,
+             SnapshotExpansionContext parentContext,
+             string? currentBlockName,
+             IReadOnlyList<string> nextBlockPath)
         {
             Entity? wcsEnt = null;
 
@@ -286,13 +288,15 @@ namespace FluxCAD.BricsCAD.Plugin26
                     Depth = parentContext.Depth,
                     SourceKind = ResolveBlockContainerSourceKind(),
                     SnapshotKey = BuildSnapshotKey(
-                        prefix: "C",
-                        handle: sourceBr.Handle.ToString(),
-                        depth: parentContext.Depth,
-                        entityType: sourceBr.GetType().Name,
-                        blockPath: nextBlockPath)
+                    prefix: "C",
+                    handle: sourceBr.Handle.ToString(),
+                    depth: parentContext.Depth,
+                    entityType: sourceBr.GetType().Name,
+                    blockPath: nextBlockPath)
                 };
 
+                PopulateLinetypeFields(entity, sourceBr, wcsEnt, tr);
+                PopulateSemanticFlags(entity);
                 PopulateGeometryFields(entity, wcsEnt);
                 return entity;
             }
@@ -309,6 +313,7 @@ namespace FluxCAD.BricsCAD.Plugin26
 
         private static SheetEntity? BuildLeafSheetEntity(
     Entity sourceEnt,
+    Transaction tr,
     SnapshotExpansionContext context)
         {
             Entity? wcsEnt = null;
@@ -373,6 +378,8 @@ namespace FluxCAD.BricsCAD.Plugin26
                         blockPath: context.BlockPath)
                 };
 
+                PopulateLinetypeFields(sheetEntity, sourceEnt, wcsEnt, tr);
+                PopulateSemanticFlags(sheetEntity);
                 PopulateGeometryFields(sheetEntity, wcsEnt);
                 return sheetEntity;
             }
@@ -384,6 +391,101 @@ namespace FluxCAD.BricsCAD.Plugin26
             {
                 wcsEnt?.Dispose();
             }
+        }
+
+        private static void PopulateSemanticFlags(SheetEntity target)
+        {
+            if (target == null)
+                return;
+
+            var layer = NormalizeSemanticName(target.Layer);
+            var rawLt = NormalizeSemanticName(target.LinetypeName);
+            var effLt = NormalizeSemanticName(target.EffectiveLinetypeName);
+
+            target.LayerNormalized = layer;
+
+            target.IsCenterLine =
+                LooksLikeCenterSemantic(rawLt) ||
+                LooksLikeCenterSemantic(effLt) ||
+                LooksLikeCenterSemantic(layer);
+
+            target.IsHiddenLine =
+                LooksLikeHiddenSemantic(rawLt) ||
+                LooksLikeHiddenSemantic(effLt) ||
+                LooksLikeHiddenSemantic(layer);
+
+            target.IsTitleLikeLayer = LooksLikeTitleSemantic(layer);
+            target.IsTableLikeLayer = LooksLikeTableSemantic(layer);
+            target.IsOuterContourLikeLayer = LooksLikeOuterContourSemantic(layer);
+
+            target.IsLikelySemanticNoise =
+                target.IsTitleLikeLayer ||
+                target.IsTableLikeLayer;
+        }
+
+        private static string NormalizeSemanticName(string? value)
+        {
+            return (value ?? string.Empty).Trim().ToUpperInvariant();
+        }
+
+        private static bool ContainsAny(string value, params string[] keywords)
+        {
+            if (string.IsNullOrWhiteSpace(value))
+                return false;
+
+            foreach (var keyword in keywords)
+            {
+                if (!string.IsNullOrWhiteSpace(keyword) &&
+                    value.Contains(keyword, StringComparison.OrdinalIgnoreCase))
+                    return true;
+            }
+
+            return false;
+        }
+
+        private static bool LooksLikeCenterSemantic(string value)
+        {
+            if (string.IsNullOrWhiteSpace(value))
+                return false;
+
+            return ContainsAny(value,
+                "CENTER", "CENTRE", "CNTR", "CTR", "CL", "CENTERLINE", "중심");
+        }
+
+        private static bool LooksLikeHiddenSemantic(string value)
+        {
+            if (string.IsNullOrWhiteSpace(value))
+                return false;
+
+            return ContainsAny(value,
+                "HIDDEN", "HID", "HL", "DOT", "PHANTOM", "숨은", "은선");
+        }
+
+        private static bool LooksLikeTitleSemantic(string value)
+        {
+            if (string.IsNullOrWhiteSpace(value))
+                return false;
+
+            return ContainsAny(value,
+                "TITLE", "TITLEBLOCK", "표제", "표제란", "도곽", "SHEET", "FRAMEINFO");
+        }
+
+        private static bool LooksLikeTableSemantic(string value)
+        {
+            if (string.IsNullOrWhiteSpace(value))
+                return false;
+
+            return ContainsAny(value,
+                "TABLE", "TAB", "BOM", "LIST", "SCHEDULE", "표", "자재", "부품");
+        }
+
+        private static bool LooksLikeOuterContourSemantic(string value)
+        {
+            if (string.IsNullOrWhiteSpace(value))
+                return false;
+
+            return ContainsAny(value,
+                "OUTER", "OUTLINE", "CONTOUR", "외형", "외곽");
         }
 
         private static SheetEntitySourceKind ResolveLeafSourceKind(Entity ent, bool isInsideBlock)
@@ -883,6 +985,95 @@ namespace FluxCAD.BricsCAD.Plugin26
             public string? OwnerBlockName { get; }
             public int Depth { get; }
             public bool IsInsideBlock { get; }
+        }
+
+
+        private static string? TryGetRawLinetypeName(Entity ent)
+        {
+            if (ent == null)
+                return null;
+
+            try
+            {
+                var name = ent.Linetype;
+                if (string.IsNullOrWhiteSpace(name))
+                    return null;
+
+                return name.Trim();
+            }
+            catch
+            {
+                return null;
+            }
+        }
+
+        private static string? TryGetEffectiveLinetypeName(Entity ent, Transaction tr)
+        {
+            if (ent == null)
+                return null;
+
+            try
+            {
+                var raw = TryGetRawLinetypeName(ent);
+
+                if (!string.IsNullOrWhiteSpace(raw) &&
+                    !raw.Equals("ByLayer", StringComparison.OrdinalIgnoreCase))
+                {
+                    return raw;
+                }
+
+                if (raw != null && raw.Equals("ByBlock", StringComparison.OrdinalIgnoreCase))
+                {
+                    return raw;
+                }
+
+                var layerId = ent.LayerId;
+                if (layerId.IsNull || !layerId.IsValid)
+                    return raw;
+
+                var layer = tr.GetObject(layerId, OpenMode.ForRead) as LayerTableRecord;
+                if (layer == null)
+                    return raw;
+
+                var layerLinetypeId = layer.LinetypeObjectId;
+                if (layerLinetypeId.IsNull || !layerLinetypeId.IsValid)
+                    return raw;
+
+                var ltr = tr.GetObject(layerLinetypeId, OpenMode.ForRead) as LinetypeTableRecord;
+                if (ltr == null)
+                    return raw;
+
+                if (string.IsNullOrWhiteSpace(ltr.Name))
+                    return raw;
+
+                return ltr.Name.Trim();
+            }
+            catch
+            {
+                return TryGetRawLinetypeName(ent);
+            }
+        }
+
+        private static void PopulateLinetypeFields(
+            SheetEntity target,
+            Entity sourceEnt,
+            Entity wcsEnt,
+            Transaction tr)
+        {
+            if (target == null || sourceEnt == null)
+                return;
+
+            var raw = TryGetRawLinetypeName(sourceEnt) ?? TryGetRawLinetypeName(wcsEnt);
+            var effective = TryGetEffectiveLinetypeName(sourceEnt, tr)
+                            ?? TryGetEffectiveLinetypeName(wcsEnt, tr)
+                            ?? raw;
+
+            target.LinetypeName = raw;
+            target.EffectiveLinetypeName = effective;
+            target.IsByLayerLinetype =
+                string.Equals(raw, "ByLayer", StringComparison.OrdinalIgnoreCase);
+            target.IsByBlockLinetype =
+                string.Equals(raw, "ByBlock", StringComparison.OrdinalIgnoreCase);
         }
     }
 }

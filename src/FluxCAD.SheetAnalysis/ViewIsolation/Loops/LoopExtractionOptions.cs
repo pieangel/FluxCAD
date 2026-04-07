@@ -13,5 +13,8 @@ namespace FluxCAD.SheetAnalysis.ViewIsolation.Loops
         public double ArcStepDegrees { get; set; } = 8.0;
         public double MaxSegmentLength { get; set; } = 2.0;
         public bool IncludeInteriorDivider { get; set; } = false;
+
+        public bool EnableGapHealing { get; set; } = true;
+        public double ClosureTolerance { get; set; } = 1.0;
     }
 }
