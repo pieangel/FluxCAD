@@ -357,6 +357,86 @@ namespace FluxCAD.BricsCAD.Plugin26
                     ed);
 
                 // ------------------------------------------------------------
+                // 5-1) 복사본에 표시할 relation graph 계산
+                //      주의: 배치에는 사용하지 않고, 표시용으로만 사용
+                // ------------------------------------------------------------
+                var geometryPrimaryCandidates = workItems
+                    .Select(x => x.View)
+                    .Where(x => x != null)
+                    .Where(x => x.FinalRole == ViewIslandSemanticRole.GeometryView)
+                    .Where(x => x.IsTopLevelView || x.IsPrimaryView || x.IsRepresentativePrimaryView)
+                    .OrderBy(x => x.IslandId)
+                    .ToList();
+
+                ViewGraph? copiedGraph = null;
+                RelativePositionMap? copiedPositionMap = null;
+
+                if (geometryPrimaryCandidates.Count > 0)
+                {
+                    var graphAnchorCandidate = geometryPrimaryCandidates
+                        .FirstOrDefault(x => x.IsRepresentativePrimaryView)
+                        ?? geometryPrimaryCandidates
+                            .Where(x => x.IsPrimaryView)
+                            .OrderByDescending(x => x.RepresentativePrimaryScore)
+                            .ThenByDescending(x => x.PrimaryScore)
+                            .ThenByDescending(x => x.Area)
+                            .FirstOrDefault()
+                        ?? geometryPrimaryCandidates
+                            .OrderByDescending(x => x.Area)
+                            .FirstOrDefault();
+
+                    if (graphAnchorCandidate != null)
+                    {
+                        var viewClusters = BuildViewClustersFromCandidates(
+                            geometryPrimaryCandidates,
+                            graphAnchorCandidate,
+                            ed);
+
+                        var anchorView = viewClusters.FirstOrDefault(x => x.Id == graphAnchorCandidate.IslandId);
+
+                        if (anchorView != null)
+                        {
+                            var policy = new ProjectionLayoutPolicy
+                            {
+                                PreferThirdAngleLayout = true,
+                                MinBandOverlapRatio = 0.45,
+                                MaxNormalizedNeighborGap = 1.50,
+                                MinRelationScore = 0.40,
+
+                                AllowTopView = false,
+                                AllowBottomView = false,
+                                AllowLeftView = false,
+                                AllowRightView = false,
+                                AllowSectionView = false,
+                                AllowDetailView = false
+                            };
+
+                            var analyzer = new ProjectionLayoutAnalyzer();
+                            var rawLayout = analyzer.Analyze(viewClusters, policy);
+
+                            var filteredRelations = rawLayout.Relations
+                                .Where(x => x != null)
+                                .Where(x => x.Score >= policy.MinRelationScore)
+                                .Where(x => x.Direction != ProjectionDirection.Overlapping)
+                                .OrderByDescending(x => x.Score)
+                                .ToList();
+
+                            copiedGraph = new ViewGraph
+                            {
+                                Anchor = anchorView,
+                                Nodes = viewClusters,
+                                Layout = new ProjectionLayoutResult
+                                {
+                                    Relations = filteredRelations
+                                }
+                            };
+
+                            copiedPositionMap = BuildRelativePositionMap(copiedGraph, minScore: 0.40);
+                        }
+                    }
+                }
+
+                // ------------------------------------------------------------
                 // 6) 전체 group bounds 계산
                 //    핵심: 원본 상대 위치는 그대로 두고 group 전체만 이동
                 // ------------------------------------------------------------
@@ -452,6 +532,34 @@ namespace FluxCAD.BricsCAD.Plugin26
                     }
                 }
 
+                // ------------------------------------------------------------
+                // 8) 복사된 그룹 위에 relation overlay 표시
+                // ------------------------------------------------------------
+                if (copiedGraph != null && copiedPositionMap != null)
+                {
+                    using (doc.LockDocument())
+                    using (var tr = db.TransactionManager.StartTransaction())
+                    {
+                        DrawCopiedViewGraphOverlays(
+                            db,
+                            tr,
+                            copiedGraph,
+                            copiedPositionMap,
+                            geometryPrimaryCandidates,
+                            groupDx,
+                            groupDy,
+                            clearLayerFirst: true,
+                            drawLabels: true,
+                            drawRelations: true);
+
+                        tr.Commit();
+                    }
+
+                    ed.WriteMessage(
+                        $"\n[FluxCAD] Copied relation overlay drawn. " +
+                        $"Anchor={copiedGraph.Anchor.Id}, Nodes={copiedGraph.Nodes.Count}, Edges={copiedGraph.Edges.Count}");
+                }
+
                 ed.WriteMessage(
                     $"\n[FluxCAD] TopLevel Geometry Views copied outside. " +
                     $"Views={orderedViews.Count}, TotalSource={totalSourceCount}, TotalCopied={totalCopiedCount}, " +
@@ -461,6 +569,190 @@ namespace FluxCAD.BricsCAD.Plugin26
             {
                 ed.WriteMessage($"\n[FluxCAD] FLUX_COPY_TOPLEVEL_GEOMETRY_VIEWS_OUTSIDE failed: {ex}");
             }
+        }
+
+
+        private static void DrawCopiedViewGraphOverlays(
+    Database db,
+    Transaction tr,
+    ViewGraph graph,
+    RelativePositionMap map,
+    IReadOnlyList<ViewCandidate> sourceCandidates,
+    double offsetX,
+    double offsetY,
+    bool clearLayerFirst,
+    bool drawLabels,
+    bool drawRelations)
+        {
+            if (db == null)
+                throw new ArgumentNullException(nameof(db));
+            if (tr == null)
+                throw new ArgumentNullException(nameof(tr));
+            if (graph == null)
+                throw new ArgumentNullException(nameof(graph));
+            if (map == null)
+                throw new ArgumentNullException(nameof(map));
+
+            const string layerName = "FLUX_VIEW_COPY_REL";
+
+            EnsureDebugLayer(db, tr, layerName, colorIndex: 6, clearLayerFirst: clearLayerFirst);
+
+            var candidateMap = sourceCandidates?
+                .Where(x => x != null)
+                .ToDictionary(x => x.IslandId)
+                ?? new Dictionary<int, ViewCandidate>();
+
+            // ------------------------------------------------------------
+            // 1) copied node label
+            // ------------------------------------------------------------
+            foreach (var node in graph.Nodes)
+            {
+                var movedBounds = OffsetBounds(node.Bounds, offsetX, offsetY);
+                var movedCenter = OffsetPoint(node.Bounds.Center, offsetX, offsetY);
+
+                short colorIndex = ResolveViewGraphColor(node, graph, map);
+
+                if (drawLabels)
+                {
+                    var label = BuildViewGraphNodeLabel(node, graph, map, candidateMap);
+
+                    DrawDebugText(
+                        db,
+                        tr,
+                        layerName,
+                        movedCenter,
+                        label,
+                        colorIndex,
+                        Math.Max(8.0, Math.Min(movedBounds.Width, movedBounds.Height) * 0.08));
+                }
+            }
+
+            if (!drawRelations)
+                return;
+
+            // ------------------------------------------------------------
+            // 2) primary relation: anchor direct / reverse
+            // ------------------------------------------------------------
+            var primaryRelations = BuildPrimaryAnchorDisplayRelations(graph, map);
+
+            var primaryLaneCounters = new Dictionary<AnchorRelativePosition, int>
+            {
+                [AnchorRelativePosition.Left] = 0,
+                [AnchorRelativePosition.Right] = 0,
+                [AnchorRelativePosition.Above] = 0,
+                [AnchorRelativePosition.Below] = 0
+            };
+
+            foreach (var rel in primaryRelations
+                .OrderByDescending(x => x.Score)
+                .ThenBy(x => x.TargetViewId))
+            {
+                var source = graph.FindNode(rel.SourceViewId);
+                var target = graph.FindNode(rel.TargetViewId);
+
+                if (source == null || target == null)
+                    continue;
+
+                var sourceCenter = OffsetPoint(source.Center, offsetX, offsetY);
+                var targetCenter = OffsetPoint(target.Center, offsetX, offsetY);
+
+                var colorIndex = ResolveAnchorRelationColor(rel.Position, rel.Score);
+
+                DrawDebugLine(
+                    db,
+                    tr,
+                    layerName,
+                    sourceCenter,
+                    targetCenter,
+                    colorIndex);
+
+                var laneIndex = primaryLaneCounters[rel.Position];
+                primaryLaneCounters[rel.Position] = laneIndex + 1;
+
+                var labelPos = ComputeRelationLabelPosition(
+                    sourceCenter,
+                    targetCenter,
+                    laneIndex,
+                    baseOffset: 18.0,
+                    laneSpacing: 12.0);
+
+                DrawDebugText(
+                    db,
+                    tr,
+                    layerName,
+                    labelPos,
+                    BuildAnchorRelationLabel(rel),
+                    colorIndex,
+                    7.0);
+            }
+
+            // ------------------------------------------------------------
+            // 3) secondary relation: sibling / indirect
+            // ------------------------------------------------------------
+            var secondaryRelations = BuildSecondaryAnchorDisplayRelations(graph, map);
+
+            foreach (var rel in secondaryRelations
+                .OrderBy(x => GetIntentPriority(x.IntentSemantic))
+                .ThenByDescending(x => x.Score)
+                .ThenBy(x => x.SourceViewId)
+                .ThenBy(x => x.TargetViewId))
+            {
+                var source = graph.FindNode(rel.SourceViewId);
+                var target = graph.FindNode(rel.TargetViewId);
+
+                if (source == null || target == null)
+                    continue;
+
+                var sourceCenter = OffsetPoint(source.Center, offsetX, offsetY);
+                var targetCenter = OffsetPoint(target.Center, offsetX, offsetY);
+
+                var secondaryColor = ResolveSecondaryRelationColor(rel.IntentSemantic);
+                var laneIndex = GetSecondaryLaneIndex(rel.IntentSemantic);
+
+                DrawDebugLine(
+                    db,
+                    tr,
+                    layerName,
+                    sourceCenter,
+                    targetCenter,
+                    secondaryColor);
+
+                var labelPos = ComputeRelationLabelPosition(
+                    sourceCenter,
+                    targetCenter,
+                    laneIndex: laneIndex,
+                    baseOffset: 24.0,
+                    laneSpacing: 12.0);
+
+                DrawDebugText(
+                    db,
+                    tr,
+                    layerName,
+                    labelPos,
+                    BuildSecondaryRelationShortLabel(
+                        rel.IntentSemantic,
+                        rel.SiblingDirection,
+                        rel.Score),
+                    secondaryColor,
+                    6.5);
+            }
+        }
+
+        private static Point2D OffsetPoint(Point2D p, double dx, double dy)
+        {
+            return new Point2D(p.X + dx, p.Y + dy);
+        }
+
+        private static Bounds2D OffsetBounds(Bounds2D b, double dx, double dy)
+        {
+            if (b.IsEmpty)
+                return Bounds2D.Empty;
+
+            return new Bounds2D(
+                b.MinX + dx,
+                b.MinY + dy,
+                b.MaxX + dx,
+                b.MaxY + dy);
         }
 
 
