@@ -1,4 +1,5 @@
 ﻿using Bricscad.ApplicationServices;
+using Bricscad.ApplicationServices.Core;
 using FluxCAD.SheetAnalysis;
 using FluxCAD.SheetAnalysis.Structure.Analysis;
 using FluxCAD.SheetAnalysis.Structure.Builders;
@@ -7,21 +8,19 @@ using FluxCAD.SheetAnalysis.Structure.Models;
 using FluxCAD.SheetAnalysis.Structure.Results;
 using FluxCAD.SheetAnalysis.ViewIsolation;
 using FluxCAD.SheetAnalysis.ViewIsolation.Analysis;
+using FluxCAD.SheetAnalysis.ViewIsolation.Loops;
 using FluxCAD.SheetAnalysis.ViewProjection;
 using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Linq;
 using System.Text;
 using Teigha.DatabaseServices;
 //using Teigha.EditorInput;
 using Teigha.Geometry;
 using Teigha.GraphicsInterface;
+using Teigha.GraphicsSystem;
 using Teigha.Runtime;
-using Bricscad.ApplicationServices.Core;
-
-using FluxCAD.SheetAnalysis.ViewIsolation.Loops;
-using System.Linq;
-
 using TeighaColor = Teigha.Colors.Color;
 
 namespace FluxCAD.BricsCAD.Plugin26
@@ -297,7 +296,8 @@ namespace FluxCAD.BricsCAD.Plugin26
                     var semanticEntities = CollectIslandSemanticEntitiesFromPool(
                         semanticPool,
                         island,
-                        tolerance: dynamicTolerance);
+                        tolerance: dynamicTolerance,
+                        ed: ed);
 
                     var filteredSemanticEntities = semanticEntities
                         .Where(x => x != null)
@@ -308,9 +308,15 @@ namespace FluxCAD.BricsCAD.Plugin26
                         .Where(x => !x.IsLikelySemanticNoise)
                         .Where(x => !x.IsTableLikeLayer)
                         .Where(x => !x.IsTitleLikeLayer)
-                        .Where(x => !IsHiddenOrCenterEntity(x))
                         .Where(x => !IsSemanticFrameLikeEntity(x, sheetBounds))
                         .ToList();
+
+                    ed.WriteMessage(
+                        $"\n[FluxCAD] CopySemanticFilter I:{view.IslandId}, " +
+                        $"Before={semanticEntities.Count}, After={filteredSemanticEntities.Count}, " +
+                        $"HiddenOrCenterInSource={semanticEntities.Count(x => IsHiddenOrCenterEntity(x))}, " +
+                        $"DimInSource={semanticEntities.Count(x => x.IsDimensionLike)}, " +
+                        $"TextInSource={semanticEntities.Count(x => x.IsTextLike)}");
 
                     if (filteredSemanticEntities.Count == 0)
                     {
@@ -478,7 +484,9 @@ namespace FluxCAD.BricsCAD.Plugin26
                             tr,
                             work.SemanticEntities,
                             work.View.Bounds,
-                            sheetBounds);
+                            sheetBounds,
+                            ed,
+                            work.View.IslandId);
 
                         if (sourceIds.Count == 0)
                         {
@@ -1144,11 +1152,13 @@ namespace FluxCAD.BricsCAD.Plugin26
         }
 
         private static ObjectIdCollection CollectModelSpaceEntitiesForSemanticView(
-    Database db,
-    Transaction tr,
-    IReadOnlyList<SheetEntity> semanticEntities,
-    Bounds2D targetViewBounds,
-    Bounds2D sheetBounds)
+            Database db,
+            Transaction tr,
+            IReadOnlyList<SheetEntity> semanticEntities,
+            Bounds2D targetViewBounds,
+            Bounds2D sheetBounds,
+            Bricscad.EditorInput.Editor? ed = null,
+            int? viewId = null)
         {
             var result = new ObjectIdCollection();
 
@@ -1170,19 +1180,121 @@ namespace FluxCAD.BricsCAD.Plugin26
             var msId = SymbolUtilityServices.GetBlockModelSpaceId(db);
             var ms = (BlockTableRecord)tr.GetObject(msId, OpenMode.ForRead);
 
+            int totalModelSpace = 0;
+            int skippedInvalidOrErased = 0;
+            int skippedNullEntity = 0;
+
+            int rejectedDimension = 0;
+            int rejectedTextLike = 0;
+            int rejectedHatchOrSolid = 0;
+            int rejectedHiddenOrCenter = 0;
+            int rejectedNoBounds = 0;
+            int rejectedFrameLike = 0;
+            int rejectedNoViewIntersect = 0;
+            int rejectedNoSemanticIntersect = 0;
+
+            int accepted = 0;
+
             foreach (ObjectId id in ms)
             {
+                totalModelSpace++;
+
                 if (!id.IsValid || id.IsErased)
+                {
+                    skippedInvalidOrErased++;
                     continue;
+                }
 
                 var ent = tr.GetObject(id, OpenMode.ForRead, false) as Entity;
                 if (ent == null)
+                {
+                    skippedNullEntity++;
                     continue;
+                }
 
-                if (!ShouldCopyEntityBySemanticBounds(ent, semanticBounds, targetViewBounds, sheetBounds))
+                if (ent is Dimension)
+                {
+                    rejectedDimension++;
                     continue;
+                }
+
+                if (ent is DBText || ent is MText || ent is MLeader || ent is Leader)
+                {
+                    rejectedTextLike++;
+                    continue;
+                }
+
+                if (ent is Hatch || ent is Solid)
+                {
+                    rejectedHatchOrSolid++;
+                    continue;
+                }
+
+                if (IsHiddenOrCenterCadEntity(ent))
+                {
+                    rejectedHiddenOrCenter++;
+                    continue;
+                }
+
+                if (!TryGetEntityBoundsSafe(ent, out var bounds) || bounds.IsEmpty)
+                {
+                    rejectedNoBounds++;
+                    continue;
+                }
+
+                if (IsCadEntityFrameLike(bounds, sheetBounds))
+                {
+                    rejectedFrameLike++;
+                    continue;
+                }
+
+                if (!Bounds2DHelper.Intersects(targetViewBounds, bounds, tolerance: 0.0))
+                {
+                    rejectedNoViewIntersect++;
+                    continue;
+                }
+
+                bool intersectsSemantic = false;
+                foreach (var sb in semanticBounds)
+                {
+                    if (sb.IsEmpty)
+                        continue;
+
+                    if (Bounds2DHelper.Intersects(sb, bounds, tolerance: 2.0))
+                    {
+                        intersectsSemantic = true;
+                        break;
+                    }
+                }
+
+                if (!intersectsSemantic)
+                {
+                    rejectedNoSemanticIntersect++;
+                    continue;
+                }
 
                 result.Add(id);
+                accepted++;
+            }
+
+            if (ed != null)
+            {
+                var tag = viewId.HasValue ? $"I:{viewId.Value}" : "I:?";
+
+                ed.WriteMessage(
+                    $"\n[FluxCAD] CopySourceCollect {tag}, " +
+                    $"ModelSpace={totalModelSpace}, " +
+                    $"Accepted={accepted}, " +
+                    $"InvalidOrErased={skippedInvalidOrErased}, " +
+                    $"NullEntity={skippedNullEntity}, " +
+                    $"Dimension={rejectedDimension}, " +
+                    $"TextLike={rejectedTextLike}, " +
+                    $"HatchOrSolid={rejectedHatchOrSolid}, " +
+                    $"HiddenOrCenter={rejectedHiddenOrCenter}, " +
+                    $"NoBounds={rejectedNoBounds}, " +
+                    $"FrameLike={rejectedFrameLike}, " +
+                    $"NoViewIntersect={rejectedNoViewIntersect}, " +
+                    $"NoSemanticIntersect={rejectedNoSemanticIntersect}");
             }
 
             return result;
@@ -2561,13 +2673,19 @@ namespace FluxCAD.BricsCAD.Plugin26
 
                 double score = 0.0;
 
-                // 1. anchor relation score 우선
+                // 1. anchor relation score
                 score += node.Score * 10.0;
 
-                // 2. area
+                // 2. direct / reverse relation bonus
+                if (IsDirectOrReverseReason(node.Reason))
+                    score += 3.0;
+                else if (IsIndirectReason(node.Reason))
+                    score -= 1.5;
+
+                // 3. area
                 score += view.Area * 0.001;
 
-                // 3. 너무 얇은 뷰는 살짝 감점
+                // 4. 너무 얇은 뷰는 살짝 감점
                 var minor = Math.Max(Math.Min(view.Width, view.Height), 1e-6);
                 var major = Math.Max(view.Width, view.Height);
                 var aspect = major / minor;
@@ -2584,6 +2702,7 @@ namespace FluxCAD.BricsCAD.Plugin26
 
             return bestViewId;
         }
+
 
         private static ProjectionDirection ResolveTargetRelativeDirection(
     ViewCluster source,
@@ -3095,6 +3214,7 @@ namespace FluxCAD.BricsCAD.Plugin26
         }
 
 
+
         private static AnchorRelativeNode? ResolveIndirectAgainstAnchorGroups(
     ViewGraph graph,
     IReadOnlyDictionary<AnchorRelativePosition, List<AnchorRelativeNode>> groups,
@@ -3117,7 +3237,15 @@ namespace FluxCAD.BricsCAD.Plugin26
                 if (members == null || members.Count == 0)
                     continue;
 
-                foreach (var member in members)
+                // direct/reverse member를 먼저 쓰도록 정렬
+                var orderedMembers = members
+                    .Where(x => x != null)
+                    .OrderByDescending(x => IsDirectOrReverseReason(x.Reason))
+                    .ThenByDescending(x => x.Score)
+                    .ThenBy(x => x.ViewId)
+                    .ToList();
+
+                foreach (var member in orderedMembers)
                 {
                     var viaNode = graph.FindNode(member.ViewId);
                     if (viaNode == null)
@@ -3132,16 +3260,22 @@ namespace FluxCAD.BricsCAD.Plugin26
                     if (relation == null)
                         continue;
 
-                    // 중요: via -> target 기준으로 target의 상대 방향을 직접 계산
-                    var siblingDirection = ResolveTargetRelativeDirection(viaNode, targetNode);
+                    // 핵심: relation analyzer가 계산한 방향을 그대로 사용
+                    var siblingDirection = ResolveSiblingDirection(
+                        targetId,
+                        member.ViewId,
+                        relation);
 
                     if (!IsSiblingCompatibleWithAnchorGroup(basePos, siblingDirection))
                         continue;
 
                     var semanticIntent = ResolveViewIntentSemantic(basePos, siblingDirection);
 
-                    // direct보다 약간 낮게
-                    var score = relation.Score * 0.90;
+                    // direct via를 우선
+                    var directViaBonus = IsDirectOrReverseReason(member.Reason) ? 0.08 : 0.0;
+                    var chainPenalty = IsIndirectReason(member.Reason) ? 0.06 : 0.0;
+
+                    var score = relation.Score * 0.90 + directViaBonus - chainPenalty;
 
                     if (score <= bestScore)
                         continue;
@@ -3277,7 +3411,8 @@ namespace FluxCAD.BricsCAD.Plugin26
             var finalized = groups.ToDictionary(
                 kv => kv.Key,
                 kv => (IReadOnlyList<AnchorRelativeNode>)kv.Value
-                    .OrderByDescending(x => x.Score)
+                    .OrderByDescending(x => IsDirectOrReverseReason(x.Reason))
+                    .ThenByDescending(x => x.Score)
                     .ThenBy(x => x.ViewId)
                     .ToList());
 
@@ -4515,7 +4650,8 @@ namespace FluxCAD.BricsCAD.Plugin26
                 var semanticEntities = CollectIslandSemanticEntitiesFromPool(
                     semanticPool,
                     island,
-                    tolerance: dynamicTolerance);
+                    tolerance: dynamicTolerance,
+                    ed: ed);
 
                 var role = DetermineIslandSemanticRoleFromContext(island, semanticEntities);
                 island.SemanticRole = role;
@@ -6423,7 +6559,8 @@ namespace FluxCAD.BricsCAD.Plugin26
                 var semanticEntities = CollectIslandSemanticEntitiesFromPool(
                     semanticPool,
                     island,
-                    tolerance: dynamicTolerance);
+                    tolerance: dynamicTolerance,
+                    ed: ed);
 
                 var reassignedRole = DetermineIslandSemanticRoleFromContext(
                     island,
@@ -6577,9 +6714,10 @@ namespace FluxCAD.BricsCAD.Plugin26
 
 
         private static IReadOnlyList<SheetEntity> CollectIslandSemanticEntitiesFromPool(
-    IReadOnlyList<SheetEntity> semanticPool,
-    OccupancyHitIsland island,
-    double tolerance)
+            IReadOnlyList<SheetEntity> semanticPool,
+            OccupancyHitIsland island,
+            double tolerance,
+            Bricscad.EditorInput.Editor? ed = null)
         {
             if (semanticPool == null)
                 throw new ArgumentNullException(nameof(semanticPool));
@@ -6588,10 +6726,30 @@ namespace FluxCAD.BricsCAD.Plugin26
 
             var islandBounds = Bounds2DHelper.Inflate(island.Bounds, tolerance);
 
-            var result = semanticPool
+            var rawIntersected = semanticPool
+                .Where(x => x != null)
+                .Where(x => !Bounds2DHelper.IsEmpty(x.Bounds))
                 .Where(x => Bounds2DHelper.Intersects(islandBounds, x.Bounds, tolerance: 0))
+                .ToList();
+
+            var oversizedRejected = rawIntersected
+                .Where(x => IsObviouslyOversizedForIsland(x, island, islandBounds))
+                .ToList();
+
+            var result = rawIntersected
                 .Where(x => !IsObviouslyOversizedForIsland(x, island, islandBounds))
                 .ToList();
+
+            if (ed != null)
+            {
+                ed.WriteMessage(
+                    $"\n[FluxCAD] IslandSemanticCollect I:{island.Id}, " +
+                    $"Tol={tolerance:0.##}, " +
+                    $"Intersected={rawIntersected.Count}, " +
+                    $"OversizedRejected={oversizedRejected.Count}, " +
+                    $"Final={result.Count}, " +
+                    $"IslandSize=({island.Bounds.Width:0.##}x{island.Bounds.Height:0.##})");
+            }
 
             return result;
         }
