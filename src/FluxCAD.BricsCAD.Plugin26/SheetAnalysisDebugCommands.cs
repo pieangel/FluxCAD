@@ -166,6 +166,14 @@ namespace FluxCAD.BricsCAD.Plugin26
             public List<SheetEntity> SemanticEntities { get; init; } = new();
         }
 
+        private sealed class ProjectionPlacement
+        {
+            public int ViewId { get; init; }
+            public Bounds2D TargetBounds { get; init; } = Bounds2D.Empty;
+            public string Reason { get; init; } = string.Empty;
+        }
+
+
 
 
         [CommandMethod("FLUX_COPY_TOPLEVEL_GEOMETRY_VIEWS_OUTSIDE")]
@@ -271,8 +279,6 @@ namespace FluxCAD.BricsCAD.Plugin26
 
                 // ------------------------------------------------------------
                 // 4) view별 복사 작업 데이터 미리 구성
-                //    핵심: 여기서는 source view별 entity만 모으고,
-                //          이동 벡터는 아직 계산하지 않는다.
                 // ------------------------------------------------------------
                 var workItems = new List<CopyViewWorkItem>();
 
@@ -327,8 +333,8 @@ namespace FluxCAD.BricsCAD.Plugin26
                 }
 
                 // ------------------------------------------------------------
-                // 5) projection 구조 기준 정렬 순서 계산
-                //    실제 위치는 유지한 채, 처리/로그 순서만 구조적으로 정돈
+                // 5) anchor / ordered view 계산
+                //    주의: 정렬 순서/로그용으로만 사용하고 배치 좌표는 건드리지 않음
                 // ------------------------------------------------------------
                 var anchorCandidate = workItems
                     .Select(x => x.View)
@@ -345,11 +351,14 @@ namespace FluxCAD.BricsCAD.Plugin26
                         .OrderByDescending(x => x.Area)
                         .First();
 
-                var orderedViews = OrderViewsForProjectionCopy(workItems.Select(x => x.View).ToList(), anchorCandidate, ed);
+                var orderedViews = OrderViewsForProjectionCopy(
+                    workItems.Select(x => x.View).ToList(),
+                    anchorCandidate,
+                    ed);
 
                 // ------------------------------------------------------------
                 // 6) 전체 group bounds 계산
-                //    핵심: 이제부터는 view별 dx 금지
+                //    핵심: 원본 상대 위치는 그대로 두고 group 전체만 이동
                 // ------------------------------------------------------------
                 var groupBounds = UnionBounds(workItems.Select(x => x.View.Bounds));
                 if (groupBounds.IsEmpty)
@@ -363,14 +372,14 @@ namespace FluxCAD.BricsCAD.Plugin26
                 var groupDy = 0.0;
 
                 ed.WriteMessage(
-                    $"\n[FluxCAD] CopyGroupBounds={groupBounds}, GroupOffset=({groupDx:0.##},{groupDy:0.##}), Anchor={anchorCandidate.IslandId}");
+                    $"\n[FluxCAD] CopyGroupBounds={groupBounds}, " +
+                    $"GroupOffset=({groupDx:0.##},{groupDy:0.##}), Anchor={anchorCandidate.IslandId}");
 
                 int totalSourceCount = 0;
                 int totalCopiedCount = 0;
 
                 // ------------------------------------------------------------
-                // 7) 각 view는 source 수집만 따로 하되,
-                //    displacement는 모두 동일한 groupDx/groupDy를 사용
+                // 7) 모든 view에 동일 displacement 적용
                 // ------------------------------------------------------------
                 foreach (var view in orderedViews)
                 {
@@ -454,25 +463,289 @@ namespace FluxCAD.BricsCAD.Plugin26
             }
         }
 
-//         private static Bounds2D UnionBounds(IEnumerable<Bounds2D> boundsList)
-//         {
-//             if (boundsList == null)
-//                 return Bounds2D.Empty;
-// 
-//             var valid = boundsList
-//                 .Where(x => !x.IsEmpty)
-//                 .ToList();
-// 
-//             if (valid.Count == 0)
-//                 return Bounds2D.Empty;
-// 
-//             var minX = valid.Min(x => x.MinX);
-//             var minY = valid.Min(x => x.MinY);
-//             var maxX = valid.Max(x => x.MaxX);
-//             var maxY = valid.Max(x => x.MaxY);
-// 
-//             return new Bounds2D(minX, minY, maxX, maxY);
-//         }
+
+        private List<ProjectionPlacement> BuildProjectionPlacements(
+    IReadOnlyList<ViewCandidate> views,
+    ViewCandidate anchorCandidate,
+    Bounds2D targetGroupBounds,
+    Bricscad.EditorInput.Editor ed)
+        {
+            var result = new List<ProjectionPlacement>();
+
+            if (views == null || views.Count == 0)
+                return result;
+
+            if (anchorCandidate == null)
+                return result;
+
+            var viewClusters = BuildViewClustersFromCandidates(
+                views,
+                anchorCandidate,
+                ed);
+
+            var anchorView = viewClusters.FirstOrDefault(x => x.Id == anchorCandidate.IslandId);
+            if (anchorView == null)
+                return result;
+
+            var policy = new ProjectionLayoutPolicy
+            {
+                PreferThirdAngleLayout = true,
+                MinBandOverlapRatio = 0.45,
+                MaxNormalizedNeighborGap = 1.50,
+                MinRelationScore = 0.40,
+
+                AllowTopView = false,
+                AllowBottomView = false,
+                AllowLeftView = false,
+                AllowRightView = false,
+                AllowSectionView = false,
+                AllowDetailView = false
+            };
+
+            var analyzer = new ProjectionLayoutAnalyzer();
+            var rawLayout = analyzer.Analyze(viewClusters, policy);
+
+            var filteredRelations = rawLayout.Relations
+                .Where(x => x != null)
+                .Where(x => x.Score >= policy.MinRelationScore)
+                .Where(x => x.Direction != ProjectionDirection.Overlapping)
+                .OrderByDescending(x => x.Score)
+                .ToList();
+
+            var graph = new ViewGraph
+            {
+                Anchor = anchorView,
+                Nodes = viewClusters,
+                Layout = new ProjectionLayoutResult
+                {
+                    Relations = filteredRelations
+                }
+            };
+
+            var map = BuildRelativePositionMap(graph, minScore: 0.40);
+
+            // 기준 배치 간격
+            var horizontalGap = Math.Max(anchorCandidate.Width * 0.18, 80.0);
+            var verticalGap = Math.Max(anchorCandidate.Height * 0.25, 80.0);
+
+            // anchor를 targetGroupBounds 안의 기준 위치에 둠
+            var anchorTargetBounds = new Bounds2D(
+                targetGroupBounds.MinX,
+                targetGroupBounds.MinY + (targetGroupBounds.Height - anchorCandidate.Height) * 0.5,
+                targetGroupBounds.MinX + anchorCandidate.Width,
+                targetGroupBounds.MinY + (targetGroupBounds.Height - anchorCandidate.Height) * 0.5 + anchorCandidate.Height);
+
+            result.Add(new ProjectionPlacement
+            {
+                ViewId = anchorCandidate.IslandId,
+                TargetBounds = anchorTargetBounds,
+                Reason = "Anchor"
+            });
+
+            var placedIds = new HashSet<int> { anchorCandidate.IslandId };
+            var viewMap = views.ToDictionary(x => x.IslandId);
+
+            // 1차 direct group 배치
+            PlaceAnchorGroup(map, AnchorRelativePosition.Above, result, placedIds, viewMap, anchorTargetBounds, horizontalGap, verticalGap);
+            PlaceAnchorGroup(map, AnchorRelativePosition.Below, result, placedIds, viewMap, anchorTargetBounds, horizontalGap, verticalGap);
+            PlaceAnchorGroup(map, AnchorRelativePosition.Left, result, placedIds, viewMap, anchorTargetBounds, horizontalGap, verticalGap);
+            PlaceAnchorGroup(map, AnchorRelativePosition.Right, result, placedIds, viewMap, anchorTargetBounds, horizontalGap, verticalGap);
+
+            // unresolved fallback: 기존 상대위치를 anchor 기준으로 보존하되, target 영역 안으로 이동
+            foreach (var view in views.OrderBy(x => x.IslandId))
+            {
+                if (placedIds.Contains(view.IslandId))
+                    continue;
+
+                var dx = view.Bounds.MinX - anchorCandidate.Bounds.MinX;
+                var dy = view.Bounds.MinY - anchorCandidate.Bounds.MinY;
+
+                var fallbackBounds = new Bounds2D(
+                    anchorTargetBounds.MinX + dx,
+                    anchorTargetBounds.MinY + dy,
+                    anchorTargetBounds.MinX + dx + view.Width,
+                    anchorTargetBounds.MinY + dy + view.Height);
+
+                result.Add(new ProjectionPlacement
+                {
+                    ViewId = view.IslandId,
+                    TargetBounds = fallbackBounds,
+                    Reason = "FallbackRelativeToAnchor"
+                });
+
+                placedIds.Add(view.IslandId);
+            }
+
+            return result;
+        }
+
+        private void PlaceAnchorGroup(
+    RelativePositionMap map,
+    AnchorRelativePosition position,
+    List<ProjectionPlacement> result,
+    HashSet<int> placedIds,
+    IReadOnlyDictionary<int, ViewCandidate> viewMap,
+    Bounds2D anchorTargetBounds,
+    double horizontalGap,
+    double verticalGap)
+        {
+            if (map == null)
+                return;
+
+            if (!map.Groups.TryGetValue(position, out var nodes) || nodes == null || nodes.Count == 0)
+                return;
+
+            var ordered = nodes
+                .Where(x => x != null)
+                .OrderByDescending(x => x.Score)
+                .ThenBy(x => x.ViewId)
+                .ToList();
+
+            double cursorX, cursorY;
+
+            switch (position)
+            {
+                case AnchorRelativePosition.Above:
+                    {
+                        cursorX = anchorTargetBounds.MinX;
+                        cursorY = anchorTargetBounds.MaxY + verticalGap;
+
+                        foreach (var node in ordered)
+                        {
+                            if (!viewMap.TryGetValue(node.ViewId, out var view))
+                                continue;
+
+                            var b = new Bounds2D(
+                                cursorX,
+                                cursorY,
+                                cursorX + view.Width,
+                                cursorY + view.Height);
+
+                            result.Add(new ProjectionPlacement
+                            {
+                                ViewId = view.IslandId,
+                                TargetBounds = b,
+                                Reason = "Above"
+                            });
+
+                            placedIds.Add(view.IslandId);
+                            cursorX += view.Width + horizontalGap;
+                        }
+
+                        break;
+                    }
+
+                case AnchorRelativePosition.Below:
+                    {
+                        cursorX = anchorTargetBounds.MinX;
+                        cursorY = anchorTargetBounds.MinY - verticalGap;
+
+                        foreach (var node in ordered)
+                        {
+                            if (!viewMap.TryGetValue(node.ViewId, out var view))
+                                continue;
+
+                            var b = new Bounds2D(
+                                cursorX,
+                                cursorY - view.Height,
+                                cursorX + view.Width,
+                                cursorY);
+
+                            result.Add(new ProjectionPlacement
+                            {
+                                ViewId = view.IslandId,
+                                TargetBounds = b,
+                                Reason = "Below"
+                            });
+
+                            placedIds.Add(view.IslandId);
+                            cursorX += view.Width + horizontalGap;
+                        }
+
+                        break;
+                    }
+
+                case AnchorRelativePosition.Left:
+                    {
+                        cursorX = anchorTargetBounds.MinX - horizontalGap;
+                        cursorY = anchorTargetBounds.MinY;
+
+                        foreach (var node in ordered)
+                        {
+                            if (!viewMap.TryGetValue(node.ViewId, out var view))
+                                continue;
+
+                            var b = new Bounds2D(
+                                cursorX - view.Width,
+                                cursorY,
+                                cursorX,
+                                cursorY + view.Height);
+
+                            result.Add(new ProjectionPlacement
+                            {
+                                ViewId = view.IslandId,
+                                TargetBounds = b,
+                                Reason = "Left"
+                            });
+
+                            placedIds.Add(view.IslandId);
+                            cursorY -= (view.Height + verticalGap);
+                        }
+
+                        break;
+                    }
+
+                case AnchorRelativePosition.Right:
+                    {
+                        cursorX = anchorTargetBounds.MaxX + horizontalGap;
+                        cursorY = anchorTargetBounds.MinY;
+
+                        foreach (var node in ordered)
+                        {
+                            if (!viewMap.TryGetValue(node.ViewId, out var view))
+                                continue;
+
+                            var b = new Bounds2D(
+                                cursorX,
+                                cursorY,
+                                cursorX + view.Width,
+                                cursorY + view.Height);
+
+                            result.Add(new ProjectionPlacement
+                            {
+                                ViewId = view.IslandId,
+                                TargetBounds = b,
+                                Reason = "Right"
+                            });
+
+                            placedIds.Add(view.IslandId);
+                            cursorY -= (view.Height + verticalGap);
+                        }
+
+                        break;
+                    }
+            }
+        }
+
+        //         private static Bounds2D UnionBounds(IEnumerable<Bounds2D> boundsList)
+        //         {
+        //             if (boundsList == null)
+        //                 return Bounds2D.Empty;
+        // 
+        //             var valid = boundsList
+        //                 .Where(x => !x.IsEmpty)
+        //                 .ToList();
+        // 
+        //             if (valid.Count == 0)
+        //                 return Bounds2D.Empty;
+        // 
+        //             var minX = valid.Min(x => x.MinX);
+        //             var minY = valid.Min(x => x.MinY);
+        //             var maxX = valid.Max(x => x.MaxX);
+        //             var maxY = valid.Max(x => x.MaxY);
+        // 
+        //             return new Bounds2D(minX, minY, maxX, maxY);
+        //         }
 
         private List<ViewCandidate> OrderViewsForProjectionCopy(
     IReadOnlyList<ViewCandidate> views,
