@@ -159,6 +159,1343 @@ namespace FluxCAD.BricsCAD.Plugin26
             public List<ProjectionGroupDto> Groups { get; } = new();
         }
 
+        private sealed class CopyViewWorkItem
+        {
+            public ViewCandidate View { get; init; } = null!;
+            public OccupancyHitIsland Island { get; init; } = null!;
+            public List<SheetEntity> SemanticEntities { get; init; } = new();
+        }
+
+
+
+        [CommandMethod("FLUX_COPY_TOPLEVEL_GEOMETRY_VIEWS_OUTSIDE")]
+        public void FluxCopyTopLevelGeometryViewsOutside()
+        {
+            var doc = Bricscad.ApplicationServices.Application.DocumentManager.MdiActiveDocument;
+            if (doc == null)
+                return;
+
+            var db = doc.Database;
+            var ed = doc.Editor;
+
+            try
+            {
+                var sheetFilePath = db.Filename;
+                if (string.IsNullOrWhiteSpace(sheetFilePath))
+                {
+                    ed.WriteMessage("\n[FluxCAD] 저장된 DWG 파일이 아닙니다.");
+                    return;
+                }
+
+                // ------------------------------------------------------------
+                // 1) 현재까지 완성된 해석 파이프라인 재사용
+                // ------------------------------------------------------------
+                var candidates = BuildResolvedViewCandidates(sheetFilePath, ed);
+                if (candidates == null || candidates.Count == 0)
+                {
+                    ed.WriteMessage("\n[FluxCAD] view candidate가 비어 있습니다.");
+                    return;
+                }
+
+                var topLevelGeometryViews = candidates
+                    .Where(x => x != null)
+                    .Where(x => x.FinalRole == ViewIslandSemanticRole.GeometryView)
+                    .Where(x => x.IsTopLevelView)
+                    .Where(x => !x.IsSparseBridgeLike)
+                    .ToList();
+
+                if (topLevelGeometryViews.Count == 0)
+                {
+                    ed.WriteMessage("\n[FluxCAD] 복사할 TopLevel GeometryView가 없습니다.");
+                    return;
+                }
+
+                // ------------------------------------------------------------
+                // 2) snapshot + semantic pipeline 다시 확보
+                // ------------------------------------------------------------
+                IEntitySnapshotBuilder snapshotBuilder = new SimpleSheetFileSnapshotBuilder();
+                var fullEntities = snapshotBuilder.Build(sheetFilePath);
+
+                if (fullEntities == null || fullEntities.Count == 0)
+                {
+                    ed.WriteMessage("\n[FluxCAD] snapshot이 비어 있습니다.");
+                    return;
+                }
+
+                var pipeline = BuildSemanticIslandPipeline(
+                    fullEntities,
+                    ed,
+                    closeSingleCellGaps: false,
+                    targetCellSize: 12.0,
+                    excludeSparseBridgeFromGroups: false);
+
+                if (pipeline == null || pipeline.SemanticResults == null || pipeline.SemanticResults.Count == 0)
+                {
+                    ed.WriteMessage("\n[FluxCAD] semantic pipeline 결과가 비어 있습니다.");
+                    return;
+                }
+
+                var rebuiltSemanticResults = RebuildSemanticResultsWithReassignedRoles(
+                    pipeline.SemanticResults,
+                    fullEntities,
+                    ed);
+
+                var islandMap = rebuiltSemanticResults
+                    .Where(x => x != null && x.Island != null)
+                    .ToDictionary(x => x.Island.Id, x => x.Island);
+
+                var sheetBounds = Bounds2DHelper.FromEntities(fullEntities);
+                var semanticPool = BuildSemanticEvidencePool(fullEntities, sheetBounds, ed);
+
+                // ------------------------------------------------------------
+                // 3) DB 전체 bounds 확보 (복사 배치용)
+                // ------------------------------------------------------------
+                Bounds2D modelBounds;
+
+                using (doc.LockDocument())
+                using (var tr = db.TransactionManager.StartTransaction())
+                {
+                    var msId = SymbolUtilityServices.GetBlockModelSpaceId(db);
+                    var ms = (BlockTableRecord)tr.GetObject(msId, OpenMode.ForRead);
+                    modelBounds = GetModelSpaceBounds(ms, tr);
+                    tr.Commit();
+                }
+
+                if (modelBounds.IsEmpty)
+                {
+                    ed.WriteMessage("\n[FluxCAD] model bounds가 비어 있습니다.");
+                    return;
+                }
+
+                var groupGap = Math.Max(modelBounds.Width * 0.12, 220.0);
+
+                // ------------------------------------------------------------
+                // 4) view별 복사 작업 데이터 미리 구성
+                //    핵심: 여기서는 source view별 entity만 모으고,
+                //          이동 벡터는 아직 계산하지 않는다.
+                // ------------------------------------------------------------
+                var workItems = new List<CopyViewWorkItem>();
+
+                foreach (var view in topLevelGeometryViews)
+                {
+                    if (!islandMap.TryGetValue(view.IslandId, out var island))
+                    {
+                        ed.WriteMessage($"\n[FluxCAD] Island={view.IslandId} semantic island를 찾지 못했습니다.");
+                        continue;
+                    }
+
+                    var dynamicTolerance = Math.Max(
+                        3.0,
+                        Math.Min(island.Bounds.Width, island.Bounds.Height) * 0.5);
+
+                    var semanticEntities = CollectIslandSemanticEntitiesFromPool(
+                        semanticPool,
+                        island,
+                        tolerance: dynamicTolerance);
+
+                    var filteredSemanticEntities = semanticEntities
+                        .Where(x => x != null)
+                        .Where(x => x.IsVisible)
+                        .Where(x => x.IsGeometryLike)
+                        .Where(x => !x.IsTextLike)
+                        .Where(x => !x.IsDimensionLike)
+                        .Where(x => !x.IsLikelySemanticNoise)
+                        .Where(x => !x.IsTableLikeLayer)
+                        .Where(x => !x.IsTitleLikeLayer)
+                        .Where(x => !IsHiddenOrCenterEntity(x))
+                        .Where(x => !IsSemanticFrameLikeEntity(x, sheetBounds))
+                        .ToList();
+
+                    if (filteredSemanticEntities.Count == 0)
+                    {
+                        ed.WriteMessage($"\n[FluxCAD] Island={view.IslandId} 복사할 semantic entity가 없습니다.");
+                        continue;
+                    }
+
+                    workItems.Add(new CopyViewWorkItem
+                    {
+                        View = view,
+                        Island = island,
+                        SemanticEntities = filteredSemanticEntities
+                    });
+                }
+
+                if (workItems.Count == 0)
+                {
+                    ed.WriteMessage("\n[FluxCAD] 최종 복사 가능한 work item이 없습니다.");
+                    return;
+                }
+
+                // ------------------------------------------------------------
+                // 5) projection 구조 기준 정렬 순서 계산
+                //    실제 위치는 유지한 채, 처리/로그 순서만 구조적으로 정돈
+                // ------------------------------------------------------------
+                var anchorCandidate = workItems
+                    .Select(x => x.View)
+                    .FirstOrDefault(x => x.IsRepresentativePrimaryView)
+                    ?? workItems
+                        .Select(x => x.View)
+                        .Where(x => x.IsPrimaryView)
+                        .OrderByDescending(x => x.RepresentativePrimaryScore)
+                        .ThenByDescending(x => x.PrimaryScore)
+                        .ThenByDescending(x => x.Area)
+                        .FirstOrDefault()
+                    ?? workItems
+                        .Select(x => x.View)
+                        .OrderByDescending(x => x.Area)
+                        .First();
+
+                var orderedViews = OrderViewsForProjectionCopy(workItems.Select(x => x.View).ToList(), anchorCandidate, ed);
+
+                // ------------------------------------------------------------
+                // 6) 전체 group bounds 계산
+                //    핵심: 이제부터는 view별 dx 금지
+                // ------------------------------------------------------------
+                var groupBounds = UnionBounds(workItems.Select(x => x.View.Bounds));
+                if (groupBounds.IsEmpty)
+                {
+                    ed.WriteMessage("\n[FluxCAD] group bounds가 비어 있습니다.");
+                    return;
+                }
+
+                var targetGroupMinX = modelBounds.MaxX + groupGap;
+                var groupDx = targetGroupMinX - groupBounds.MinX;
+                var groupDy = 0.0;
+
+                ed.WriteMessage(
+                    $"\n[FluxCAD] CopyGroupBounds={groupBounds}, GroupOffset=({groupDx:0.##},{groupDy:0.##}), Anchor={anchorCandidate.IslandId}");
+
+                int totalSourceCount = 0;
+                int totalCopiedCount = 0;
+
+                // ------------------------------------------------------------
+                // 7) 각 view는 source 수집만 따로 하되,
+                //    displacement는 모두 동일한 groupDx/groupDy를 사용
+                // ------------------------------------------------------------
+                foreach (var view in orderedViews)
+                {
+                    var work = workItems.FirstOrDefault(x => x.View.IslandId == view.IslandId);
+                    if (work == null)
+                        continue;
+
+                    ObjectIdCollection sourceIds;
+                    int copiedCount;
+
+                    using (doc.LockDocument())
+                    using (var tr = db.TransactionManager.StartTransaction())
+                    {
+                        sourceIds = CollectModelSpaceEntitiesForSemanticView(
+                            db,
+                            tr,
+                            work.SemanticEntities,
+                            work.View.Bounds,
+                            sheetBounds);
+
+                        if (sourceIds.Count == 0)
+                        {
+                            ed.WriteMessage($"\n[FluxCAD] Island={view.IslandId} sourceIds가 비어 있습니다.");
+                            tr.Commit();
+                            continue;
+                        }
+
+                        var msId = SymbolUtilityServices.GetBlockModelSpaceId(db);
+                        var mapping = new IdMapping();
+                        db.DeepCloneObjects(sourceIds, msId, mapping, false);
+
+                        var displacement = Matrix3d.Displacement(new Vector3d(groupDx, groupDy, 0.0));
+                        copiedCount = 0;
+
+                        foreach (IdPair pair in mapping)
+                        {
+                            if (!pair.IsCloned)
+                                continue;
+
+                            var cloned = tr.GetObject(pair.Value, OpenMode.ForWrite, false) as Entity;
+                            if (cloned == null)
+                                continue;
+
+                            cloned.TransformBy(displacement);
+                            copiedCount++;
+                        }
+
+                        var labelPos = new Point2D(
+                            work.View.Center.X + groupDx,
+                            work.View.Bounds.MaxY + groupDy + Math.Max(work.View.Height * 0.08, 20.0));
+
+                        DrawDebugText(
+                            db,
+                            tr,
+                            EnsureCopyOutputLayer(db, tr),
+                            labelPos,
+                            BuildCopiedViewLabel(view),
+                            ResolveCopiedViewColor(view),
+                            Math.Max(10.0, Math.Min(view.Bounds.Width, view.Bounds.Height) * 0.08));
+
+                        totalSourceCount += sourceIds.Count;
+                        totalCopiedCount += copiedCount;
+
+                        tr.Commit();
+
+                        ed.WriteMessage(
+                            $"\n[FluxCAD] Copied View Island={view.IslandId}, " +
+                            $"Semantic={work.SemanticEntities.Count}, SourceIds={sourceIds.Count}, Copied={copiedCount}, " +
+                            $"GroupOffset=({groupDx:0.##},{groupDy:0.##})");
+                    }
+                }
+
+                ed.WriteMessage(
+                    $"\n[FluxCAD] TopLevel Geometry Views copied outside. " +
+                    $"Views={orderedViews.Count}, TotalSource={totalSourceCount}, TotalCopied={totalCopiedCount}, " +
+                    $"GroupOffset=({groupDx:0.##},{groupDy:0.##})");
+            }
+            catch (System.Exception ex)
+            {
+                ed.WriteMessage($"\n[FluxCAD] FLUX_COPY_TOPLEVEL_GEOMETRY_VIEWS_OUTSIDE failed: {ex}");
+            }
+        }
+
+//         private static Bounds2D UnionBounds(IEnumerable<Bounds2D> boundsList)
+//         {
+//             if (boundsList == null)
+//                 return Bounds2D.Empty;
+// 
+//             var valid = boundsList
+//                 .Where(x => !x.IsEmpty)
+//                 .ToList();
+// 
+//             if (valid.Count == 0)
+//                 return Bounds2D.Empty;
+// 
+//             var minX = valid.Min(x => x.MinX);
+//             var minY = valid.Min(x => x.MinY);
+//             var maxX = valid.Max(x => x.MaxX);
+//             var maxY = valid.Max(x => x.MaxY);
+// 
+//             return new Bounds2D(minX, minY, maxX, maxY);
+//         }
+
+        private List<ViewCandidate> OrderViewsForProjectionCopy(
+    IReadOnlyList<ViewCandidate> views,
+    ViewCandidate anchorCandidate,
+    Bricscad.EditorInput.Editor ed)
+        {
+            if (views == null || views.Count == 0)
+                return new List<ViewCandidate>();
+
+            if (anchorCandidate == null)
+                return views.OrderBy(x => x.IslandId).ToList();
+
+            var viewClusters = BuildViewClustersFromCandidates(
+                views,
+                anchorCandidate,
+                ed);
+
+            var anchorView = viewClusters.FirstOrDefault(x => x.Id == anchorCandidate.IslandId);
+            if (anchorView == null)
+            {
+                return views
+                    .OrderByDescending(x => x.IsRepresentativePrimaryView)
+                    .ThenByDescending(x => x.IsPrimaryView)
+                    .ThenBy(x => x.Bounds.MinY)
+                    .ThenBy(x => x.Bounds.MinX)
+                    .ToList();
+            }
+
+            var policy = new ProjectionLayoutPolicy
+            {
+                PreferThirdAngleLayout = true,
+                MinBandOverlapRatio = 0.45,
+                MaxNormalizedNeighborGap = 1.50,
+                MinRelationScore = 0.40,
+
+                AllowTopView = false,
+                AllowBottomView = false,
+                AllowLeftView = false,
+                AllowRightView = false,
+                AllowSectionView = false,
+                AllowDetailView = false
+            };
+
+            var analyzer = new ProjectionLayoutAnalyzer();
+            var rawLayout = analyzer.Analyze(viewClusters, policy);
+
+            var filteredRelations = rawLayout.Relations
+                .Where(x => x != null)
+                .Where(x => x.Score >= policy.MinRelationScore)
+                .Where(x => x.Direction != ProjectionDirection.Overlapping)
+                .OrderByDescending(x => x.Score)
+                .ToList();
+
+            var graph = new ViewGraph
+            {
+                Anchor = anchorView,
+                Nodes = viewClusters,
+                Layout = new ProjectionLayoutResult
+                {
+                    Relations = filteredRelations
+                }
+            };
+
+            var map = BuildRelativePositionMap(graph, minScore: 0.40);
+
+            var orderedIds = new List<int> { anchorCandidate.IslandId };
+
+            AddGroup(map, AnchorRelativePosition.Above, orderedIds);
+            AddGroup(map, AnchorRelativePosition.Below, orderedIds);
+            AddGroup(map, AnchorRelativePosition.Left, orderedIds);
+            AddGroup(map, AnchorRelativePosition.Right, orderedIds);
+
+            foreach (var v in views.OrderBy(x => x.IslandId))
+            {
+                if (!orderedIds.Contains(v.IslandId))
+                    orderedIds.Add(v.IslandId);
+            }
+
+            var viewMap = views.ToDictionary(x => x.IslandId);
+            return orderedIds
+                .Where(viewMap.ContainsKey)
+                .Select(id => viewMap[id])
+                .ToList();
+        }
+
+        private static void AddGroup(
+            RelativePositionMap map,
+            AnchorRelativePosition position,
+            List<int> orderedIds)
+        {
+            if (map == null || orderedIds == null)
+                return;
+
+            if (!map.Groups.TryGetValue(position, out var nodes) || nodes == null)
+                return;
+
+            foreach (var node in nodes
+                .OrderByDescending(x => x.Score)
+                .ThenBy(x => x.ViewId))
+            {
+                if (!orderedIds.Contains(node.ViewId))
+                    orderedIds.Add(node.ViewId);
+            }
+        }
+
+        private static ObjectIdCollection CollectModelSpaceEntitiesForSemanticView(
+    Database db,
+    Transaction tr,
+    IReadOnlyList<SheetEntity> semanticEntities,
+    Bounds2D targetViewBounds,
+    Bounds2D sheetBounds)
+        {
+            var result = new ObjectIdCollection();
+
+            if (db == null)
+                throw new ArgumentNullException(nameof(db));
+            if (tr == null)
+                throw new ArgumentNullException(nameof(tr));
+            if (semanticEntities == null || semanticEntities.Count == 0)
+                return result;
+
+            var semanticBounds = semanticEntities
+                .Where(x => x != null && !x.Bounds.IsEmpty)
+                .Select(x => x.Bounds)
+                .ToList();
+
+            if (semanticBounds.Count == 0)
+                return result;
+
+            var msId = SymbolUtilityServices.GetBlockModelSpaceId(db);
+            var ms = (BlockTableRecord)tr.GetObject(msId, OpenMode.ForRead);
+
+            foreach (ObjectId id in ms)
+            {
+                if (!id.IsValid || id.IsErased)
+                    continue;
+
+                var ent = tr.GetObject(id, OpenMode.ForRead, false) as Entity;
+                if (ent == null)
+                    continue;
+
+                if (!ShouldCopyEntityBySemanticBounds(ent, semanticBounds, targetViewBounds, sheetBounds))
+                    continue;
+
+                result.Add(id);
+            }
+
+            return result;
+        }
+
+        private static bool ShouldCopyEntityBySemanticBounds(
+    Entity ent,
+    IReadOnlyList<Bounds2D> semanticBounds,
+    Bounds2D targetViewBounds,
+    Bounds2D sheetBounds)
+        {
+            if (ent == null)
+                return false;
+
+            if (ent is Dimension)
+                return false;
+
+            if (ent is DBText || ent is MText || ent is MLeader || ent is Leader)
+                return false;
+
+            if (ent is Hatch || ent is Solid)
+                return false;
+
+            if (IsHiddenOrCenterCadEntity(ent))
+                return false;
+
+            if (!TryGetEntityBoundsSafe(ent, out var bounds))
+                return false;
+
+            if (bounds.IsEmpty)
+                return false;
+
+            if (IsCadEntityFrameLike(bounds, sheetBounds))
+                return false;
+
+            // 우선 target view 전체 bounds와는 겹쳐야 함
+            if (!Bounds2DHelper.Intersects(targetViewBounds, bounds, tolerance: 0.0))
+                return false;
+
+            // semantic entity들 중 하나와 실제로 겹치는지 확인
+            foreach (var sb in semanticBounds)
+            {
+                if (sb.IsEmpty)
+                    continue;
+
+                if (Bounds2DHelper.Intersects(sb, bounds, tolerance: 2.0))
+                    return true;
+            }
+
+            return false;
+        }
+
+        private static HashSet<string> CollectTopLevelSourceHandles(
+    IReadOnlyList<SheetEntity> semanticEntities)
+        {
+            var result = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+            if (semanticEntities == null || semanticEntities.Count == 0)
+                return result;
+
+            foreach (var e in semanticEntities)
+            {
+                if (e == null)
+                    continue;
+
+                var h = (e.Handle ?? string.Empty).Trim();
+                if (!string.IsNullOrWhiteSpace(h))
+                    result.Add(h);
+            }
+
+            return result;
+        }
+
+        private static ObjectIdCollection ResolveObjectIdsFromHandles(
+            Database db,
+            Transaction tr,
+            IEnumerable<string> handles)
+        {
+            var result = new ObjectIdCollection();
+
+            if (db == null)
+                throw new ArgumentNullException(nameof(db));
+            if (tr == null)
+                throw new ArgumentNullException(nameof(tr));
+            if (handles == null)
+                return result;
+
+            var handleSet = new HashSet<string>(
+                handles
+                    .Where(x => !string.IsNullOrWhiteSpace(x))
+                    .Select(x => x.Trim().ToUpperInvariant()),
+                StringComparer.OrdinalIgnoreCase);
+
+            if (handleSet.Count == 0)
+                return result;
+
+            var bt = (BlockTable)tr.GetObject(db.BlockTableId, OpenMode.ForRead);
+            var ms = (BlockTableRecord)tr.GetObject(bt[BlockTableRecord.ModelSpace], OpenMode.ForRead);
+
+            foreach (ObjectId id in ms)
+            {
+                if (!id.IsValid || id.IsErased)
+                    continue;
+
+                var obj = tr.GetObject(id, OpenMode.ForRead, false) as DBObject;
+                if (obj == null)
+                    continue;
+
+                var h = obj.Handle.ToString().Trim().ToUpperInvariant();
+                if (!handleSet.Contains(h))
+                    continue;
+
+                result.Add(id);
+            }
+
+            return result;
+        }
+
+        private static bool ShouldCopyRecoveredTopLevelEntity(
+            Entity ent,
+            Bounds2D targetViewBounds,
+            Bounds2D sheetBounds)
+        {
+            if (ent == null)
+                return false;
+
+            if (ent is Dimension)
+                return false;
+
+            if (ent is DBText || ent is MText || ent is MLeader || ent is Leader)
+                return false;
+
+            // Hatch/Solid는 현재 보여주기 용도에서는 제외
+            if (ent is Hatch || ent is Solid)
+                return false;
+
+            if (IsHiddenOrCenterCadEntity(ent))
+                return false;
+
+            if (!TryGetEntityBoundsSafe(ent, out var bounds))
+                return false;
+
+            if (bounds.IsEmpty)
+                return false;
+
+            // sheet frame 같은 거대 영역 제외
+            if (IsCadEntityFrameLike(bounds, sheetBounds))
+                return false;
+
+            // 뷰와 전혀 겹치지 않으면 제외
+            if (!Bounds2DHelper.Intersects(targetViewBounds, bounds, tolerance: 0.0))
+                return false;
+
+            // view보다 지나치게 큰 top-level entity 차단
+            var widthRatio = bounds.Width / Math.Max(targetViewBounds.Width, 1e-9);
+            var heightRatio = bounds.Height / Math.Max(targetViewBounds.Height, 1e-9);
+            var areaRatio = bounds.Area / Math.Max(targetViewBounds.Area, 1e-9);
+
+            if (widthRatio >= 1.8 || heightRatio >= 1.8 || areaRatio >= 4.0)
+                return false;
+
+            return true;
+        }
+
+        private static bool IsCadEntityFrameLike(Bounds2D entityBounds, Bounds2D sheetBounds, double tolerance = 2.0)
+        {
+            if (entityBounds.IsEmpty || sheetBounds.IsEmpty)
+                return false;
+
+            var matchesSheet =
+                Math.Abs(entityBounds.MinX - sheetBounds.MinX) <= tolerance &&
+                Math.Abs(entityBounds.MinY - sheetBounds.MinY) <= tolerance &&
+                Math.Abs(entityBounds.MaxX - sheetBounds.MaxX) <= tolerance &&
+                Math.Abs(entityBounds.MaxY - sheetBounds.MaxY) <= tolerance;
+
+            if (matchesSheet)
+                return true;
+
+            var widthRatio = entityBounds.Width / Math.Max(sheetBounds.Width, 1e-9);
+            var heightRatio = entityBounds.Height / Math.Max(sheetBounds.Height, 1e-9);
+
+            return widthRatio >= 0.92 && heightRatio >= 0.92;
+        }
+
+        private static bool TryGetEntityBoundsSafe(Entity ent, out Bounds2D bounds)
+        {
+            bounds = Bounds2D.Empty;
+
+            if (ent == null)
+                return false;
+
+            try
+            {
+                var ext = ent.GeometricExtents;
+                bounds = new Bounds2D(
+                    ext.MinPoint.X,
+                    ext.MinPoint.Y,
+                    ext.MaxPoint.X,
+                    ext.MaxPoint.Y);
+
+                return !bounds.IsEmpty;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        private static Bounds2D GetModelSpaceBounds(BlockTableRecord ms, Transaction tr)
+        {
+            var hasAny = false;
+            var minX = double.MaxValue;
+            var minY = double.MaxValue;
+            var maxX = double.MinValue;
+            var maxY = double.MinValue;
+
+            foreach (ObjectId id in ms)
+            {
+                var ent = tr.GetObject(id, OpenMode.ForRead, false) as Entity;
+                if (ent == null)
+                    continue;
+
+                if (!TryGetEntityBoundsSafe(ent, out var b))
+                    continue;
+
+                if (b.IsEmpty)
+                    continue;
+
+                hasAny = true;
+                minX = Math.Min(minX, b.MinX);
+                minY = Math.Min(minY, b.MinY);
+                maxX = Math.Max(maxX, b.MaxX);
+                maxY = Math.Max(maxY, b.MaxY);
+            }
+
+            return hasAny
+                ? new Bounds2D(minX, minY, maxX, maxY)
+                : Bounds2D.Empty;
+        }
+
+        private static bool IsHiddenOrCenterCadEntity(Entity ent)
+        {
+            if (ent == null)
+                return false;
+
+            string raw = NormalizeCadName(ent.Linetype);
+            string layer = NormalizeCadName(ent.Layer);
+
+            if (LooksLikeCenterCad(raw) || LooksLikeHiddenCad(raw))
+                return true;
+
+            if (LooksLikeCenterCad(layer) || LooksLikeHiddenCad(layer))
+                return true;
+
+            return false;
+        }
+
+        /*
+        private static string NormalizeCadName(string? value)
+        {
+            return (value ?? string.Empty).Trim().ToUpperInvariant();
+        }
+
+        private static bool LooksLikeCenterCad(string value)
+        {
+            if (string.IsNullOrWhiteSpace(value))
+                return false;
+
+            return value.Contains("CENTER")
+                || value.Contains("CENTRE")
+                || value.Contains("CNTR")
+                || value.Contains("CTR");
+        }
+
+        private static bool LooksLikeHiddenCad(string value)
+        {
+            if (string.IsNullOrWhiteSpace(value))
+                return false;
+
+            return value.Contains("HIDDEN")
+                || value.Contains("HID")
+                || value.Contains("DOT")
+                || value.Contains("PHANTOM");
+        }
+        */
+
+        private static string EnsureCopyOutputLayer(Database db, Transaction tr)
+        {
+            const string layerName = "FLUX_VIEW_COPY_OUT";
+
+            var lt = (LayerTable)tr.GetObject(db.LayerTableId, OpenMode.ForRead);
+
+            if (!lt.Has(layerName))
+            {
+                lt.UpgradeOpen();
+
+                var ltr = new LayerTableRecord
+                {
+                    Name = layerName,
+                    Color = TeighaColor.FromColorIndex(Teigha.Colors.ColorMethod.ByAci, 3)
+                };
+
+                lt.Add(ltr);
+                tr.AddNewlyCreatedDBObject(ltr, true);
+            }
+
+            return layerName;
+        }
+
+        private static string BuildCopiedViewLabel(ViewCandidate view)
+        {
+            if (view == null)
+                return "View";
+
+            if (view.IsRepresentativePrimaryView)
+                return $"REP:{view.IslandId}";
+
+            if (view.IsPrimaryView)
+                return $"PV:{view.IslandId}";
+
+            return $"GV:{view.IslandId}";
+        }
+
+        private static short ResolveCopiedViewColor(ViewCandidate view)
+        {
+            if (view == null)
+                return 8;
+
+            if (view.IsRepresentativePrimaryView)
+                return 6; // magenta
+
+            if (view.IsPrimaryView)
+                return 3; // green
+
+            return 4; // cyan
+        }
+
+        [CommandMethod("FLUX_COPY_REP_GEOMETRY_OUTSIDE")]
+        public void FluxCopyRepresentativeGeometryOutside()
+        {
+            var doc = Bricscad.ApplicationServices.Application.DocumentManager.MdiActiveDocument;
+            if (doc == null)
+                return;
+
+            var db = doc.Database;
+            var ed = doc.Editor;
+
+            try
+            {
+                var sheetFilePath = db.Filename;
+                if (string.IsNullOrWhiteSpace(sheetFilePath))
+                {
+                    ed.WriteMessage("\n[FluxCAD] 저장된 DWG 파일이 아닙니다.");
+                    return;
+                }
+
+                // 1) 대표 뷰 결정
+                var candidates = BuildResolvedViewCandidates(sheetFilePath, ed);
+                if (candidates == null || candidates.Count == 0)
+                {
+                    ed.WriteMessage("\n[FluxCAD] view candidate가 비어 있습니다.");
+                    return;
+                }
+
+                var geometryPrimaryCandidates = candidates
+                    .Where(x => x != null)
+                    .Where(x => x.FinalRole == ViewIslandSemanticRole.GeometryView)
+                    .Where(x => x.IsTopLevelView || x.IsPrimaryView || x.IsRepresentativePrimaryView)
+                    .OrderBy(x => x.IslandId)
+                    .ToList();
+
+                if (geometryPrimaryCandidates.Count == 0)
+                {
+                    ed.WriteMessage("\n[FluxCAD] copy용 GeometryView candidate가 없습니다.");
+                    return;
+                }
+
+                var representative = geometryPrimaryCandidates
+                    .FirstOrDefault(x => x.IsRepresentativePrimaryView)
+                    ?? geometryPrimaryCandidates
+                        .Where(x => x.IsPrimaryView)
+                        .OrderByDescending(x => x.RepresentativePrimaryScore)
+                        .ThenByDescending(x => x.PrimaryScore)
+                        .ThenByDescending(x => x.Area)
+                        .FirstOrDefault()
+                    ?? geometryPrimaryCandidates
+                        .OrderByDescending(x => x.Area)
+                        .FirstOrDefault();
+
+                if (representative == null)
+                {
+                    ed.WriteMessage("\n[FluxCAD] representative view 결정 실패.");
+                    return;
+                }
+
+                var exportBounds = representative.Bounds;
+                if (exportBounds.IsEmpty)
+                {
+                    ed.WriteMessage("\n[FluxCAD] representative bounds가 비어 있습니다.");
+                    return;
+                }
+
+                var sourceIds = new ObjectIdCollection();
+
+                Bounds2D allBounds;
+                using (doc.LockDocument())
+                using (var tr = db.TransactionManager.StartTransaction())
+                {
+                    var msId = SymbolUtilityServices.GetBlockModelSpaceId(db);
+                    var ms = (BlockTableRecord)tr.GetObject(msId, OpenMode.ForRead);
+
+                    allBounds = GetModelSpaceBounds(ms, tr);
+
+                    foreach (ObjectId id in ms)
+                    {
+                        if (!id.IsValid || id.IsErased)
+                            continue;
+
+                        var ent = tr.GetObject(id, OpenMode.ForRead, false) as Entity;
+                        if (ent == null)
+                            continue;
+
+                        if (!ShouldCopyGeometryEntity(ent, exportBounds))
+                            continue;
+
+                        sourceIds.Add(id);
+                    }
+
+                    tr.Commit();
+                }
+
+                if (sourceIds.Count == 0)
+                {
+                    ed.WriteMessage("\n[FluxCAD] 복사할 형상 entity가 없습니다.");
+                    return;
+                }
+
+                // 2) 시트 바깥 오른쪽으로 이동 오프셋 계산
+                var gap = Math.Max(allBounds.Width * 0.15, 200.0);
+                var targetMinX = allBounds.MaxX + gap;
+                var dx = targetMinX - exportBounds.MinX;
+                var dy = 0.0;
+
+                using (doc.LockDocument())
+                using (var tr = db.TransactionManager.StartTransaction())
+                {
+                    var msId = SymbolUtilityServices.GetBlockModelSpaceId(db);
+                    var ms = (BlockTableRecord)tr.GetObject(msId, OpenMode.ForWrite);
+
+                    var mapping = new IdMapping();
+                    db.DeepCloneObjects(sourceIds, msId, mapping, false);
+
+                    var displacement = Matrix3d.Displacement(new Vector3d(dx, dy, 0.0));
+
+                    int copiedCount = 0;
+
+                    foreach (IdPair pair in mapping)
+                    {
+                        if (!pair.IsCloned)
+                            continue;
+
+                        var cloned = tr.GetObject(pair.Value, OpenMode.ForWrite, false) as Entity;
+                        if (cloned == null)
+                            continue;
+
+                        cloned.TransformBy(displacement);
+                        copiedCount++;
+                    }
+
+                    tr.Commit();
+
+                    ed.WriteMessage(
+                        $"\n[FluxCAD] representative geometry copied outside. " +
+                        $"Island={representative.IslandId}, Source={sourceIds.Count}, Copied={copiedCount}, " +
+                        $"Offset=({dx:0.##},{dy:0.##})");
+                }
+            }
+            catch (System.Exception ex)
+            {
+                ed.WriteMessage($"\n[FluxCAD] FLUX_COPY_REP_GEOMETRY_OUTSIDE failed: {ex}");
+            }
+        }
+
+        private static bool ShouldCopyGeometryEntity(Entity ent, Bounds2D repBounds)
+        {
+            if (ent == null)
+                return false;
+
+            // 제외
+            if (ent is Dimension)
+                return false;
+
+            if (ent is DBText || ent is MText || ent is MLeader || ent is Leader)
+                return false;
+
+            if (ent is Hatch || ent is Solid)
+                return false;
+
+            if (IsHiddenOrCenterCadEntity(ent))
+                return false;
+
+            // extents 확인
+            if (!TryGetEntityBoundsSafe(ent, out var bounds))
+                return false;
+
+            if (bounds.IsEmpty)
+                return false;
+
+            if (!Bounds2DHelper.Intersects(repBounds, bounds, tolerance: 0.0))
+                return false;
+
+            // 이번 버전은 blockreference도 허용
+            return ent is Line
+                || ent is Arc
+                || ent is Circle
+                || ent is Ellipse
+                || ent is Teigha.DatabaseServices.Polyline
+                || ent is Polyline2d
+                || ent is Polyline3d
+                || ent is Spline
+                || ent is BlockReference;
+        }
+
+        private static bool TryGetEntityBoundsSafe_old(Entity ent, out Bounds2D bounds)
+        {
+            bounds = Bounds2D.Empty;
+
+            if (ent == null)
+                return false;
+
+            try
+            {
+                var ext = ent.GeometricExtents;
+                bounds = new Bounds2D(
+                    ext.MinPoint.X,
+                    ext.MinPoint.Y,
+                    ext.MaxPoint.X,
+                    ext.MaxPoint.Y);
+
+                return !bounds.IsEmpty;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        private static Bounds2D GetModelSpaceBounds_old(BlockTableRecord ms, Transaction tr)
+        {
+            var hasAny = false;
+            var minX = double.MaxValue;
+            var minY = double.MaxValue;
+            var maxX = double.MinValue;
+            var maxY = double.MinValue;
+
+            foreach (ObjectId id in ms)
+            {
+                var ent = tr.GetObject(id, OpenMode.ForRead, false) as Entity;
+                if (ent == null)
+                    continue;
+
+                if (!TryGetEntityBoundsSafe(ent, out var b))
+                    continue;
+
+                if (b.IsEmpty)
+                    continue;
+
+                hasAny = true;
+                minX = Math.Min(minX, b.MinX);
+                minY = Math.Min(minY, b.MinY);
+                maxX = Math.Max(maxX, b.MaxX);
+                maxY = Math.Max(maxY, b.MaxY);
+            }
+
+            return hasAny
+                ? new Bounds2D(minX, minY, maxX, maxY)
+                : Bounds2D.Empty;
+        }
+        /*
+        private static bool IsHiddenOrCenterCadEntity(Entity ent)
+        {
+            if (ent == null)
+                return false;
+
+            string raw = NormalizeCadName(ent.Linetype);
+            string layer = NormalizeCadName(ent.Layer);
+
+            if (LooksLikeCenterCad(raw) || LooksLikeHiddenCad(raw))
+                return true;
+
+            if (LooksLikeCenterCad(layer) || LooksLikeHiddenCad(layer))
+                return true;
+
+            return false;
+        }
+
+        
+        private static string NormalizeCadName(string? value)
+        {
+            return (value ?? string.Empty).Trim().ToUpperInvariant();
+        }
+
+        private static bool LooksLikeCenterCad(string value)
+        {
+            if (string.IsNullOrWhiteSpace(value))
+                return false;
+
+            return value.Contains("CENTER")
+                || value.Contains("CENTRE")
+                || value.Contains("CNTR")
+                || value.Contains("CTR");
+        }
+
+        private static bool LooksLikeHiddenCad(string value)
+        {
+            if (string.IsNullOrWhiteSpace(value))
+                return false;
+
+            return value.Contains("HIDDEN")
+                || value.Contains("HID")
+                || value.Contains("DOT")
+                || value.Contains("PHANTOM");
+        }
+        */
+
+        [CommandMethod("FLUX_EXPORT_REP_GEOMETRY_ONLY")]
+        public void FluxExportRepresentativeGeometryOnly()
+        {
+            var doc = Bricscad.ApplicationServices.Application.DocumentManager.MdiActiveDocument;
+            if (doc == null)
+                return;
+
+            var db = doc.Database;
+            var ed = doc.Editor;
+
+            try
+            {
+                var sheetFilePath = db.Filename;
+                if (string.IsNullOrWhiteSpace(sheetFilePath))
+                {
+                    ed.WriteMessage("\n[FluxCAD] 저장된 DWG 파일이 아닙니다.");
+                    return;
+                }
+
+                // 1) 현재 해석 파이프라인 재사용
+                var candidates = BuildResolvedViewCandidates(sheetFilePath, ed);
+                if (candidates == null || candidates.Count == 0)
+                {
+                    ed.WriteMessage("\n[FluxCAD] view candidate가 비어 있습니다.");
+                    return;
+                }
+
+                var geometryPrimaryCandidates = candidates
+                    .Where(x => x != null)
+                    .Where(x => x.FinalRole == ViewIslandSemanticRole.GeometryView)
+                    .Where(x => x.IsTopLevelView || x.IsPrimaryView || x.IsRepresentativePrimaryView)
+                    .OrderBy(x => x.IslandId)
+                    .ToList();
+
+                if (geometryPrimaryCandidates.Count == 0)
+                {
+                    ed.WriteMessage("\n[FluxCAD] export용 GeometryView candidate가 없습니다.");
+                    return;
+                }
+
+                var representative = geometryPrimaryCandidates
+                    .FirstOrDefault(x => x.IsRepresentativePrimaryView)
+                    ?? geometryPrimaryCandidates
+                        .Where(x => x.IsPrimaryView)
+                        .OrderByDescending(x => x.RepresentativePrimaryScore)
+                        .ThenByDescending(x => x.PrimaryScore)
+                        .ThenByDescending(x => x.Area)
+                        .FirstOrDefault()
+                    ?? geometryPrimaryCandidates
+                        .OrderByDescending(x => x.Area)
+                        .FirstOrDefault();
+
+                if (representative == null)
+                {
+                    ed.WriteMessage("\n[FluxCAD] representative view 결정 실패.");
+                    return;
+                }
+
+                var exportBounds = representative.Bounds;
+                if (exportBounds.IsEmpty)
+                {
+                    ed.WriteMessage("\n[FluxCAD] representative view bounds가 비어 있습니다.");
+                    return;
+                }
+
+                var sourceIds = new ObjectIdCollection();
+
+                using (doc.LockDocument())
+                using (var tr = db.TransactionManager.StartTransaction())
+                {
+                    var msId = SymbolUtilityServices.GetBlockModelSpaceId(db);
+                    var ms = (BlockTableRecord)tr.GetObject(msId, OpenMode.ForRead);
+
+                    foreach (ObjectId id in ms)
+                    {
+                        if (!id.IsValid || id.IsErased)
+                            continue;
+
+                        var ent = tr.GetObject(id, OpenMode.ForRead, false) as Entity;
+                        if (ent == null)
+                            continue;
+
+                        if (!ShouldExportGeometryEntity(ent, exportBounds))
+                            continue;
+
+                        sourceIds.Add(id);
+                    }
+
+                    tr.Commit();
+                }
+
+                if (sourceIds.Count == 0)
+                {
+                    ed.WriteMessage("\n[FluxCAD] export할 형상 entity가 없습니다.");
+                    return;
+                }
+
+                var baseDir = Path.GetDirectoryName(sheetFilePath)!;
+                var baseName = Path.GetFileNameWithoutExtension(sheetFilePath);
+                var outPath = Path.Combine(
+                    baseDir,
+                    $"{baseName}_REPVIEW_{representative.IslandId}_GEOMONLY.dwg");
+
+                ExportEntitiesToNewDwg(db, sourceIds, outPath);
+
+                ed.WriteMessage(
+                    $"\n[FluxCAD] representative geometry exported. " +
+                    $"Island={representative.IslandId}, Count={sourceIds.Count}, File={outPath}");
+            }
+            catch (System.Exception ex)
+            {
+                ed.WriteMessage($"\n[FluxCAD] FLUX_EXPORT_REP_GEOMETRY_ONLY failed: {ex}");
+            }
+        }
+
+        private static bool ShouldExportGeometryEntity(Entity ent, Bounds2D exportBounds)
+        {
+            if (ent == null)
+                return false;
+
+            // 1) 명시적 제외
+            if (ent is Dimension)
+                return false;
+
+            if (ent is DBText || ent is MText || ent is MLeader || ent is Leader)
+                return false;
+
+            if (ent is Hatch || ent is Solid)
+                return false;
+
+            if (ent is BlockReference)
+                return false;
+
+            // 2) 숨은선 / 중심선 제외
+            if (IsHiddenOrCenterCadEntity(ent))
+                return false;
+
+            // 3) 기하 extents 확인
+            if (!TryGetEntityBounds(ent, out var entityBounds))
+                return false;
+
+            if (entityBounds.IsEmpty)
+                return false;
+
+            // 4) 대표 뷰 bounds와 겹치는 것만 포함
+            if (!Bounds2DHelper.Intersects(exportBounds, entityBounds, tolerance: 0.0))
+                return false;
+
+            // 5) 실제 형상 계열만 허용
+            return ent is Line
+                || ent is Arc
+                || ent is Circle
+                || ent is Ellipse
+                || ent is Teigha.DatabaseServices.Polyline
+                || ent is Polyline2d
+                || ent is Polyline3d
+                || ent is Spline;
+        }
+
+        private static bool TryGetEntityBounds(Entity ent, out Bounds2D bounds)
+        {
+            bounds = Bounds2D.Empty;
+
+            if (ent == null)
+                return false;
+
+            try
+            {
+                var ext = ent.GeometricExtents;
+                bounds = new Bounds2D(
+                    ext.MinPoint.X,
+                    ext.MinPoint.Y,
+                    ext.MaxPoint.X,
+                    ext.MaxPoint.Y);
+                return !bounds.IsEmpty;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        private static bool IsHiddenOrCenterCadEntity_old(Entity ent)
+        {
+            if (ent == null)
+                return false;
+
+            string raw = NormalizeCadName(ent.Linetype);
+            string layer = NormalizeCadName(ent.Layer);
+
+            if (LooksLikeCenterCad(raw) || LooksLikeHiddenCad(raw))
+                return true;
+
+            if (LooksLikeCenterCad(layer) || LooksLikeHiddenCad(layer))
+                return true;
+
+            return false;
+        }
+
+        private static string NormalizeCadName(string? value)
+        {
+            return (value ?? string.Empty).Trim().ToUpperInvariant();
+        }
+
+        private static bool LooksLikeCenterCad(string value)
+        {
+            if (string.IsNullOrWhiteSpace(value))
+                return false;
+
+            return value.Contains("CENTER")
+                || value.Contains("CENTRE")
+                || value.Contains("CNTR")
+                || value.Contains("CTR");
+        }
+
+        private static bool LooksLikeHiddenCad(string value)
+        {
+            if (string.IsNullOrWhiteSpace(value))
+                return false;
+
+            return value.Contains("HIDDEN")
+                || value.Contains("HID")
+                || value.Contains("DOT")
+                || value.Contains("PHANTOM");
+        }
+
+        private static void ExportEntitiesToNewDwg(
+            Database sourceDb,
+            ObjectIdCollection sourceIds,
+            string outPath)
+        {
+            if (sourceDb == null)
+                throw new ArgumentNullException(nameof(sourceDb));
+
+            if (sourceIds == null || sourceIds.Count == 0)
+                throw new ArgumentException("sourceIds is empty.", nameof(sourceIds));
+
+            using (var newDb = new Database(true, true))
+            {
+                var newMsId = SymbolUtilityServices.GetBlockModelSpaceId(newDb);
+                var mapping = new IdMapping();
+
+                sourceDb.WblockCloneObjects(
+                    sourceIds,
+                    newMsId,
+                    mapping,
+                    DuplicateRecordCloning.Ignore,
+                    false);
+
+                newDb.SaveAs(outPath, DwgVersion.Current);
+            }
+        }
+
         [CommandMethod("FLUX_DEBUG_VIEW_GRAPH")]
         public void FluxDebugViewGraph()
         {
@@ -351,9 +1688,7 @@ namespace FluxCAD.BricsCAD.Plugin26
                     RepresentativeViewId = group.RepresentativeViewId
                 };
 
-                foreach (var secondary in group.SecondaryViews
-                             .OrderByDescending(x => x.Score)
-                             .ThenBy(x => x.ViewId))
+                foreach (var secondary in OrderProjectionSecondaryNodes(group.SecondaryViews))
                 {
                     if (secondary == null)
                         continue;
@@ -452,9 +1787,7 @@ namespace FluxCAD.BricsCAD.Plugin26
                     RepresentativeViewId = group.RepresentativeViewId
                 };
 
-                foreach (var member in group.SecondaryMembers
-                             .OrderByDescending(x => x.Score)
-                             .ThenBy(x => x.ViewId))
+                foreach (var member in OrderProjectionGroupMembers(group.SecondaryMembers))
                 {
                     if (member == null)
                         continue;
@@ -511,9 +1844,7 @@ namespace FluxCAD.BricsCAD.Plugin26
                     continue;
                 }
 
-                foreach (var s in group.SecondaryViews
-                             .OrderByDescending(x => x.Score)
-                             .ThenBy(x => x.ViewId))
+                foreach (var s in OrderProjectionSecondaryNodes(group.SecondaryViews))
                 {
                     var sibling = s.SiblingDirection?.ToString() ?? "Unknown";
                     var intent = s.IntentSemantic.ToString();
@@ -619,9 +1950,15 @@ namespace FluxCAD.BricsCAD.Plugin26
                     continue;
                 }
 
-                foreach (var member in group.SecondaryMembers
-                             .OrderByDescending(x => x.Score)
-                             .ThenBy(x => x.ViewId))
+                var leftCount = group.SecondaryMembers.Count(x => x.IntentSemantic == ViewIntentSemantic.LeftViewingCandidate);
+                var rightCount = group.SecondaryMembers.Count(x => x.IntentSemantic == ViewIntentSemantic.RightViewingCandidate);
+                var upperCount = group.SecondaryMembers.Count(x => x.IntentSemantic == ViewIntentSemantic.UpperViewingCandidate);
+                var lowerCount = group.SecondaryMembers.Count(x => x.IntentSemantic == ViewIntentSemantic.LowerViewingCandidate);
+
+                sb.AppendLine(
+                    $"    IntentBuckets = Left:{leftCount}, Right:{rightCount}, Upper:{upperCount}, Lower:{lowerCount}");
+
+                foreach (var member in OrderProjectionGroupMembers(group.SecondaryMembers))
                 {
                     var sibling = member.SiblingDirection?.ToString() ?? "Unknown";
                     var intent = member.IntentSemantic.ToString();
@@ -832,6 +2169,58 @@ namespace FluxCAD.BricsCAD.Plugin26
                 return parsed;
 
             return ViewIntentSemantic.Unknown;
+        }
+
+        private static IEnumerable<ProjectionGroupMember> OrderProjectionGroupMembers(
+    IEnumerable<ProjectionGroupMember> members)
+        {
+            return members
+                .Where(x => x != null)
+                .OrderBy(x => GetIntentPriority(x.IntentSemantic))
+                .ThenByDescending(x => x.Score)
+                .ThenBy(x => x.ViewId);
+        }
+
+        private static IEnumerable<ProjectionSecondaryNode> OrderProjectionSecondaryNodes(
+            IEnumerable<ProjectionSecondaryNode> nodes)
+        {
+            return nodes
+                .Where(x => x != null)
+                .OrderBy(x => GetIntentPriority(x.IntentSemantic))
+                .ThenByDescending(x => x.Score)
+                .ThenBy(x => x.ViewId);
+        }
+
+        private static IEnumerable<ProjectionSecondaryDto> OrderProjectionSecondaryDtos(
+            IEnumerable<ProjectionSecondaryDto> items)
+        {
+            return items
+                .Where(x => x != null)
+                .OrderBy(x => GetIntentPriority(ParseIntent(x.Intent)))
+                .ThenByDescending(x => x.Score)
+                .ThenBy(x => x.ViewId);
+        }
+
+        private static ViewIntentSemantic ParseIntent(string? text)
+        {
+            if (string.IsNullOrWhiteSpace(text))
+                return ViewIntentSemantic.Unknown;
+
+            return Enum.TryParse<ViewIntentSemantic>(text, true, out var parsed)
+                ? parsed
+                : ViewIntentSemantic.Unknown;
+        }
+
+        private static int GetIntentPriority(ViewIntentSemantic intent)
+        {
+            return intent switch
+            {
+                ViewIntentSemantic.LeftViewingCandidate => 0,
+                ViewIntentSemantic.RightViewingCandidate => 1,
+                ViewIntentSemantic.UpperViewingCandidate => 2,
+                ViewIntentSemantic.LowerViewingCandidate => 3,
+                _ => 9
+            };
         }
 
         private static bool IsDirectOrReverseReason(string? reason)
@@ -1675,6 +3064,56 @@ namespace FluxCAD.BricsCAD.Plugin26
             return $"Sibling ({score:0.00})";
         }
 
+        private static short ResolveSecondaryRelationColor(ViewIntentSemantic intent)
+        {
+            return intent switch
+            {
+                ViewIntentSemantic.LeftViewingCandidate => 1,   // red
+                ViewIntentSemantic.RightViewingCandidate => 4,  // cyan
+                ViewIntentSemantic.UpperViewingCandidate => 2,  // yellow
+                ViewIntentSemantic.LowerViewingCandidate => 5,  // blue
+                _ => 8                                          // gray
+            };
+        }
+
+        private static string BuildSecondaryRelationShortLabel(
+            ViewIntentSemantic intent,
+            ProjectionDirection? siblingDirection,
+            double score)
+        {
+            var intentText = intent switch
+            {
+                ViewIntentSemantic.LeftViewingCandidate => "LV",
+                ViewIntentSemantic.RightViewingCandidate => "RV",
+                ViewIntentSemantic.UpperViewingCandidate => "UV",
+                ViewIntentSemantic.LowerViewingCandidate => "DV",
+                _ => "SV"
+            };
+
+            var siblingText = siblingDirection switch
+            {
+                ProjectionDirection.LeftOf => "L",
+                ProjectionDirection.RightOf => "R",
+                ProjectionDirection.Above => "A",
+                ProjectionDirection.Below => "B",
+                _ => "?"
+            };
+
+            return $"{intentText}/{siblingText} {score:0.00}";
+        }
+
+        private static int GetSecondaryLaneIndex(ViewIntentSemantic intent)
+        {
+            return intent switch
+            {
+                ViewIntentSemantic.LeftViewingCandidate => 0,
+                ViewIntentSemantic.RightViewingCandidate => 1,
+                ViewIntentSemantic.UpperViewingCandidate => 2,
+                ViewIntentSemantic.LowerViewingCandidate => 3,
+                _ => 4
+            };
+        }
+
         private static string? TryParseReasonValue(string reason, string key)
         {
             if (string.IsNullOrWhiteSpace(reason) || string.IsNullOrWhiteSpace(key))
@@ -1813,7 +3252,8 @@ namespace FluxCAD.BricsCAD.Plugin26
             var secondaryRelations = BuildSecondaryAnchorDisplayRelations(graph, map);
 
             foreach (var rel in secondaryRelations
-                .OrderByDescending(x => x.Score)
+                .OrderBy(x => GetIntentPriority(x.IntentSemantic))
+                .ThenByDescending(x => x.Score)
                 .ThenBy(x => x.SourceViewId)
                 .ThenBy(x => x.TargetViewId))
             {
@@ -1823,7 +3263,8 @@ namespace FluxCAD.BricsCAD.Plugin26
                 if (source == null || target == null)
                     continue;
 
-                const short secondaryColor = 8; // gray
+                var secondaryColor = ResolveSecondaryRelationColor(rel.IntentSemantic);
+                var laneIndex = GetSecondaryLaneIndex(rel.IntentSemantic);
 
                 DrawDebugLine(
                     db,
@@ -1836,16 +3277,19 @@ namespace FluxCAD.BricsCAD.Plugin26
                 var labelPos = ComputeRelationLabelPosition(
                     source.Center,
                     target.Center,
-                    laneIndex: 1,
-                    baseOffset: 14.0,
-                    laneSpacing: 10.0);
+                    laneIndex: laneIndex,
+                    baseOffset: 24.0,
+                    laneSpacing: 12.0);
 
                 DrawDebugText(
                     db,
                     tr,
                     layerName,
                     labelPos,
-                    BuildSecondaryRelationLabel(rel.Reason, rel.Score),
+                    BuildSecondaryRelationShortLabel(
+                        rel.IntentSemantic,
+                        rel.SiblingDirection,
+                        rel.Score),
                     secondaryColor,
                     6.5);
             }
@@ -9204,11 +10648,17 @@ namespace FluxCAD.BricsCAD.Plugin26
 
         private static Bounds2D UnionBounds(IEnumerable<Bounds2D> boundsList)
         {
+            if (boundsList == null)
+                return Bounds2D.Empty;
+
             bool first = true;
             double minX = 0, minY = 0, maxX = 0, maxY = 0;
 
             foreach (var b in boundsList)
             {
+                if (b.IsEmpty)
+                    continue;
+
                 if (first)
                 {
                     minX = b.MinX;
