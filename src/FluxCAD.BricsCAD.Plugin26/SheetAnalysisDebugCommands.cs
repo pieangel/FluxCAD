@@ -136,6 +136,29 @@ namespace FluxCAD.BricsCAD.Plugin26
             public List<ProjectionGroupNode> Groups { get; } = new();
         }
 
+        private sealed class ProjectionSecondaryDto
+        {
+            public int ViewId { get; init; }
+            public double Score { get; init; }
+            public string SiblingDirection { get; init; } = string.Empty;
+            public string Intent { get; init; } = string.Empty;
+            public string Relation { get; init; } = string.Empty;
+            public string Reason { get; init; } = string.Empty;
+        }
+
+        private sealed class ProjectionGroupDto
+        {
+            public string Direction { get; init; } = string.Empty;
+            public int? RepresentativeViewId { get; init; }
+            public List<ProjectionSecondaryDto> Secondary { get; } = new();
+        }
+
+        private sealed class ProjectionDto
+        {
+            public int AnchorViewId { get; init; }
+            public List<ProjectionGroupDto> Groups { get; } = new();
+        }
+
         [CommandMethod("FLUX_DEBUG_VIEW_GRAPH")]
         public void FluxDebugViewGraph()
         {
@@ -263,8 +286,8 @@ namespace FluxCAD.BricsCAD.Plugin26
                 // 새 tree 구조화
                 var projectionTree = BuildProjectionTree(graph, projectionGroups);
 
-                // 기존 chain은 유지
-                var chains = BuildProjectionChains(graph, positionMap);
+                // DTO 승격
+                var projectionDto = BuildProjectionDto(projectionTree);
 
                 // 로그
                 ed.WriteMessage("\n");
@@ -273,7 +296,7 @@ namespace FluxCAD.BricsCAD.Plugin26
                 ed.WriteMessage("\n" + FormatRelativePositionMap(positionMap));
                 ed.WriteMessage("\n" + FormatProjectionGroups(graph, projectionGroups));
                 ed.WriteMessage("\n" + FormatProjectionTree(projectionTree));
-                ed.WriteMessage("\n" + FormatProjectionChains(chains));
+                ed.WriteMessage("\n" + FormatProjectionDto(projectionDto));
                 ed.WriteMessage("\n================ END VIEW GRAPH DEBUG ================");
 
                 // 7) overlay
@@ -301,6 +324,107 @@ namespace FluxCAD.BricsCAD.Plugin26
                 ed.WriteMessage($"\n[FluxCAD] FLUX_DEBUG_VIEW_GRAPH failed: {ex}");
             }
         }
+
+
+        private static ProjectionDto BuildProjectionDto(ProjectionTree tree)
+        {
+            if (tree == null)
+                throw new ArgumentNullException(nameof(tree));
+
+            var dto = new ProjectionDto
+            {
+                AnchorViewId = tree.AnchorViewId
+            };
+
+            if (tree.Groups == null || tree.Groups.Count == 0)
+                return dto;
+
+            foreach (var group in tree.Groups
+                         .OrderBy(g => g.Direction.ToString()))
+            {
+                if (group == null)
+                    continue;
+
+                var groupDto = new ProjectionGroupDto
+                {
+                    Direction = group.Direction.ToString(),
+                    RepresentativeViewId = group.RepresentativeViewId
+                };
+
+                foreach (var secondary in group.SecondaryViews
+                             .OrderByDescending(x => x.Score)
+                             .ThenBy(x => x.ViewId))
+                {
+                    if (secondary == null)
+                        continue;
+
+                    groupDto.Secondary.Add(new ProjectionSecondaryDto
+                    {
+                        ViewId = secondary.ViewId,
+                        Score = secondary.Score,
+                        SiblingDirection = secondary.SiblingDirection?.ToString() ?? "Unknown",
+                        Intent = secondary.IntentSemantic.ToString(),
+                        Relation = group.Direction.ToString(),
+                        Reason = secondary.Reason ?? string.Empty
+                    });
+                }
+
+                dto.Groups.Add(groupDto);
+            }
+
+            return dto;
+        }
+
+        private static string FormatProjectionDto(ProjectionDto dto)
+        {
+            var sb = new StringBuilder();
+
+            sb.AppendLine("[ProjectionDto]");
+
+            if (dto == null)
+            {
+                sb.AppendLine("- (null)");
+                return sb.ToString();
+            }
+
+            sb.AppendLine($"AnchorId = {dto.AnchorViewId}");
+
+            if (dto.Groups == null || dto.Groups.Count == 0)
+            {
+                sb.AppendLine("- Groups: (none)");
+                return sb.ToString();
+            }
+
+            foreach (var group in dto.Groups)
+            {
+                sb.AppendLine($"- Direction = {group.Direction}");
+
+                if (group.RepresentativeViewId.HasValue)
+                    sb.AppendLine($"    Representative = {group.RepresentativeViewId.Value}");
+                else
+                    sb.AppendLine("    Representative = (none)");
+
+                if (group.Secondary.Count == 0)
+                {
+                    sb.AppendLine("    Secondary = (none)");
+                    continue;
+                }
+
+                foreach (var sec in group.Secondary)
+                {
+                    sb.AppendLine(
+                        $"    Secondary = {sec.ViewId}, " +
+                        $"sibling={sec.SiblingDirection}, " +
+                        $"intent={sec.Intent}, " +
+                        $"relation={sec.Relation}, " +
+                        $"score={sec.Score:0.000}");
+                }
+            }
+
+            return sb.ToString();
+        }
+
+
 
         private static ProjectionTree BuildProjectionTree(
     ViewGraph graph,
