@@ -173,6 +173,358 @@ namespace FluxCAD.BricsCAD.Plugin26
         }
 
 
+        [CommandMethod("FLUX_COPY_NORMALIZED_GEOMETRY_VIEWS_OUTSIDE")]
+        public void FluxCopyNormalizedGeometryViewsOutside()
+        {
+            var doc = Bricscad.ApplicationServices.Application.DocumentManager.MdiActiveDocument;
+            if (doc == null)
+                return;
+
+            var db = doc.Database;
+            var ed = doc.Editor;
+
+            try
+            {
+                var sheetFilePath = db.Filename;
+                if (string.IsNullOrWhiteSpace(sheetFilePath))
+                {
+                    ed.WriteMessage("\n[FluxCAD] 저장된 DWG 파일이 아닙니다.");
+                    return;
+                }
+
+                ed.WriteMessage("\n[FluxCAD] Mode=CopyNormalizedGeometryViewsOutside");
+
+                // ------------------------------------------------------------
+                // 1) 기존 해석 파이프라인 그대로 재사용
+                // ------------------------------------------------------------
+                var candidates = BuildResolvedViewCandidates(sheetFilePath, ed);
+                if (candidates == null || candidates.Count == 0)
+                {
+                    ed.WriteMessage("\n[FluxCAD] view candidate가 비어 있습니다.");
+                    return;
+                }
+
+                var topLevelGeometryViews = candidates
+                    .Where(x => x != null)
+                    .Where(x => x.FinalRole == ViewIslandSemanticRole.GeometryView)
+                    .Where(x => x.IsTopLevelView)
+                    .Where(x => !x.IsSparseBridgeLike)
+                    .OrderBy(x => x.IslandId)
+                    .ToList();
+
+                if (topLevelGeometryViews.Count == 0)
+                {
+                    ed.WriteMessage("\n[FluxCAD] 복사할 TopLevel GeometryView가 없습니다.");
+                    return;
+                }
+
+                // ------------------------------------------------------------
+                // 2) snapshot + semantic pipeline 다시 확보
+                // ------------------------------------------------------------
+                IEntitySnapshotBuilder snapshotBuilder = new SimpleSheetFileSnapshotBuilder();
+                var fullEntities = snapshotBuilder.Build(sheetFilePath);
+
+                if (fullEntities == null || fullEntities.Count == 0)
+                {
+                    ed.WriteMessage("\n[FluxCAD] snapshot이 비어 있습니다.");
+                    return;
+                }
+
+                var pipeline = BuildSemanticIslandPipeline(
+                    fullEntities,
+                    ed,
+                    closeSingleCellGaps: false,
+                    targetCellSize: 12.0,
+                    excludeSparseBridgeFromGroups: false);
+
+                if (pipeline == null || pipeline.SemanticResults == null || pipeline.SemanticResults.Count == 0)
+                {
+                    ed.WriteMessage("\n[FluxCAD] semantic pipeline 결과가 비어 있습니다.");
+                    return;
+                }
+
+                var rebuiltSemanticResults = RebuildSemanticResultsWithReassignedRoles(
+                    pipeline.SemanticResults,
+                    fullEntities,
+                    ed);
+
+                var islandMap = rebuiltSemanticResults
+                    .Where(x => x != null && x.Island != null)
+                    .ToDictionary(x => x.Island.Id, x => x.Island);
+
+                var sheetBounds = Bounds2DHelper.FromEntities(fullEntities);
+                var semanticPool = BuildSemanticEvidencePool(fullEntities, sheetBounds, ed);
+
+                // ------------------------------------------------------------
+                // 3) DB 전체 bounds 확보
+                // ------------------------------------------------------------
+                Bounds2D modelBounds;
+
+                using (doc.LockDocument())
+                using (var tr = db.TransactionManager.StartTransaction())
+                {
+                    var msId = SymbolUtilityServices.GetBlockModelSpaceId(db);
+                    var ms = (BlockTableRecord)tr.GetObject(msId, OpenMode.ForRead);
+                    modelBounds = GetModelSpaceBounds(ms, tr);
+                    tr.Commit();
+                }
+
+                if (modelBounds.IsEmpty)
+                {
+                    ed.WriteMessage("\n[FluxCAD] model bounds가 비어 있습니다.");
+                    return;
+                }
+
+                // ------------------------------------------------------------
+                // 4) work item 구성 (기존 명령 최대 재사용)
+                // ------------------------------------------------------------
+                var workItems = new List<CopyViewWorkItem>();
+
+                foreach (var view in topLevelGeometryViews)
+                {
+                    if (!islandMap.TryGetValue(view.IslandId, out var island))
+                    {
+                        ed.WriteMessage($"\n[FluxCAD] Island={view.IslandId} semantic island를 찾지 못했습니다.");
+                        continue;
+                    }
+
+                    var dynamicTolerance = Math.Max(
+                        3.0,
+                        Math.Min(island.Bounds.Width, island.Bounds.Height) * 0.5);
+
+                    var semanticEntities = CollectIslandSemanticEntitiesFromPool(
+                        semanticPool,
+                        island,
+                        tolerance: dynamicTolerance,
+                        ed: ed);
+
+                    var filteredSemanticEntities = semanticEntities
+                        .Where(x => x != null)
+                        .Where(x => x.IsVisible)
+                        .Where(x => x.IsGeometryLike)
+                        .Where(x => !x.IsTextLike)
+                        .Where(x => !x.IsDimensionLike)
+                        .Where(x => !x.IsLikelySemanticNoise)
+                        .Where(x => !x.IsTableLikeLayer)
+                        .Where(x => !x.IsTitleLikeLayer)
+                        .Where(x => !IsSemanticFrameLikeEntity(x, sheetBounds))
+                        .Where(x => !IsHiddenOrCenterEntity(x))
+                        .ToList();
+
+                    ed.WriteMessage(
+                        $"\n[FluxCAD] CopySemanticFilter I:{view.IslandId}, " +
+                        $"Before={semanticEntities.Count}, After={filteredSemanticEntities.Count}, " +
+                        $"HiddenOrCenterInSource={semanticEntities.Count(x => IsHiddenOrCenterEntity(x))}, " +
+                        $"DimInSource={semanticEntities.Count(x => x.IsDimensionLike)}, " +
+                        $"TextInSource={semanticEntities.Count(x => x.IsTextLike)}");
+
+                    if (filteredSemanticEntities.Count == 0)
+                    {
+                        ed.WriteMessage($"\n[FluxCAD] Island={view.IslandId} 복사할 semantic entity가 없습니다.");
+                        continue;
+                    }
+
+                    workItems.Add(new CopyViewWorkItem
+                    {
+                        View = view,
+                        Island = island,
+                        SemanticEntities = filteredSemanticEntities
+                    });
+                }
+
+                if (workItems.Count == 0)
+                {
+                    ed.WriteMessage("\n[FluxCAD] 최종 복사 가능한 work item이 없습니다.");
+                    return;
+                }
+
+                // ------------------------------------------------------------
+                // 5) ProjectionRoleSet + NormalizedPlacement 계산
+                //    이미 클래스 내부에 있는 함수들을 그대로 사용
+                // ------------------------------------------------------------
+                var placementViews = workItems
+                    .Select(x => x.View)
+                    .Where(x => x != null)
+                    .OrderBy(x => x.IslandId)
+                    .ToList();
+
+                var projectionRoleSet = BuildProjectionRoleSet(placementViews);
+                if (projectionRoleSet == null || !projectionRoleSet.IsValid)
+                {
+                    ed.WriteMessage("\n[FluxCAD] ProjectionRoleSet이 유효하지 않습니다.");
+                    return;
+                }
+
+                var sourceGroupBounds = UnionBounds(placementViews.Select(x => x.Bounds));
+                if (sourceGroupBounds.IsEmpty)
+                {
+                    ed.WriteMessage("\n[FluxCAD] source group bounds가 비어 있습니다.");
+                    return;
+                }
+
+                var groupGap = Math.Max(modelBounds.Width * 0.12, 220.0);
+
+                // 기존 group 크기를 유지하면서 시트 우측 바깥에 새 group 영역 확보
+                var targetGroupBounds = new Bounds2D(
+                    modelBounds.MaxX + groupGap,
+                    sourceGroupBounds.MinY,
+                    modelBounds.MaxX + groupGap + sourceGroupBounds.Width,
+                    sourceGroupBounds.MinY + sourceGroupBounds.Height);
+
+                var placements = BuildNormalizedProjectionPlacements(
+                    placementViews,
+                    projectionRoleSet,
+                    targetGroupBounds,
+                    ed);
+
+                if (placements == null || placements.Count == 0)
+                {
+                    ed.WriteMessage("\n[FluxCAD] normalized placement 결과가 비어 있습니다.");
+                    return;
+                }
+
+                var placementMap = placements
+                    .Where(x => x != null)
+                    .ToDictionary(x => x.ViewId, x => x);
+
+                ed.WriteMessage(
+                    $"\n[FluxCAD] Normalized target group bounds={targetGroupBounds}, " +
+                    $"Placements={placements.Count}");
+
+                int totalSourceCount = 0;
+                int totalCopiedCount = 0;
+
+                // ------------------------------------------------------------
+                // 6) view별 normalized displacement 적용
+                // ------------------------------------------------------------
+                foreach (var work in workItems.OrderBy(x => x.View.IslandId))
+                {
+                    if (!placementMap.TryGetValue(work.View.IslandId, out var placement))
+                    {
+                        ed.WriteMessage($"\n[FluxCAD] Island={work.View.IslandId} placement가 없습니다.");
+                        continue;
+                    }
+
+                    ObjectIdCollection sourceIds;
+
+                    using (doc.LockDocument())
+                    using (var tr = db.TransactionManager.StartTransaction())
+                    {
+                        sourceIds = CollectModelSpaceEntitiesForSemanticView(
+                            db,
+                            tr,
+                            work.SemanticEntities,
+                            work.View.Bounds,
+                            sheetBounds,
+                            ed,
+                            work.View.IslandId);
+
+                        if (sourceIds.Count == 0)
+                        {
+                            ed.WriteMessage($"\n[FluxCAD] Island={work.View.IslandId} sourceIds가 비어 있습니다.");
+                            tr.Commit();
+                            continue;
+                        }
+
+                        var msId = SymbolUtilityServices.GetBlockModelSpaceId(db);
+                        var mapping = new IdMapping();
+                        db.DeepCloneObjects(sourceIds, msId, mapping, false);
+
+                        // 핵심:
+                        // 기존 view.Bounds의 중심을 placement.TargetBounds 중심으로 이동
+                        var dx = placement.TargetBounds.Center.X - work.View.Bounds.Center.X;
+                        var dy = placement.TargetBounds.Center.Y - work.View.Bounds.Center.Y;
+                        var displacement = Matrix3d.Displacement(new Vector3d(dx, dy, 0.0));
+
+                        var clonedTopLevelIds = CollectDirectClonedIds(sourceIds, mapping);
+
+                        int copiedCount = 0;
+                        foreach (var clonedId in clonedTopLevelIds)
+                        {
+                            var cloned = tr.GetObject(clonedId, OpenMode.ForWrite, false) as Entity;
+                            if (cloned == null)
+                                continue;
+
+                            cloned.TransformBy(displacement);
+                            copiedCount++;
+                        }
+
+                        var labelPos = new Point2D(
+                            placement.TargetBounds.Center.X,
+                            placement.TargetBounds.MaxY + Math.Max(placement.TargetBounds.Height * 0.08, 20.0));
+
+                        DrawDebugText(
+                            db,
+                            tr,
+                            EnsureCopyOutputLayer(db, tr),
+                            labelPos,
+                            BuildNormalizedCopiedViewLabel(work.View, placement),
+                            ResolveCopiedViewColor(work.View),
+                            Math.Max(10.0, Math.Min(placement.TargetBounds.Width, placement.TargetBounds.Height) * 0.08));
+
+                        totalSourceCount += sourceIds.Count;
+                        totalCopiedCount += copiedCount;
+
+                        tr.Commit();
+
+                        ed.WriteMessage(
+                            $"\n[FluxCAD] NormalizedCopied View Island={work.View.IslandId}, " +
+                            $"Reason={placement.Reason}, " +
+                            $"Semantic={work.SemanticEntities.Count}, SourceIds={sourceIds.Count}, Copied={copiedCount}, " +
+                            $"Offset=({dx:0.##},{dy:0.##}), Target={placement.TargetBounds}");
+                    }
+                }
+
+                ed.WriteMessage(
+                    $"\n[FluxCAD] Normalized Geometry Views copied outside. " +
+                    $"Views={workItems.Count}, Placements={placements.Count}, " +
+                    $"TotalSource={totalSourceCount}, TotalCopied={totalCopiedCount}");
+            }
+            catch (System.Exception ex)
+            {
+                ed.WriteMessage($"\n[FluxCAD] FLUX_COPY_NORMALIZED_GEOMETRY_VIEWS_OUTSIDE failed: {ex}");
+            }
+        }
+
+        private static List<ObjectId> CollectDirectClonedIds(
+            ObjectIdCollection sourceIds,
+            IdMapping mapping)
+        {
+            var result = new List<ObjectId>();
+
+            if (sourceIds == null || sourceIds.Count == 0 || mapping == null)
+                return result;
+
+            var sourceSet = new HashSet<ObjectId>();
+            foreach (ObjectId id in sourceIds)
+                sourceSet.Add(id);
+
+            foreach (IdPair pair in mapping)
+            {
+                if (!pair.IsCloned)
+                    continue;
+
+                if (!sourceSet.Contains(pair.Key))
+                    continue;
+
+                result.Add(pair.Value);
+            }
+
+            return result;
+        }
+
+        private static string BuildNormalizedCopiedViewLabel(
+            ViewCandidate view,
+            ProjectionPlacement placement)
+        {
+            if (view == null && placement == null)
+                return "NView";
+
+            var baseLabel = BuildCopiedViewLabel(view);
+            var reason = placement?.Reason ?? "Normalized";
+
+            return $"{baseLabel} [{reason}]";
+        }
 
 
         [CommandMethod("FLUX_COPY_TOPLEVEL_GEOMETRY_VIEWS_OUTSIDE")]
@@ -2303,6 +2655,21 @@ namespace FluxCAD.BricsCAD.Plugin26
                 // DTO 승격
                 var projectionDto = BuildProjectionDto(projectionTree);
 
+                var projectionRoleSet = BuildProjectionRoleSet(geometryPrimaryCandidates);
+
+                var groupBounds = UnionBounds(geometryPrimaryCandidates.Select(x => x.Bounds));
+
+                if (!groupBounds.IsEmpty)
+                {
+                    var normalizedPlacements = BuildNormalizedProjectionPlacements(
+                        geometryPrimaryCandidates,
+                        projectionRoleSet,
+                        groupBounds,
+                        ed);
+
+                    ed.WriteMessage("\n" + FormatNormalizedPlacements(normalizedPlacements));
+                }
+
                 // 로그
                 ed.WriteMessage("\n");
                 ed.WriteMessage("\n================ VIEW GRAPH DEBUG ================");
@@ -2311,6 +2678,7 @@ namespace FluxCAD.BricsCAD.Plugin26
                 ed.WriteMessage("\n" + FormatProjectionGroups(graph, projectionGroups));
                 ed.WriteMessage("\n" + FormatProjectionTree(projectionTree));
                 ed.WriteMessage("\n" + FormatProjectionDto(projectionDto));
+                ed.WriteMessage("\n" + FormatProjectionRoleSet(projectionRoleSet));
                 ed.WriteMessage("\n================ END VIEW GRAPH DEBUG ================");
 
                 // 7) overlay
@@ -2337,6 +2705,454 @@ namespace FluxCAD.BricsCAD.Plugin26
             {
                 ed.WriteMessage($"\n[FluxCAD] FLUX_DEBUG_VIEW_GRAPH failed: {ex}");
             }
+        }
+
+        private List<ProjectionPlacement> BuildNormalizedProjectionPlacements(
+    IReadOnlyList<ViewCandidate> views,
+    ProjectionRoleSet roleSet,
+    Bounds2D targetGroupBounds,
+    Bricscad.EditorInput.Editor ed)
+        {
+            var result = new List<ProjectionPlacement>();
+
+            if (views == null || views.Count == 0)
+                return result;
+
+            if (roleSet == null || !roleSet.IsValid)
+                return result;
+
+            if (targetGroupBounds.IsEmpty)
+                return result;
+
+            var viewMap = views
+                .Where(x => x != null)
+                .ToDictionary(x => x.IslandId, x => x);
+
+            if (!viewMap.TryGetValue(roleSet.FrontViewId, out var front))
+                return result;
+
+            var frontWidth = front.Width;
+            var frontHeight = front.Height;
+
+            var horizontalGap = Math.Max(frontWidth * 0.18, 80.0);
+            var verticalGap = Math.Max(frontHeight * 0.25, 80.0);
+
+            // 기준점:
+            // targetGroupBounds 안에서 Front를 중앙 근처에 배치
+            var frontMinX = targetGroupBounds.MinX + Math.Max(0.0, (targetGroupBounds.Width - frontWidth) * 0.5);
+            var frontMinY = targetGroupBounds.MinY + Math.Max(0.0, (targetGroupBounds.Height - frontHeight) * 0.5);
+
+            var frontBounds = new Bounds2D(
+                frontMinX,
+                frontMinY,
+                frontMinX + frontWidth,
+                frontMinY + frontHeight);
+
+            result.Add(new ProjectionPlacement
+            {
+                ViewId = front.IslandId,
+                TargetBounds = frontBounds,
+                Reason = "Normalized:Front"
+            });
+
+            // Top
+            if (roleSet.TopViewId.HasValue && viewMap.TryGetValue(roleSet.TopViewId.Value, out var top))
+            {
+                var topBounds = new Bounds2D(
+                    frontBounds.MinX + (frontBounds.Width - top.Width) * 0.5,
+                    frontBounds.MaxY + verticalGap,
+                    frontBounds.MinX + (frontBounds.Width - top.Width) * 0.5 + top.Width,
+                    frontBounds.MaxY + verticalGap + top.Height);
+
+                result.Add(new ProjectionPlacement
+                {
+                    ViewId = top.IslandId,
+                    TargetBounds = topBounds,
+                    Reason = "Normalized:Top"
+                });
+            }
+
+            // Bottom
+            if (roleSet.BottomViewId.HasValue && viewMap.TryGetValue(roleSet.BottomViewId.Value, out var bottom))
+            {
+                var bottomBounds = new Bounds2D(
+                    frontBounds.MinX + (frontBounds.Width - bottom.Width) * 0.5,
+                    frontBounds.MinY - verticalGap - bottom.Height,
+                    frontBounds.MinX + (frontBounds.Width - bottom.Width) * 0.5 + bottom.Width,
+                    frontBounds.MinY - verticalGap);
+
+                result.Add(new ProjectionPlacement
+                {
+                    ViewId = bottom.IslandId,
+                    TargetBounds = bottomBounds,
+                    Reason = "Normalized:Bottom"
+                });
+            }
+
+            // Left
+            if (roleSet.LeftViewId.HasValue && viewMap.TryGetValue(roleSet.LeftViewId.Value, out var left))
+            {
+                var leftBounds = new Bounds2D(
+                    frontBounds.MinX - horizontalGap - left.Width,
+                    frontBounds.MinY + (frontBounds.Height - left.Height) * 0.5,
+                    frontBounds.MinX - horizontalGap,
+                    frontBounds.MinY + (frontBounds.Height - left.Height) * 0.5 + left.Height);
+
+                result.Add(new ProjectionPlacement
+                {
+                    ViewId = left.IslandId,
+                    TargetBounds = leftBounds,
+                    Reason = "Normalized:Left"
+                });
+            }
+
+            // Right
+            if (roleSet.RightViewId.HasValue && viewMap.TryGetValue(roleSet.RightViewId.Value, out var right))
+            {
+                var rightBounds = new Bounds2D(
+                    frontBounds.MaxX + horizontalGap,
+                    frontBounds.MinY + (frontBounds.Height - right.Height) * 0.5,
+                    frontBounds.MaxX + horizontalGap + right.Width,
+                    frontBounds.MinY + (frontBounds.Height - right.Height) * 0.5 + right.Height);
+
+                result.Add(new ProjectionPlacement
+                {
+                    ViewId = right.IslandId,
+                    TargetBounds = rightBounds,
+                    Reason = "Normalized:Right"
+                });
+            }
+
+            // 추가 뷰들(Secondary)은 같은 방향에 순차 배치
+            AppendAdditionalNormalizedPlacements(
+                result,
+                roleSet.AdditionalTopViewIds,
+                viewMap,
+                frontBounds,
+                horizontalGap,
+                verticalGap,
+                "Top");
+
+            AppendAdditionalNormalizedPlacements(
+                result,
+                roleSet.AdditionalBottomViewIds,
+                viewMap,
+                frontBounds,
+                horizontalGap,
+                verticalGap,
+                "Bottom");
+
+            AppendAdditionalNormalizedPlacements(
+                result,
+                roleSet.AdditionalLeftViewIds,
+                viewMap,
+                frontBounds,
+                horizontalGap,
+                verticalGap,
+                "Left");
+
+            AppendAdditionalNormalizedPlacements(
+                result,
+                roleSet.AdditionalRightViewIds,
+                viewMap,
+                frontBounds,
+                horizontalGap,
+                verticalGap,
+                "Right");
+
+            ed.WriteMessage(
+                $"\n[FluxCAD] BuildNormalizedProjectionPlacements " +
+                $"Front={roleSet.FrontViewId}, " +
+                $"Top={roleSet.TopViewId?.ToString() ?? "-"}, " +
+                $"Bottom={roleSet.BottomViewId?.ToString() ?? "-"}, " +
+                $"Left={roleSet.LeftViewId?.ToString() ?? "-"}, " +
+                $"Right={roleSet.RightViewId?.ToString() ?? "-"}, " +
+                $"Placements={result.Count}");
+
+            foreach (var p in result.OrderBy(x => x.ViewId))
+            {
+                ed.WriteMessage(
+                    $"\n  [NormalizedPlacement] View={p.ViewId}, Reason={p.Reason}, Bounds={p.TargetBounds}");
+            }
+
+            return result;
+        }
+
+        private void AppendAdditionalNormalizedPlacements(
+    List<ProjectionPlacement> result,
+    IReadOnlyList<int> additionalIds,
+    IReadOnlyDictionary<int, ViewCandidate> viewMap,
+    Bounds2D frontBounds,
+    double horizontalGap,
+    double verticalGap,
+    string side)
+        {
+            if (result == null || additionalIds == null || additionalIds.Count == 0)
+                return;
+
+            var ordered = additionalIds
+                .Where(viewMap.ContainsKey)
+                .Select(id => viewMap[id])
+                .OrderByDescending(x => x.PrimaryScore)
+                .ThenByDescending(x => x.Area)
+                .ToList();
+
+            if (ordered.Count == 0)
+                return;
+
+            switch (side)
+            {
+                case "Top":
+                    {
+                        double cursorX = frontBounds.MaxX + horizontalGap;
+                        double baseY = frontBounds.MaxY + verticalGap;
+
+                        foreach (var view in ordered)
+                        {
+                            var b = new Bounds2D(
+                                cursorX,
+                                baseY,
+                                cursorX + view.Width,
+                                baseY + view.Height);
+
+                            result.Add(new ProjectionPlacement
+                            {
+                                ViewId = view.IslandId,
+                                TargetBounds = b,
+                                Reason = "Normalized:TopSecondary"
+                            });
+
+                            cursorX += view.Width + horizontalGap;
+                        }
+
+                        break;
+                    }
+
+                case "Bottom":
+                    {
+                        double cursorX = frontBounds.MaxX + horizontalGap;
+                        double baseY = frontBounds.MinY - verticalGap;
+
+                        foreach (var view in ordered)
+                        {
+                            var b = new Bounds2D(
+                                cursorX,
+                                baseY - view.Height,
+                                cursorX + view.Width,
+                                baseY);
+
+                            result.Add(new ProjectionPlacement
+                            {
+                                ViewId = view.IslandId,
+                                TargetBounds = b,
+                                Reason = "Normalized:BottomSecondary"
+                            });
+
+                            cursorX += view.Width + horizontalGap;
+                        }
+
+                        break;
+                    }
+
+                case "Left":
+                    {
+                        double cursorY = frontBounds.MinY - verticalGap;
+
+                        foreach (var view in ordered)
+                        {
+                            var b = new Bounds2D(
+                                frontBounds.MinX - horizontalGap - view.Width,
+                                cursorY - view.Height,
+                                frontBounds.MinX - horizontalGap,
+                                cursorY);
+
+                            result.Add(new ProjectionPlacement
+                            {
+                                ViewId = view.IslandId,
+                                TargetBounds = b,
+                                Reason = "Normalized:LeftSecondary"
+                            });
+
+                            cursorY -= (view.Height + verticalGap);
+                        }
+
+                        break;
+                    }
+
+                case "Right":
+                    {
+                        double cursorY = frontBounds.MinY - verticalGap;
+
+                        foreach (var view in ordered)
+                        {
+                            var b = new Bounds2D(
+                                frontBounds.MaxX + horizontalGap,
+                                cursorY - view.Height,
+                                frontBounds.MaxX + horizontalGap + view.Width,
+                                cursorY);
+
+                            result.Add(new ProjectionPlacement
+                            {
+                                ViewId = view.IslandId,
+                                TargetBounds = b,
+                                Reason = "Normalized:RightSecondary"
+                            });
+
+                            cursorY -= (view.Height + verticalGap);
+                        }
+
+                        break;
+                    }
+            }
+        }
+
+        private static string FormatNormalizedPlacements(
+    IReadOnlyList<ProjectionPlacement> placements)
+        {
+            var sb = new StringBuilder();
+
+            sb.AppendLine("[NormalizedProjectionPlacements]");
+
+            if (placements == null || placements.Count == 0)
+            {
+                sb.AppendLine("- (none)");
+                return sb.ToString();
+            }
+
+            foreach (var p in placements.OrderBy(x => x.ViewId))
+            {
+                sb.AppendLine(
+                    $"- View={p.ViewId}, Reason={p.Reason}, " +
+                    $"Bounds=({p.TargetBounds.MinX:0.##},{p.TargetBounds.MinY:0.##})-({p.TargetBounds.MaxX:0.##},{p.TargetBounds.MaxY:0.##})");
+            }
+
+            return sb.ToString();
+        }
+
+        private static ProjectionRoleSet BuildProjectionRoleSet(
+    IReadOnlyList<ViewCandidate> candidates)
+        {
+            var set = new ProjectionRoleSet();
+
+            if (candidates == null || candidates.Count == 0)
+                return set;
+
+            var topLevelGeometry = candidates
+                .Where(x => x != null)
+                .Where(x => x.IsTopLevelView)
+                .Where(x => !x.HasParent)
+                .Where(x => x.FinalRole == ViewIslandSemanticRole.GeometryView)
+                .ToList();
+
+            var front = topLevelGeometry.FirstOrDefault(x =>
+                string.Equals(x.ProjectionRole, "Front", StringComparison.OrdinalIgnoreCase));
+
+            if (front != null)
+                set.FrontViewId = front.IslandId;
+
+            AssignSingleAndAdditional(
+                topLevelGeometry,
+                "Top",
+                out var top,
+                set.AdditionalTopViewIds);
+
+            AssignSingleAndAdditional(
+                topLevelGeometry,
+                "Bottom",
+                out var bottom,
+                set.AdditionalBottomViewIds);
+
+            AssignSingleAndAdditional(
+                topLevelGeometry,
+                "Left",
+                out var left,
+                set.AdditionalLeftViewIds);
+
+            AssignSingleAndAdditional(
+                topLevelGeometry,
+                "Right",
+                out var right,
+                set.AdditionalRightViewIds);
+
+            set.TopViewId = top;
+            set.BottomViewId = bottom;
+            set.LeftViewId = left;
+            set.RightViewId = right;
+
+            foreach (var c in topLevelGeometry)
+            {
+                if (string.IsNullOrWhiteSpace(c.ProjectionRole) ||
+                    string.Equals(c.ProjectionRole, "Unresolved", StringComparison.OrdinalIgnoreCase) ||
+                    string.Equals(c.ProjectionRole, "ReferenceGeometry", StringComparison.OrdinalIgnoreCase) ||
+                    c.ProjectionRole.EndsWith("_Weak", StringComparison.OrdinalIgnoreCase) ||
+                    c.ProjectionRole.EndsWith("_Reference", StringComparison.OrdinalIgnoreCase))
+                {
+                    set.UnresolvedViewIds.Add(c.IslandId);
+                }
+            }
+
+            return set;
+        }
+
+        private static void AssignSingleAndAdditional(
+            IReadOnlyList<ViewCandidate> candidates,
+            string role,
+            out int? representativeId,
+            List<int> additionalIds)
+        {
+            representativeId = null;
+
+            var matched = candidates
+                .Where(x => string.Equals(x.ProjectionRole, role, StringComparison.OrdinalIgnoreCase) ||
+                            string.Equals(x.ProjectionRole, role + "_Secondary", StringComparison.OrdinalIgnoreCase))
+                .OrderBy(x => string.Equals(x.ProjectionRole, role, StringComparison.OrdinalIgnoreCase) ? 0 : 1)
+                .ThenByDescending(x => x.PrimaryScore)
+                .ThenByDescending(x => x.Area)
+                .ToList();
+
+            if (matched.Count == 0)
+                return;
+
+            representativeId = matched[0].IslandId;
+
+            foreach (var extra in matched.Skip(1))
+                additionalIds.Add(extra.IslandId);
+        }
+
+        private static string FormatProjectionRoleSet(ProjectionRoleSet set)
+        {
+            var sb = new StringBuilder();
+
+            sb.AppendLine("[ProjectionRoleSet]");
+
+            if (set == null || !set.IsValid)
+            {
+                sb.AppendLine("- Invalid");
+                return sb.ToString();
+            }
+
+            sb.AppendLine($"Front = {set.FrontViewId}");
+            sb.AppendLine($"Top = {set.TopViewId?.ToString() ?? "-"}");
+            sb.AppendLine($"Bottom = {set.BottomViewId?.ToString() ?? "-"}");
+            sb.AppendLine($"Left = {set.LeftViewId?.ToString() ?? "-"}");
+            sb.AppendLine($"Right = {set.RightViewId?.ToString() ?? "-"}");
+
+            if (set.AdditionalTopViewIds.Count > 0)
+                sb.AppendLine($"AdditionalTop = {string.Join(", ", set.AdditionalTopViewIds)}");
+
+            if (set.AdditionalBottomViewIds.Count > 0)
+                sb.AppendLine($"AdditionalBottom = {string.Join(", ", set.AdditionalBottomViewIds)}");
+
+            if (set.AdditionalLeftViewIds.Count > 0)
+                sb.AppendLine($"AdditionalLeft = {string.Join(", ", set.AdditionalLeftViewIds)}");
+
+            if (set.AdditionalRightViewIds.Count > 0)
+                sb.AppendLine($"AdditionalRight = {string.Join(", ", set.AdditionalRightViewIds)}");
+
+            if (set.UnresolvedViewIds.Count > 0)
+                sb.AppendLine($"Unresolved = {string.Join(", ", set.UnresolvedViewIds)}");
+
+            return sb.ToString();
         }
 
 

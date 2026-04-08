@@ -217,6 +217,132 @@ namespace FluxCAD.SheetAnalysis.ViewIsolation.Analysis
             }
         }
 
+        private static ProjectionRoleSet BuildProjectionRoleSet(
+    IReadOnlyList<ViewCandidate> candidates)
+        {
+            var set = new ProjectionRoleSet();
+
+            if (candidates == null || candidates.Count == 0)
+                return set;
+
+            var topLevelGeometry = candidates
+                .Where(x => x != null)
+                .Where(x => x.IsTopLevelView)
+                .Where(x => !x.HasParent)
+                .Where(x => x.FinalRole == ViewIslandSemanticRole.GeometryView)
+                .ToList();
+
+            var front = topLevelGeometry.FirstOrDefault(x =>
+                string.Equals(x.ProjectionRole, "Front", StringComparison.OrdinalIgnoreCase));
+
+            if (front != null)
+                set.FrontViewId = front.IslandId;
+
+            AssignSingleAndAdditional(
+                topLevelGeometry,
+                "Top",
+                out var top,
+                set.AdditionalTopViewIds);
+
+            AssignSingleAndAdditional(
+                topLevelGeometry,
+                "Bottom",
+                out var bottom,
+                set.AdditionalBottomViewIds);
+
+            AssignSingleAndAdditional(
+                topLevelGeometry,
+                "Left",
+                out var left,
+                set.AdditionalLeftViewIds);
+
+            AssignSingleAndAdditional(
+                topLevelGeometry,
+                "Right",
+                out var right,
+                set.AdditionalRightViewIds);
+
+            set.TopViewId = top;
+            set.BottomViewId = bottom;
+            set.LeftViewId = left;
+            set.RightViewId = right;
+
+            foreach (var c in topLevelGeometry)
+            {
+                if (string.IsNullOrWhiteSpace(c.ProjectionRole) ||
+                    string.Equals(c.ProjectionRole, "Unresolved", StringComparison.OrdinalIgnoreCase) ||
+                    string.Equals(c.ProjectionRole, "ReferenceGeometry", StringComparison.OrdinalIgnoreCase) ||
+                    c.ProjectionRole.EndsWith("_Weak", StringComparison.OrdinalIgnoreCase) ||
+                    c.ProjectionRole.EndsWith("_Reference", StringComparison.OrdinalIgnoreCase))
+                {
+                    set.UnresolvedViewIds.Add(c.IslandId);
+                }
+            }
+
+            return set;
+        }
+
+        private static string FormatProjectionRoleSet(ProjectionRoleSet set)
+        {
+            var sb = new StringBuilder();
+
+            sb.AppendLine("[ProjectionRoleSet]");
+
+            if (set == null || !set.IsValid)
+            {
+                sb.AppendLine("- Invalid");
+                return sb.ToString();
+            }
+
+            sb.AppendLine($"Front = {set.FrontViewId}");
+            sb.AppendLine($"Top = {set.TopViewId?.ToString() ?? "-"}");
+            sb.AppendLine($"Bottom = {set.BottomViewId?.ToString() ?? "-"}");
+            sb.AppendLine($"Left = {set.LeftViewId?.ToString() ?? "-"}");
+            sb.AppendLine($"Right = {set.RightViewId?.ToString() ?? "-"}");
+
+            if (set.AdditionalTopViewIds.Count > 0)
+                sb.AppendLine($"AdditionalTop = {string.Join(", ", set.AdditionalTopViewIds)}");
+
+            if (set.AdditionalBottomViewIds.Count > 0)
+                sb.AppendLine($"AdditionalBottom = {string.Join(", ", set.AdditionalBottomViewIds)}");
+
+            if (set.AdditionalLeftViewIds.Count > 0)
+                sb.AppendLine($"AdditionalLeft = {string.Join(", ", set.AdditionalLeftViewIds)}");
+
+            if (set.AdditionalRightViewIds.Count > 0)
+                sb.AppendLine($"AdditionalRight = {string.Join(", ", set.AdditionalRightViewIds)}");
+
+            if (set.UnresolvedViewIds.Count > 0)
+                sb.AppendLine($"Unresolved = {string.Join(", ", set.UnresolvedViewIds)}");
+
+            return sb.ToString();
+        }
+
+        private static void AssignSingleAndAdditional(
+            IReadOnlyList<ViewCandidate> candidates,
+            string role,
+            out int? representativeId,
+            List<int> additionalIds)
+        {
+            representativeId = null;
+
+            var matched = candidates
+                .Where(x => string.Equals(x.ProjectionRole, role, StringComparison.OrdinalIgnoreCase) ||
+                            string.Equals(x.ProjectionRole, role + "_Secondary", StringComparison.OrdinalIgnoreCase))
+                .OrderBy(x => string.Equals(x.ProjectionRole, role, StringComparison.OrdinalIgnoreCase) ? 0 : 1)
+                .ThenByDescending(x => x.PrimaryScore)
+                .ThenByDescending(x => x.Area)
+                .ToList();
+
+            if (matched.Count == 0)
+                return;
+
+            representativeId = matched[0].IslandId;
+
+            foreach (var extra in matched.Skip(1))
+                additionalIds.Add(extra.IslandId);
+        }
+
         private Dictionary<ViewRelativePosition, ViewCandidate?> ResolveAnchorDirectRepresentatives(
     ViewCandidate anchor,
     IReadOnlyList<ViewCandidate> primaryViews)
