@@ -578,6 +578,140 @@ namespace FluxCAD.BricsCAD.Plugin26
             }
         }
 
+
+        private static HashSet<string> CollectDirectSourceHandles(
+    IReadOnlyList<SheetEntity> semanticEntities)
+        {
+            var result = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+            if (semanticEntities == null || semanticEntities.Count == 0)
+                return result;
+
+            foreach (var se in semanticEntities)
+            {
+                if (se == null)
+                    continue;
+
+                // 실제 프로젝트에서 사용 중인 handle 필드명에 맞게 연결
+                // 예:
+                // if (!string.IsNullOrWhiteSpace(se.Handle)) result.Add(se.Handle);
+                // if (!string.IsNullOrWhiteSpace(se.SourceHandle)) result.Add(se.SourceHandle);
+
+                var handle = se.Handle; // <- 실제 필드명에 맞게 조정
+                if (string.IsNullOrWhiteSpace(handle))
+                    continue;
+
+                result.Add(handle);
+            }
+
+            return result;
+        }
+
+        private static ObjectIdCollection ResolveObjectIdsFromDirectHandles(
+    Database db,
+    Transaction tr,
+    IEnumerable<string> handles)
+        {
+            var result = new ObjectIdCollection();
+
+            if (db == null)
+                throw new ArgumentNullException(nameof(db));
+            if (tr == null)
+                throw new ArgumentNullException(nameof(tr));
+            if (handles == null)
+                return result;
+
+            var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+            foreach (var h in handles)
+            {
+                if (string.IsNullOrWhiteSpace(h))
+                    continue;
+
+                if (!seen.Add(h))
+                    continue;
+
+                try
+                {
+                    long rawHandleValue;
+                    try
+                    {
+                        rawHandleValue = Convert.ToInt64(h, 16);
+                    }
+                    catch
+                    {
+                        continue;
+                    }
+
+                    var handle = new Handle(rawHandleValue);
+                    var id = db.GetObjectId(false, handle, 0);
+                    if (!id.IsValid || id.IsErased)
+                        continue;
+
+                    result.Add(id);
+                }
+                catch
+                {
+                    // 못 찾으면 skip
+                }
+            }
+
+            return result;
+        }
+
+        private static ObjectIdCollection CollectExactSourceIdsFromSemanticEntities(
+    Database db,
+    Transaction tr,
+    IReadOnlyList<SheetEntity> semanticEntities,
+    Bounds2D targetViewBounds,
+    Bounds2D sheetBounds)
+        {
+            var result = new ObjectIdCollection();
+
+            if (semanticEntities == null || semanticEntities.Count == 0)
+                return result;
+
+            var directHandles = CollectDirectSourceHandles(semanticEntities);
+            var directIds = ResolveObjectIdsFromDirectHandles(db, tr, directHandles);
+
+            var filtered = new ObjectIdCollection();
+
+            foreach (ObjectId id in directIds)
+            {
+                if (!id.IsValid || id.IsErased)
+                    continue;
+
+                var ent = tr.GetObject(id, OpenMode.ForRead, false) as Entity;
+                if (ent == null)
+                    continue;
+
+                // geometry copy용이므로 text/dim/title/frame만 제외
+                if (ent is Dimension)
+                    continue;
+
+                if (ent is DBText || ent is MText || ent is MLeader || ent is Leader)
+                    continue;
+
+                if (ent is Hatch || ent is Solid)
+                    continue;
+
+                if (!TryGetEntityBoundsSafe(ent, out var bounds) || bounds.IsEmpty)
+                    continue;
+
+                if (IsCadEntityFrameLike(bounds, sheetBounds))
+                    continue;
+
+                if (!Bounds2DHelper.Intersects(targetViewBounds, bounds, tolerance: 3.0))
+                    continue;
+
+                filtered.Add(id);
+            }
+
+            return filtered;
+        }
+
+
+
         private static bool ShouldCopyEntityBySemanticBoundsForFallback(
     Entity ent,
     IReadOnlyList<Bounds2D> semanticBounds,
@@ -714,6 +848,26 @@ namespace FluxCAD.BricsCAD.Plugin26
     Bricscad.EditorInput.Editor? ed,
     int viewId)
         {
+            // PASS 0: semantic entity의 direct source handle exact recovery
+            var exactIds = CollectExactSourceIdsFromSemanticEntities(
+                db,
+                tr,
+                semanticEntities,
+                targetViewBounds,
+                sheetBounds);
+
+            var exactInspection = InspectAcceptedSourceIds(exactIds, tr);
+
+            if (exactIds.Count > 0)
+            {
+                return new SourceSelectionResult
+                {
+                    SourceIds = exactIds,
+                    Inspection = exactInspection,
+                    SelectionMode = "ExactSemanticSourceRecovery"
+                };
+            }
+
             // ------------------------------------------------------------
             // PASS 1: 현재 방식
             // ------------------------------------------------------------
@@ -3318,7 +3472,7 @@ namespace FluxCAD.BricsCAD.Plugin26
                 });
             }
 
-            // 추가 뷰들(Secondary)은 같은 방향에 순차 배치
+            // 추가 뷰들(Secondary)
             AppendAdditionalNormalizedPlacements(
                 result,
                 roleSet.AdditionalTopViewIds,
@@ -3355,6 +3509,19 @@ namespace FluxCAD.BricsCAD.Plugin26
                 verticalGap,
                 "Right");
 
+            // ------------------------------------------------------------
+            // 핵심 추가:
+            // role이 부여되지 않았거나 대표/secondary에 들어가지 못한
+            // unresolved geometry views도 버리지 않고 자동 배치
+            // ------------------------------------------------------------
+            AppendUnresolvedNormalizedPlacements(
+                result,
+                views,
+                frontBounds,
+                targetGroupBounds,
+                horizontalGap,
+                verticalGap);
+
             ed.WriteMessage(
                 $"\n[FluxCAD] BuildNormalizedProjectionPlacements " +
                 $"Front={roleSet.FrontViewId}, " +
@@ -3371,6 +3538,77 @@ namespace FluxCAD.BricsCAD.Plugin26
             }
 
             return result;
+        }
+
+        private void AppendUnresolvedNormalizedPlacements(
+    List<ProjectionPlacement> result,
+    IReadOnlyList<ViewCandidate> views,
+    Bounds2D frontBounds,
+    Bounds2D targetGroupBounds,
+    double horizontalGap,
+    double verticalGap)
+        {
+            if (result == null || views == null || views.Count == 0)
+                return;
+
+            var placedIds = new HashSet<int>(result.Select(x => x.ViewId));
+
+            var unresolved = views
+                .Where(x => x != null)
+                .Where(x => !placedIds.Contains(x.IslandId))
+                .Where(x => x.FinalRole == ViewIslandSemanticRole.GeometryView)
+                .OrderByDescending(x => x.PrimaryScore)
+                .ThenByDescending(x => x.Area)
+                .ThenBy(x => x.IslandId)
+                .ToList();
+
+            if (unresolved.Count == 0)
+                return;
+
+            // 기본 정책:
+            // Front의 오른쪽 바깥에서 시작해서 위→아래로 쌓고,
+            // 세로 공간이 부족하면 다음 컬럼으로 넘긴다.
+            var startX = Math.Max(frontBounds.MaxX + horizontalGap, targetGroupBounds.MinX);
+            var startY = targetGroupBounds.MaxY;
+
+            var cursorX = startX;
+            var cursorY = startY;
+
+            double currentColumnWidth = 0.0;
+            var minYLimit = targetGroupBounds.MinY;
+
+            foreach (var view in unresolved)
+            {
+                if (view == null)
+                    continue;
+
+                var w = Math.Max(view.Width, 1.0);
+                var h = Math.Max(view.Height, 1.0);
+
+                // 현재 컬럼에 못 넣으면 다음 컬럼으로 이동
+                if (cursorY - h < minYLimit)
+                {
+                    cursorX += currentColumnWidth + horizontalGap;
+                    cursorY = startY;
+                    currentColumnWidth = 0.0;
+                }
+
+                var b = new Bounds2D(
+                    cursorX,
+                    cursorY - h,
+                    cursorX + w,
+                    cursorY);
+
+                result.Add(new ProjectionPlacement
+                {
+                    ViewId = view.IslandId,
+                    TargetBounds = b,
+                    Reason = "Normalized:UnresolvedSecondary"
+                });
+
+                currentColumnWidth = Math.Max(currentColumnWidth, w);
+                cursorY -= (h + verticalGap);
+            }
         }
 
         private void AppendAdditionalNormalizedPlacements(
