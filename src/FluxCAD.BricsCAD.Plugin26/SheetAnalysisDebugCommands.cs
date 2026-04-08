@@ -2945,34 +2945,45 @@ namespace FluxCAD.BricsCAD.Plugin26
         }
 
         private static string BuildViewGraphNodeLabel(
-    ViewCluster node,
-    ViewGraph graph,
-    RelativePositionMap map,
-    IReadOnlyDictionary<int, ViewCandidate> candidateMap)
+            ViewCluster node,
+            ViewGraph graph,
+            RelativePositionMap map,
+            IReadOnlyDictionary<int, ViewCandidate> candidateMap)
         {
             candidateMap.TryGetValue(node.Id, out var c);
 
-            if (node.Id == graph.Anchor.Id)
-                return $"Anchor:{node.Id}";
-
-            var pos = FindAnchorRelativePosition(map, node.Id);
-            var posText = ToAnchorPositionText(pos);
-
-            var relNode = FindAnchorRelativeNode(map, node.Id);
-            var suffix = "";
-
-            if (relNode != null && IsIndirectReason(relNode.Reason) && TryParseIndirectVia(relNode.Reason, out var viaId))
-                suffix = $" via:{viaId}";
-
             if (c != null)
             {
+                var proj = string.IsNullOrWhiteSpace(c.ProjectionRole)
+                    ? "-"
+                    : c.ProjectionRole;
+
+                var pos = node.Id == graph.Anchor.Id
+                    ? "Anchor"
+                    : ToAnchorPositionText(FindAnchorRelativePosition(map, node.Id));
+
+                var viaText = string.Empty;
+                var relNode = FindAnchorRelativeNode(map, node.Id);
+                if (relNode != null &&
+                    IsIndirectReason(relNode.Reason) &&
+                    TryParseIndirectVia(relNode.Reason, out var viaId))
+                {
+                    viaText = $" via:{viaId}";
+                }
+
                 return
-                    $"{posText}:{node.Id}{suffix} " +
-                    $"Primary={(c.IsPrimaryView ? "Y" : "N")} " +
-                    $"Representative={(c.IsRepresentativePrimaryView ? "Y" : "N")}";
+                    $"I:{node.Id} " +
+                    $"Proj:{proj} " +
+                    $"Pos:{pos}{viaText} " +
+                    $"P:{(c.IsPrimaryView ? "Y" : "N")} " +
+                    $"R:{(c.IsRepresentativePrimaryView ? "Y" : "N")}";
             }
 
-            return $"{posText}:{node.Id}{suffix}";
+            var fallbackPos = node.Id == graph.Anchor.Id
+                ? "Anchor"
+                : ToAnchorPositionText(FindAnchorRelativePosition(map, node.Id));
+
+            return $"I:{node.Id} Pos:{fallbackPos}";
         }
 
         private static AnchorRelativeNode? FindAnchorRelativeNode(RelativePositionMap map, int viewId)

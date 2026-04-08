@@ -89,7 +89,7 @@ namespace FluxCAD.SheetAnalysis.ViewIsolation.Analysis
             ResolveProjectionRoles(candidates);
         }
 
-        private static void ResolveProjectionRoles(IList<ViewCandidate> candidates)
+        private void ResolveProjectionRoles(IList<ViewCandidate> candidates)
         {
             if (candidates == null || candidates.Count == 0)
                 return;
@@ -100,12 +100,18 @@ namespace FluxCAD.SheetAnalysis.ViewIsolation.Analysis
                 c.ProjectionReason = string.Empty;
             }
 
-            var primaryViews = candidates
+            var topLevelGeometry = candidates
                 .Where(x => x != null)
-                .Where(x => x.IsPrimaryView)
-                .Where(x => x.FinalRole == ViewIslandSemanticRole.GeometryView)
                 .Where(x => x.IsTopLevelView)
                 .Where(x => !x.HasParent)
+                .Where(x => x.FinalRole == ViewIslandSemanticRole.GeometryView)
+                .ToList();
+
+            if (topLevelGeometry.Count == 0)
+                return;
+
+            var primaryViews = topLevelGeometry
+                .Where(x => x.IsPrimaryView)
                 .ToList();
 
             if (primaryViews.Count == 0)
@@ -128,87 +134,255 @@ namespace FluxCAD.SheetAnalysis.ViewIsolation.Analysis
                 $"RepresentativeScore={anchor.RepresentativePrimaryScore:0.###}, " +
                 $"PrimaryScore={anchor.PrimaryScore:0.###}";
 
-            var others = primaryViews
-                .Where(x => x.IslandId != anchor.IslandId)
-                .ToList();
+            // 1) anchor 기준 direct 대표들 먼저 확정
+            var groupRepresentatives = ResolveAnchorDirectRepresentatives(anchor, primaryViews);
 
-            var assignedRoles = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
-    {
-        "Front"
-    };
-
-            foreach (var view in others)
+            foreach (var kv in groupRepresentatives)
             {
-                var position = NormalizeProjectionPosition(view.BestProjectionPosition);
+                var position = kv.Key;
+                var rep = kv.Value;
+                if (rep == null)
+                    continue;
 
-                string role = position switch
+                var role = position switch
                 {
-                    "Above" => "Top",
-                    "Below" => "Bottom",
-                    "Left" => "Left",
-                    "Right" => "Right",
+                    ViewRelativePosition.Above => "Top",
+                    ViewRelativePosition.Below => "Bottom",
+                    ViewRelativePosition.Left => "Left",
+                    ViewRelativePosition.Right => "Right",
                     _ => string.Empty
                 };
 
                 if (string.IsNullOrWhiteSpace(role))
-                {
-                    view.ProjectionRole = "Unresolved";
-                    view.ProjectionReason =
-                        $"NoResolvedProjectionPosition, " +
-                        $"BestScore={view.BestProjectionScore:0.###}, " +
-                        $"BestSource={view.BestProjectionSourceIslandId?.ToString() ?? "-"}, " +
-                        $"BestPosition={view.BestProjectionPosition}";
                     continue;
-                }
 
-                // 같은 역할이 여러 개 나오면 대표 1개만 정식 role, 나머지는 secondary로 둔다
-                if (assignedRoles.Contains(role))
+                rep.ProjectionRole = role;
+                rep.ProjectionReason =
+                    $"DirectFromAnchor={anchor.IslandId}, " +
+                    $"BestSource={rep.BestProjectionSourceIslandId?.ToString() ?? "-"}, " +
+                    $"BestPosition={rep.BestProjectionPosition}, " +
+                    $"BestScore={rep.BestProjectionScore:0.###}";
+            }
+
+            // 2) 아직 role이 없는 primary geometry를 sibling/intent로 해석
+            foreach (var candidate in primaryViews)
+            {
+                if (candidate.IslandId == anchor.IslandId)
+                    continue;
+
+                if (!string.IsNullOrWhiteSpace(candidate.ProjectionRole))
+                    continue;
+
+                var resolved = ResolveIndirectProjectionRoleFromRepresentatives(
+                    candidate,
+                    groupRepresentatives,
+                    primaryViews);
+
+                if (!string.IsNullOrWhiteSpace(resolved.Role))
                 {
-                    view.ProjectionRole = role + "_Secondary";
-                    view.ProjectionReason =
-                        $"DuplicateRole, BaseRole={role}, " +
-                        $"BestScore={view.BestProjectionScore:0.###}, " +
-                        $"BestSource={view.BestProjectionSourceIslandId?.ToString() ?? "-"}, " +
-                        $"BestPosition={view.BestProjectionPosition}";
+                    candidate.ProjectionRole = resolved.Role;
+                    candidate.ProjectionReason = resolved.Reason;
                 }
                 else
                 {
-                    view.ProjectionRole = role;
-                    view.ProjectionReason =
-                        $"ResolvedFromAnchor={anchor.IslandId}, " +
-                        $"BestScore={view.BestProjectionScore:0.###}, " +
-                        $"BestSource={view.BestProjectionSourceIslandId?.ToString() ?? "-"}, " +
-                        $"BestPosition={view.BestProjectionPosition}";
-                    assignedRoles.Add(role);
+                    // fallback
+                    var fallbackRole = MapDirectPositionToRole(candidate.BestProjectionPosition);
+                    candidate.ProjectionRole = string.IsNullOrWhiteSpace(fallbackRole)
+                        ? "Unresolved"
+                        : fallbackRole + "_Weak";
+                    candidate.ProjectionReason =
+                        $"FallbackFromBestProjection, " +
+                        $"BestSource={candidate.BestProjectionSourceIslandId?.ToString() ?? "-"}, " +
+                        $"BestPosition={candidate.BestProjectionPosition}, " +
+                        $"BestScore={candidate.BestProjectionScore:0.###}";
                 }
             }
 
-            // primary는 아니지만 top-level geometry인 뷰들도 참고 role 부여
-            var nonPrimaryTopLevels = candidates
-                .Where(x => x != null)
-                .Where(x => !x.IsPrimaryView)
-                .Where(x => x.IsTopLevelView)
-                .Where(x => !x.HasParent)
-                .Where(x => x.FinalRole == ViewIslandSemanticRole.GeometryView)
-                .ToList();
-
-            foreach (var view in nonPrimaryTopLevels)
+            // 3) non-primary top-level geometry는 reference로 둠
+            foreach (var candidate in topLevelGeometry.Where(x => !x.IsPrimaryView))
             {
-                if (!string.IsNullOrWhiteSpace(view.ProjectionRole))
+                if (!string.IsNullOrWhiteSpace(candidate.ProjectionRole))
                     continue;
 
-                var position = NormalizeProjectionPosition(view.BestProjectionPosition);
-
-                view.ProjectionRole = string.IsNullOrWhiteSpace(position)
+                var fallbackRole = MapDirectPositionToRole(candidate.BestProjectionPosition);
+                candidate.ProjectionRole = string.IsNullOrWhiteSpace(fallbackRole)
                     ? "ReferenceGeometry"
-                    : position + "_Reference";
+                    : fallbackRole + "_Reference";
 
-                view.ProjectionReason =
-                    $"NonPrimaryGeometry, " +
-                    $"BestScore={view.BestProjectionScore:0.###}, " +
-                    $"BestSource={view.BestProjectionSourceIslandId?.ToString() ?? "-"}, " +
-                    $"BestPosition={view.BestProjectionPosition}";
+                candidate.ProjectionReason =
+                    $"NonPrimaryReference, " +
+                    $"BestSource={candidate.BestProjectionSourceIslandId?.ToString() ?? "-"}, " +
+                    $"BestPosition={candidate.BestProjectionPosition}, " +
+                    $"BestScore={candidate.BestProjectionScore:0.###}";
             }
+        }
+
+        private Dictionary<ViewRelativePosition, ViewCandidate?> ResolveAnchorDirectRepresentatives(
+    ViewCandidate anchor,
+    IReadOnlyList<ViewCandidate> primaryViews)
+        {
+            var result = new Dictionary<ViewRelativePosition, ViewCandidate?>
+            {
+                [ViewRelativePosition.Above] = null,
+                [ViewRelativePosition.Below] = null,
+                [ViewRelativePosition.Left] = null,
+                [ViewRelativePosition.Right] = null
+            };
+
+            var buckets = new Dictionary<ViewRelativePosition, List<(ViewCandidate View, double Score)>>()
+            {
+                [ViewRelativePosition.Above] = new List<(ViewCandidate, double)>(),
+                [ViewRelativePosition.Below] = new List<(ViewCandidate, double)>(),
+                [ViewRelativePosition.Left] = new List<(ViewCandidate, double)>(),
+                [ViewRelativePosition.Right] = new List<(ViewCandidate, double)>()
+            };
+
+            foreach (var candidate in primaryViews)
+            {
+                if (candidate == null || candidate.IslandId == anchor.IslandId)
+                    continue;
+
+                var rel = _relationshipAnalyzer.Analyze(anchor, candidate);
+                if (rel == null)
+                    continue;
+
+                if (rel.RelationKind == ViewRelationKind.EmbeddedFeature ||
+                    rel.RelationKind == ViewRelationKind.ParentChildContainment)
+                    continue;
+
+                if (!buckets.ContainsKey(rel.RelativePosition))
+                    continue;
+
+                var score = ComputeCadProjectionScore(anchor, candidate, rel);
+                if (score <= 0.0)
+                    continue;
+
+                buckets[rel.RelativePosition].Add((candidate, score));
+            }
+
+            foreach (var kv in buckets)
+            {
+                var best = kv.Value
+                    .OrderByDescending(x => x.Score)
+                    .ThenByDescending(x => x.View.PrimaryScore)
+                    .ThenByDescending(x => x.View.Area)
+                    .Select(x => x.View)
+                    .FirstOrDefault();
+
+                result[kv.Key] = best;
+            }
+
+            return result;
+        }
+
+        private (string Role, string Reason) ResolveIndirectProjectionRoleFromRepresentatives(
+    ViewCandidate candidate,
+    IReadOnlyDictionary<ViewRelativePosition, ViewCandidate?> groupRepresentatives,
+    IReadOnlyList<ViewCandidate> primaryViews)
+        {
+            if (candidate == null)
+                return (string.Empty, string.Empty);
+
+            foreach (var kv in groupRepresentatives)
+            {
+                var basePos = kv.Key;
+                var rep = kv.Value;
+
+                if (rep == null)
+                    continue;
+
+                if (candidate.IslandId == rep.IslandId)
+                    continue;
+
+                var rel = _relationshipAnalyzer.Analyze(rep, candidate);
+
+                if (rel == null)
+                    continue;
+
+                if (rel.RelationKind == ViewRelationKind.EmbeddedFeature ||
+                    rel.RelationKind == ViewRelationKind.ParentChildContainment)
+                {
+                    continue;
+                }
+
+                var siblingDir = rel.RelativePosition;
+                var role = ResolveProjectionRoleFromBaseAndSibling(basePos, siblingDir);
+
+                if (string.IsNullOrWhiteSpace(role))
+                    continue;
+
+                var score = ComputeCadProjectionScore(rep, candidate, rel);
+                if (score <= 0.0)
+                    continue;
+
+                return
+                (
+                    role,
+                    $"IndirectFromRepresentative={rep.IslandId}, " +
+                    $"Base={basePos}, Sibling={siblingDir}, " +
+                    $"Score={score:0.###}"
+                );
+            }
+
+            return (string.Empty, string.Empty);
+        }
+
+        private static string ResolveProjectionRoleFromBaseAndSibling(
+    ViewRelativePosition basePosition,
+    ViewRelativePosition siblingDirection)
+        {
+            switch (basePosition)
+            {
+                case ViewRelativePosition.Below:
+                    if (siblingDirection == ViewRelativePosition.Left)
+                        return "Left";
+                    if (siblingDirection == ViewRelativePosition.Right)
+                        return "Right";
+                    break;
+
+                case ViewRelativePosition.Above:
+                    if (siblingDirection == ViewRelativePosition.Left)
+                        return "Left";
+                    if (siblingDirection == ViewRelativePosition.Right)
+                        return "Right";
+                    break;
+
+                case ViewRelativePosition.Left:
+                    if (siblingDirection == ViewRelativePosition.Above)
+                        return "Top";
+                    if (siblingDirection == ViewRelativePosition.Below)
+                        return "Bottom";
+                    break;
+
+                case ViewRelativePosition.Right:
+                    if (siblingDirection == ViewRelativePosition.Above)
+                        return "Top";
+                    if (siblingDirection == ViewRelativePosition.Below)
+                        return "Bottom";
+                    break;
+            }
+
+            return string.Empty;
+        }
+
+        private static string MapDirectPositionToRole(string? bestProjectionPosition)
+        {
+            if (string.IsNullOrWhiteSpace(bestProjectionPosition))
+                return string.Empty;
+
+            if (string.Equals(bestProjectionPosition, ViewRelativePosition.Above.ToString(), StringComparison.OrdinalIgnoreCase))
+                return "Top";
+
+            if (string.Equals(bestProjectionPosition, ViewRelativePosition.Below.ToString(), StringComparison.OrdinalIgnoreCase))
+                return "Bottom";
+
+            if (string.Equals(bestProjectionPosition, ViewRelativePosition.Left.ToString(), StringComparison.OrdinalIgnoreCase))
+                return "Left";
+
+            if (string.Equals(bestProjectionPosition, ViewRelativePosition.Right.ToString(), StringComparison.OrdinalIgnoreCase))
+                return "Right";
+
+            return string.Empty;
         }
 
         private static string NormalizeProjectionPosition(string? position)
