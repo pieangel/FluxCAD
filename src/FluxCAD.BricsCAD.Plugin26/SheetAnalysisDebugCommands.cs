@@ -172,6 +172,32 @@ namespace FluxCAD.BricsCAD.Plugin26
             public string Reason { get; init; } = string.Empty;
         }
 
+        private sealed class SourceIdInspectionResult
+        {
+            public int BlockReferenceCount { get; init; }
+            public int CurveLikeCount { get; init; }
+            public int OtherCount { get; init; }
+
+            public bool IsSingleBlockReference { get; init; }
+            public string BlockName { get; init; } = string.Empty;
+            public string BlockHandle { get; init; } = string.Empty;
+
+            public string DescribeTypes()
+            {
+                return $"AcceptedTypes=BlockRef:{BlockReferenceCount}, CurveLike:{CurveLikeCount}, Other:{OtherCount}";
+            }
+
+            public string DescribeStrategy()
+            {
+                if (IsSingleBlockReference)
+                {
+                    return $"Strategy=SingleBlockReferenceCopy, BlockName={BlockName}, Handle={BlockHandle}";
+                }
+
+                return "Strategy=EntityLevelCopy";
+            }
+        }
+
 
         [CommandMethod("FLUX_COPY_NORMALIZED_GEOMETRY_VIEWS_OUTSIDE")]
         public void FluxCopyNormalizedGeometryViewsOutside()
@@ -308,7 +334,7 @@ namespace FluxCAD.BricsCAD.Plugin26
                         .Where(x => !x.IsTableLikeLayer)
                         .Where(x => !x.IsTitleLikeLayer)
                         .Where(x => !IsSemanticFrameLikeEntity(x, sheetBounds))
-                        .Where(x => !IsHiddenOrCenterEntity(x))
+                        //.Where(x => !IsHiddenOrCenterEntity(x))
                         .ToList();
 
                     ed.WriteMessage(
@@ -426,6 +452,14 @@ namespace FluxCAD.BricsCAD.Plugin26
                             continue;
                         }
 
+                        var inspection = InspectAcceptedSourceIds(sourceIds, tr);
+
+                        ed.WriteMessage(
+                            $"\n[FluxCAD] Island={work.View.IslandId} " +
+                            $"{inspection.DescribeTypes()}, " +
+                            $"{inspection.DescribeStrategy()}");
+
+                        /*
                         var msId = SymbolUtilityServices.GetBlockModelSpaceId(db);
                         var mapping = new IdMapping();
                         db.DeepCloneObjects(sourceIds, msId, mapping, false);
@@ -447,6 +481,52 @@ namespace FluxCAD.BricsCAD.Plugin26
 
                             cloned.TransformBy(displacement);
                             copiedCount++;
+                        }
+                        */
+
+                        var msId = SymbolUtilityServices.GetBlockModelSpaceId(db);
+                        var mapping = new IdMapping();
+                        db.DeepCloneObjects(sourceIds, msId, mapping, false);
+
+                        // 기존 view.Bounds의 중심을 placement.TargetBounds 중심으로 이동
+                        var dx = placement.TargetBounds.Center.X - work.View.Bounds.Center.X;
+                        var dy = placement.TargetBounds.Center.Y - work.View.Bounds.Center.Y;
+                        var displacement = Matrix3d.Displacement(new Vector3d(dx, dy, 0.0));
+
+                        int copiedCount = 0;
+
+                        if (inspection.IsSingleBlockReference)
+                        {
+                            // 현재 케이스:
+                            // view 전체가 BlockReference 하나로 묶여 있으므로
+                            // block 단위 복사를 우선 전략으로 사용
+                            var clonedTopLevelIds = CollectDirectClonedIds(sourceIds, mapping);
+
+                            foreach (var clonedId in clonedTopLevelIds)
+                            {
+                                var cloned = tr.GetObject(clonedId, OpenMode.ForWrite, false) as Entity;
+                                if (cloned == null)
+                                    continue;
+
+                                cloned.TransformBy(displacement);
+                                copiedCount++;
+                            }
+                        }
+                        else
+                        {
+                            // fallback:
+                            // 향후 흩어진 entity 도면에서 세부 제어를 넣을 자리
+                            var clonedTopLevelIds = CollectDirectClonedIds(sourceIds, mapping);
+
+                            foreach (var clonedId in clonedTopLevelIds)
+                            {
+                                var cloned = tr.GetObject(clonedId, OpenMode.ForWrite, false) as Entity;
+                                if (cloned == null)
+                                    continue;
+
+                                cloned.TransformBy(displacement);
+                                copiedCount++;
+                            }
                         }
 
                         var labelPos = new Point2D(
@@ -471,6 +551,8 @@ namespace FluxCAD.BricsCAD.Plugin26
                             $"\n[FluxCAD] NormalizedCopied View Island={work.View.IslandId}, " +
                             $"Reason={placement.Reason}, " +
                             $"Semantic={work.SemanticEntities.Count}, SourceIds={sourceIds.Count}, Copied={copiedCount}, " +
+                            $"{inspection.DescribeTypes()}, " +
+                            $"{inspection.DescribeStrategy()}, " +
                             $"Offset=({dx:0.##},{dy:0.##}), Target={placement.TargetBounds}");
                     }
                 }
@@ -484,6 +566,173 @@ namespace FluxCAD.BricsCAD.Plugin26
             {
                 ed.WriteMessage($"\n[FluxCAD] FLUX_COPY_NORMALIZED_GEOMETRY_VIEWS_OUTSIDE failed: {ex}");
             }
+        }
+
+        private static SourceIdInspectionResult InspectAcceptedSourceIds(
+    ObjectIdCollection sourceIds,
+    Transaction tr)
+        {
+            var result = new SourceIdInspectionResult();
+
+            if (sourceIds == null || sourceIds.Count == 0)
+                return result;
+
+            int blockRefCount = 0;
+            int curveLikeCount = 0;
+            int otherCount = 0;
+
+            bool isSingleBlock = false;
+            string blockName = string.Empty;
+            string blockHandle = string.Empty;
+
+            foreach (ObjectId id in sourceIds)
+            {
+                Entity? ent = null;
+
+                try
+                {
+                    ent = tr.GetObject(id, OpenMode.ForRead, false) as Entity;
+                }
+                catch
+                {
+                    continue;
+                }
+
+                if (ent == null)
+                    continue;
+
+                if (ent is BlockReference br)
+                {
+                    blockRefCount++;
+
+                    if (sourceIds.Count == 1)
+                    {
+                        isSingleBlock = true;
+                        blockHandle = br.Handle.ToString();
+
+                        try
+                        {
+                            var btr = (BlockTableRecord)tr.GetObject(br.BlockTableRecord, OpenMode.ForRead);
+                            blockName = btr?.Name ?? string.Empty;
+                        }
+                        catch
+                        {
+                            blockName = string.Empty;
+                        }
+                    }
+
+                    continue;
+                }
+
+                if (ent is Line
+                    || ent is Arc
+                    || ent is Circle
+                    || ent is Ellipse
+                    || ent is Teigha.DatabaseServices.Polyline
+                    || ent is Polyline2d
+                    || ent is Polyline3d
+                    || ent is Spline)
+                {
+                    curveLikeCount++;
+                    continue;
+                }
+
+                otherCount++;
+            }
+
+            return new SourceIdInspectionResult
+            {
+                BlockReferenceCount = blockRefCount,
+                CurveLikeCount = curveLikeCount,
+                OtherCount = otherCount,
+                IsSingleBlockReference = isSingleBlock,
+                BlockName = blockName,
+                BlockHandle = blockHandle
+            };
+        }
+
+
+        private static bool TryGetSingleAcceptedBlockReference(
+    ObjectIdCollection sourceIds,
+    Transaction tr,
+    out BlockReference? blockRef)
+        {
+            blockRef = null;
+
+            if (sourceIds == null || sourceIds.Count != 1)
+                return false;
+
+            var ent = tr.GetObject(sourceIds[0], OpenMode.ForRead, false) as Entity;
+            if (ent is not BlockReference br)
+                return false;
+
+            blockRef = br;
+            return true;
+        }
+
+        private static string DescribeAcceptedSourceTypes(
+            ObjectIdCollection sourceIds,
+            Transaction tr)
+        {
+            if (sourceIds == null || sourceIds.Count == 0)
+                return "AcceptedTypes=(none)";
+
+            int blockRefCount = 0;
+            int curveLikeCount = 0;
+            int otherCount = 0;
+
+            foreach (ObjectId id in sourceIds)
+            {
+                var ent = tr.GetObject(id, OpenMode.ForRead, false) as Entity;
+                if (ent == null)
+                    continue;
+
+                if (ent is BlockReference)
+                {
+                    blockRefCount++;
+                    continue;
+                }
+
+                if (ent is Line
+                    || ent is Arc
+                    || ent is Circle
+                    || ent is Ellipse
+                    || ent is Teigha.DatabaseServices.Polyline
+                    || ent is Polyline2d
+                    || ent is Polyline3d
+                    || ent is Spline)
+                {
+                    curveLikeCount++;
+                    continue;
+                }
+
+                otherCount++;
+            }
+
+            return $"AcceptedTypes=BlockRef:{blockRefCount}, CurveLike:{curveLikeCount}, Other:{otherCount}";
+        }
+
+        private static string BuildCopyStrategyText(
+            ObjectIdCollection sourceIds,
+            Transaction tr)
+        {
+            if (TryGetSingleAcceptedBlockReference(sourceIds, tr, out var br))
+            {
+                var blockName = "(anonymous)";
+                try
+                {
+                    var btr = (BlockTableRecord)tr.GetObject(br.BlockTableRecord, OpenMode.ForRead);
+                    blockName = btr?.Name ?? "(null)";
+                }
+                catch
+                {
+                    // 이름 조회 실패해도 전략 판정에는 영향 없음
+                }
+
+                return $"Strategy=SingleBlockReferenceCopy, BlockName={blockName}, Handle={br.Handle}";
+            }
+
+            return "Strategy=EntityLevelCopy";
         }
 
         private static List<ObjectId> CollectDirectClonedIds(
@@ -1504,13 +1753,13 @@ namespace FluxCAD.BricsCAD.Plugin26
         }
 
         private static ObjectIdCollection CollectModelSpaceEntitiesForSemanticView(
-            Database db,
-            Transaction tr,
-            IReadOnlyList<SheetEntity> semanticEntities,
-            Bounds2D targetViewBounds,
-            Bounds2D sheetBounds,
-            Bricscad.EditorInput.Editor? ed = null,
-            int? viewId = null)
+    Database db,
+    Transaction tr,
+    IReadOnlyList<SheetEntity> semanticEntities,
+    Bounds2D targetViewBounds,
+    Bounds2D sheetBounds,
+    Bricscad.EditorInput.Editor? ed = null,
+    int? viewId = null)
         {
             var result = new ObjectIdCollection();
 
@@ -1539,13 +1788,16 @@ namespace FluxCAD.BricsCAD.Plugin26
             int rejectedDimension = 0;
             int rejectedTextLike = 0;
             int rejectedHatchOrSolid = 0;
-            int rejectedHiddenOrCenter = 0;
             int rejectedNoBounds = 0;
             int rejectedFrameLike = 0;
             int rejectedNoViewIntersect = 0;
             int rejectedNoSemanticIntersect = 0;
 
             int accepted = 0;
+
+            // 핵심 완화값
+            const double viewTolerance = 3.0;
+            const double semanticTolerance = 3.0;
 
             foreach (ObjectId id in ms)
             {
@@ -1582,11 +1834,13 @@ namespace FluxCAD.BricsCAD.Plugin26
                     continue;
                 }
 
-                if (IsHiddenOrCenterCadEntity(ent))
-                {
-                    rejectedHiddenOrCenter++;
-                    continue;
-                }
+                // 중요:
+                // normalized geometry copy에서는 hidden/center를 제거하지 않음
+                // if (IsHiddenOrCenterCadEntity(ent))
+                // {
+                //     rejectedHiddenOrCenter++;
+                //     continue;
+                // }
 
                 if (!TryGetEntityBoundsSafe(ent, out var bounds) || bounds.IsEmpty)
                 {
@@ -1600,7 +1854,7 @@ namespace FluxCAD.BricsCAD.Plugin26
                     continue;
                 }
 
-                if (!Bounds2DHelper.Intersects(targetViewBounds, bounds, tolerance: 0.0))
+                if (!Bounds2DHelper.Intersects(targetViewBounds, bounds, tolerance: viewTolerance))
                 {
                     rejectedNoViewIntersect++;
                     continue;
@@ -1612,7 +1866,7 @@ namespace FluxCAD.BricsCAD.Plugin26
                     if (sb.IsEmpty)
                         continue;
 
-                    if (Bounds2DHelper.Intersects(sb, bounds, tolerance: 2.0))
+                    if (Bounds2DHelper.Intersects(sb, bounds, tolerance: semanticTolerance))
                     {
                         intersectsSemantic = true;
                         break;
@@ -1642,7 +1896,6 @@ namespace FluxCAD.BricsCAD.Plugin26
                     $"Dimension={rejectedDimension}, " +
                     $"TextLike={rejectedTextLike}, " +
                     $"HatchOrSolid={rejectedHatchOrSolid}, " +
-                    $"HiddenOrCenter={rejectedHiddenOrCenter}, " +
                     $"NoBounds={rejectedNoBounds}, " +
                     $"FrameLike={rejectedFrameLike}, " +
                     $"NoViewIntersect={rejectedNoViewIntersect}, " +
