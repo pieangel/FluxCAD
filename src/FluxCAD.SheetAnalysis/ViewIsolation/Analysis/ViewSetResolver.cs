@@ -79,10 +79,156 @@ namespace FluxCAD.SheetAnalysis.ViewIsolation.Analysis
             //    모든 top-level view에 대해 일관된 projection summary를 만든다.
             PopulateTopLevelProjectionLinks(topLevelCandidates);
 
-            // 6) 마지막에 primary view 판정
+            // 6) primary 선정
             ResolvePrimaryViews(candidates);
 
+            // 7) representative(anchor) 선정
             ResolveRepresentativePrimaryView(candidates);
+
+            // 8) 최종 projection role 확정 추가
+            ResolveProjectionRoles(candidates);
+        }
+
+        private static void ResolveProjectionRoles(IList<ViewCandidate> candidates)
+        {
+            if (candidates == null || candidates.Count == 0)
+                return;
+
+            foreach (var c in candidates)
+            {
+                c.ProjectionRole = string.Empty;
+                c.ProjectionReason = string.Empty;
+            }
+
+            var primaryViews = candidates
+                .Where(x => x != null)
+                .Where(x => x.IsPrimaryView)
+                .Where(x => x.FinalRole == ViewIslandSemanticRole.GeometryView)
+                .Where(x => x.IsTopLevelView)
+                .Where(x => !x.HasParent)
+                .ToList();
+
+            if (primaryViews.Count == 0)
+                return;
+
+            var anchor = primaryViews
+                .FirstOrDefault(x => x.IsRepresentativePrimaryView)
+                ?? primaryViews
+                    .OrderByDescending(x => x.RepresentativePrimaryScore)
+                    .ThenByDescending(x => x.PrimaryScore)
+                    .ThenByDescending(x => x.Area)
+                    .FirstOrDefault();
+
+            if (anchor == null)
+                return;
+
+            anchor.ProjectionRole = "Front";
+            anchor.ProjectionReason =
+                $"RepresentativePrimary Anchor={anchor.IslandId}, " +
+                $"RepresentativeScore={anchor.RepresentativePrimaryScore:0.###}, " +
+                $"PrimaryScore={anchor.PrimaryScore:0.###}";
+
+            var others = primaryViews
+                .Where(x => x.IslandId != anchor.IslandId)
+                .ToList();
+
+            var assignedRoles = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+    {
+        "Front"
+    };
+
+            foreach (var view in others)
+            {
+                var position = NormalizeProjectionPosition(view.BestProjectionPosition);
+
+                string role = position switch
+                {
+                    "Above" => "Top",
+                    "Below" => "Bottom",
+                    "Left" => "Left",
+                    "Right" => "Right",
+                    _ => string.Empty
+                };
+
+                if (string.IsNullOrWhiteSpace(role))
+                {
+                    view.ProjectionRole = "Unresolved";
+                    view.ProjectionReason =
+                        $"NoResolvedProjectionPosition, " +
+                        $"BestScore={view.BestProjectionScore:0.###}, " +
+                        $"BestSource={view.BestProjectionSourceIslandId?.ToString() ?? "-"}, " +
+                        $"BestPosition={view.BestProjectionPosition}";
+                    continue;
+                }
+
+                // 같은 역할이 여러 개 나오면 대표 1개만 정식 role, 나머지는 secondary로 둔다
+                if (assignedRoles.Contains(role))
+                {
+                    view.ProjectionRole = role + "_Secondary";
+                    view.ProjectionReason =
+                        $"DuplicateRole, BaseRole={role}, " +
+                        $"BestScore={view.BestProjectionScore:0.###}, " +
+                        $"BestSource={view.BestProjectionSourceIslandId?.ToString() ?? "-"}, " +
+                        $"BestPosition={view.BestProjectionPosition}";
+                }
+                else
+                {
+                    view.ProjectionRole = role;
+                    view.ProjectionReason =
+                        $"ResolvedFromAnchor={anchor.IslandId}, " +
+                        $"BestScore={view.BestProjectionScore:0.###}, " +
+                        $"BestSource={view.BestProjectionSourceIslandId?.ToString() ?? "-"}, " +
+                        $"BestPosition={view.BestProjectionPosition}";
+                    assignedRoles.Add(role);
+                }
+            }
+
+            // primary는 아니지만 top-level geometry인 뷰들도 참고 role 부여
+            var nonPrimaryTopLevels = candidates
+                .Where(x => x != null)
+                .Where(x => !x.IsPrimaryView)
+                .Where(x => x.IsTopLevelView)
+                .Where(x => !x.HasParent)
+                .Where(x => x.FinalRole == ViewIslandSemanticRole.GeometryView)
+                .ToList();
+
+            foreach (var view in nonPrimaryTopLevels)
+            {
+                if (!string.IsNullOrWhiteSpace(view.ProjectionRole))
+                    continue;
+
+                var position = NormalizeProjectionPosition(view.BestProjectionPosition);
+
+                view.ProjectionRole = string.IsNullOrWhiteSpace(position)
+                    ? "ReferenceGeometry"
+                    : position + "_Reference";
+
+                view.ProjectionReason =
+                    $"NonPrimaryGeometry, " +
+                    $"BestScore={view.BestProjectionScore:0.###}, " +
+                    $"BestSource={view.BestProjectionSourceIslandId?.ToString() ?? "-"}, " +
+                    $"BestPosition={view.BestProjectionPosition}";
+            }
+        }
+
+        private static string NormalizeProjectionPosition(string? position)
+        {
+            if (string.IsNullOrWhiteSpace(position))
+                return string.Empty;
+
+            if (string.Equals(position, ViewRelativePosition.Above.ToString(), StringComparison.OrdinalIgnoreCase))
+                return "Above";
+
+            if (string.Equals(position, ViewRelativePosition.Below.ToString(), StringComparison.OrdinalIgnoreCase))
+                return "Below";
+
+            if (string.Equals(position, ViewRelativePosition.Left.ToString(), StringComparison.OrdinalIgnoreCase))
+                return "Left";
+
+            if (string.Equals(position, ViewRelativePosition.Right.ToString(), StringComparison.OrdinalIgnoreCase))
+                return "Right";
+
+            return string.Empty;
         }
 
         private static void ResolveRepresentativePrimaryView(IList<ViewCandidate> candidates)
