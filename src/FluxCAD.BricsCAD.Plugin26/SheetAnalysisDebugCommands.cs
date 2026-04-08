@@ -198,6 +198,13 @@ namespace FluxCAD.BricsCAD.Plugin26
             }
         }
 
+        private sealed class SourceSelectionResult
+        {
+            public ObjectIdCollection SourceIds { get; init; } = new ObjectIdCollection();
+            public SourceIdInspectionResult Inspection { get; init; } = new SourceIdInspectionResult();
+            public string SelectionMode { get; init; } = "None";
+        }
+
 
         [CommandMethod("FLUX_COPY_NORMALIZED_GEOMETRY_VIEWS_OUTSIDE")]
         public void FluxCopyNormalizedGeometryViewsOutside()
@@ -436,7 +443,7 @@ namespace FluxCAD.BricsCAD.Plugin26
                     using (doc.LockDocument())
                     using (var tr = db.TransactionManager.StartTransaction())
                     {
-                        sourceIds = CollectModelSpaceEntitiesForSemanticView(
+                        var selection = CollectBestSourceIdsForView(
                             db,
                             tr,
                             work.SemanticEntities,
@@ -445,6 +452,9 @@ namespace FluxCAD.BricsCAD.Plugin26
                             ed,
                             work.View.IslandId);
 
+                        sourceIds = selection.SourceIds;
+                        var inspection = selection.Inspection;
+
                         if (sourceIds.Count == 0)
                         {
                             ed.WriteMessage($"\n[FluxCAD] Island={work.View.IslandId} sourceIds가 비어 있습니다.");
@@ -452,10 +462,9 @@ namespace FluxCAD.BricsCAD.Plugin26
                             continue;
                         }
 
-                        var inspection = InspectAcceptedSourceIds(sourceIds, tr);
-
                         ed.WriteMessage(
-                            $"\n[FluxCAD] Island={work.View.IslandId} " +
+                            $"\n[FluxCAD] Island={work.View.IslandId}, " +
+                            $"SelectionMode={selection.SelectionMode}, " +
                             $"{inspection.DescribeTypes()}, " +
                             $"{inspection.DescribeStrategy()}");
 
@@ -550,6 +559,7 @@ namespace FluxCAD.BricsCAD.Plugin26
                         ed.WriteMessage(
                             $"\n[FluxCAD] NormalizedCopied View Island={work.View.IslandId}, " +
                             $"Reason={placement.Reason}, " +
+                            $"SelectionMode={selection.SelectionMode}, " +
                             $"Semantic={work.SemanticEntities.Count}, SourceIds={sourceIds.Count}, Copied={copiedCount}, " +
                             $"{inspection.DescribeTypes()}, " +
                             $"{inspection.DescribeStrategy()}, " +
@@ -567,6 +577,238 @@ namespace FluxCAD.BricsCAD.Plugin26
                 ed.WriteMessage($"\n[FluxCAD] FLUX_COPY_NORMALIZED_GEOMETRY_VIEWS_OUTSIDE failed: {ex}");
             }
         }
+
+        private static bool ShouldCopyEntityBySemanticBoundsForFallback(
+    Entity ent,
+    IReadOnlyList<Bounds2D> semanticBounds,
+    Bounds2D targetViewBounds,
+    Bounds2D sheetBounds)
+        {
+            if (ent == null)
+                return false;
+
+            if (ent is Dimension)
+                return false;
+
+            if (ent is DBText || ent is MText || ent is MLeader || ent is Leader)
+                return false;
+
+            if (ent is Hatch || ent is Solid)
+                return false;
+
+            // fallback에서는 hidden/center 허용
+            // if (IsHiddenOrCenterCadEntity(ent))
+            //     return false;
+
+            if (!TryGetEntityBoundsSafe(ent, out var bounds))
+                return false;
+
+            if (bounds.IsEmpty)
+                return false;
+
+            if (IsCadEntityFrameLike(bounds, sheetBounds))
+                return false;
+
+            if (!Bounds2DHelper.Intersects(targetViewBounds, bounds, tolerance: 3.0))
+                return false;
+
+            foreach (var sb in semanticBounds)
+            {
+                if (sb.IsEmpty)
+                    continue;
+
+                if (Bounds2DHelper.Intersects(sb, bounds, tolerance: 3.0))
+                    return true;
+            }
+
+            return false;
+        }
+
+        private static ObjectIdCollection CollectFallbackSpatialEntityIds(
+    Database db,
+    Transaction tr,
+    IReadOnlyList<SheetEntity> semanticEntities,
+    Bounds2D targetViewBounds,
+    Bounds2D sheetBounds)
+        {
+            var result = new ObjectIdCollection();
+
+            if (db == null)
+                throw new ArgumentNullException(nameof(db));
+            if (tr == null)
+                throw new ArgumentNullException(nameof(tr));
+            if (semanticEntities == null || semanticEntities.Count == 0)
+                return result;
+
+            var semanticBounds = semanticEntities
+                .Where(x => x != null && !x.Bounds.IsEmpty)
+                .Select(x => x.Bounds)
+                .ToList();
+
+            if (semanticBounds.Count == 0)
+                return result;
+
+            var msId = SymbolUtilityServices.GetBlockModelSpaceId(db);
+            var ms = (BlockTableRecord)tr.GetObject(msId, OpenMode.ForRead);
+
+            foreach (ObjectId id in ms)
+            {
+                if (!id.IsValid || id.IsErased)
+                    continue;
+
+                var ent = tr.GetObject(id, OpenMode.ForRead, false) as Entity;
+                if (ent == null)
+                    continue;
+
+                if (!ShouldCopyEntityBySemanticBoundsForFallback(
+                    ent,
+                    semanticBounds,
+                    targetViewBounds,
+                    sheetBounds))
+                {
+                    continue;
+                }
+
+                result.Add(id);
+            }
+
+            return result;
+        }
+
+        private static ObjectIdCollection MergeObjectIds(
+    params ObjectIdCollection[] collections)
+        {
+            var result = new ObjectIdCollection();
+            var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+            if (collections == null || collections.Length == 0)
+                return result;
+
+            foreach (var col in collections)
+            {
+                if (col == null)
+                    continue;
+
+                foreach (ObjectId id in col)
+                {
+                    if (!id.IsValid || id.IsErased)
+                        continue;
+
+                    var key = id.Handle.ToString();
+                    if (!seen.Add(key))
+                        continue;
+
+                    result.Add(id);
+                }
+            }
+
+            return result;
+        }
+
+        private static SourceSelectionResult CollectBestSourceIdsForView(
+    Database db,
+    Transaction tr,
+    IReadOnlyList<SheetEntity> semanticEntities,
+    Bounds2D targetViewBounds,
+    Bounds2D sheetBounds,
+    Bricscad.EditorInput.Editor? ed,
+    int viewId)
+        {
+            // ------------------------------------------------------------
+            // PASS 1: 현재 방식
+            // ------------------------------------------------------------
+            var primary = CollectModelSpaceEntitiesForSemanticView(
+                db,
+                tr,
+                semanticEntities,
+                targetViewBounds,
+                sheetBounds,
+                ed,
+                viewId);
+
+            var primaryInspection = InspectAcceptedSourceIds(primary, tr);
+
+            // 현재처럼 block 1개로 대표되면 가장 좋은 케이스
+            if (primaryInspection.IsSingleBlockReference)
+            {
+                return new SourceSelectionResult
+                {
+                    SourceIds = primary,
+                    Inspection = primaryInspection,
+                    SelectionMode = "PrimarySingleBlock"
+                };
+            }
+
+            // ------------------------------------------------------------
+            // PASS 2: handle 기반 recovery
+            // ------------------------------------------------------------
+            var handles = CollectTopLevelSourceHandles(semanticEntities);
+            var recoveredByHandle = ResolveObjectIdsFromHandles(db, tr, handles);
+
+            var recoveredFiltered = new ObjectIdCollection();
+            foreach (ObjectId id in recoveredByHandle)
+            {
+                if (!id.IsValid || id.IsErased)
+                    continue;
+
+                var ent = tr.GetObject(id, OpenMode.ForRead, false) as Entity;
+                if (ent == null)
+                    continue;
+
+                if (!ShouldCopyRecoveredTopLevelEntity(ent, targetViewBounds, sheetBounds))
+                    continue;
+
+                recoveredFiltered.Add(id);
+            }
+
+            var mergedHandle = MergeObjectIds(primary, recoveredFiltered);
+            var mergedHandleInspection = InspectAcceptedSourceIds(mergedHandle, tr);
+
+            if (mergedHandle.Count > primary.Count)
+            {
+                return new SourceSelectionResult
+                {
+                    SourceIds = mergedHandle,
+                    Inspection = mergedHandleInspection,
+                    SelectionMode = "PrimaryPlusHandleRecovery"
+                };
+            }
+
+            // ------------------------------------------------------------
+            // PASS 3: spatial fallback
+            // ------------------------------------------------------------
+            var spatialFallback = CollectFallbackSpatialEntityIds(
+                db,
+                tr,
+                semanticEntities,
+                targetViewBounds,
+                sheetBounds);
+
+            var mergedSpatial = MergeObjectIds(primary, recoveredFiltered, spatialFallback);
+            var mergedSpatialInspection = InspectAcceptedSourceIds(mergedSpatial, tr);
+
+            if (mergedSpatial.Count > mergedHandle.Count)
+            {
+                return new SourceSelectionResult
+                {
+                    SourceIds = mergedSpatial,
+                    Inspection = mergedSpatialInspection,
+                    SelectionMode = "PrimaryPlusHandlePlusSpatialFallback"
+                };
+            }
+
+            // ------------------------------------------------------------
+            // fallback 없음 -> 원래 결과 유지
+            // ------------------------------------------------------------
+            return new SourceSelectionResult
+            {
+                SourceIds = primary,
+                Inspection = primaryInspection,
+                SelectionMode = "PrimaryOnly"
+            };
+        }
+
+
 
         private static SourceIdInspectionResult InspectAcceptedSourceIds(
     ObjectIdCollection sourceIds,
