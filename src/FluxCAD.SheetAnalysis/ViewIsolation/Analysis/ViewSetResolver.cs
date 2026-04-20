@@ -568,6 +568,18 @@ namespace FluxCAD.SheetAnalysis.ViewIsolation.Analysis
                     reasons.Add("GeometryView(+6)");
                 }
 
+                if (c.HasCenterLine)
+                {
+                    score += 2.5;
+                    reasons.Add("CenterLine(+2.5)");
+                }
+
+                if (c.HasHiddenLine)
+                {
+                    score += 1.5;
+                    reasons.Add("HiddenLine(+1.5)");
+                }
+
                 // 2) 치수 강도
                 var dimNorm = c.DimensionCount / (double)maxDim;
                 var dimScore = dimNorm * 8.0;
@@ -804,6 +816,24 @@ namespace FluxCAD.SheetAnalysis.ViewIsolation.Analysis
                     reasons.Add("Role=Unknown(+1)");
                 }
 
+                if (c.HasCenterLine)
+                {
+                    score += 4.0;
+                    reasons.Add("CenterLineBoost(+4)");
+                }
+
+                if (c.HasHiddenLine)
+                {
+                    score += 2.5;
+                    reasons.Add("HiddenLineBoost(+2.5)");
+                }
+
+                if (c.GeometryEntityCount >= 6)
+                {
+                    score += 1.0;
+                    reasons.Add($"GeomEntityBoost={c.GeometryEntityCount}(+1)");
+                }
+
                 if (maxDim > 0)
                 {
                     var dimNorm = (double)c.DimensionCount / maxDim;
@@ -888,6 +918,12 @@ namespace FluxCAD.SheetAnalysis.ViewIsolation.Analysis
                         score -= 2.0;
                         reasons.Add("ThinPenalty(-2)");
                     }
+                }
+
+                if (!c.HasDimension && !c.HasCenterLine && !c.HasHiddenLine)
+                {
+                    score -= 3.0;
+                    reasons.Add("NoStrongGeometryEvidencePenalty(-3)");
                 }
 
                 if (c.FinalRole == ViewIslandSemanticRole.Unknown && c.DimensionCount == 0)
@@ -1038,6 +1074,7 @@ namespace FluxCAD.SheetAnalysis.ViewIsolation.Analysis
             }
         }
 
+
         private void ResolveStrongSeeds(IList<ViewCandidate> candidates)
         {
             foreach (var c in candidates)
@@ -1052,21 +1089,33 @@ namespace FluxCAD.SheetAnalysis.ViewIsolation.Analysis
                 double score = 0.0;
                 var reasons = new List<string>();
 
-                if (c.InitialRole == ViewIslandSemanticRole.GeometryView)
-                {
-                    score += 0.45;
-                    reasons.Add("InitGeometry");
-                }
-
                 if (c.HasDimension)
                 {
-                    score += 0.40;
+                    score += 0.35;
                     reasons.Add("HasDimension");
+                }
+
+                if (c.HasCenterLine)
+                {
+                    score += 0.55;
+                    reasons.Add("HasCenterLine");
+                }
+
+                if (c.HasHiddenLine)
+                {
+                    score += 0.40;
+                    reasons.Add("HasHiddenLine");
+                }
+
+                if (c.GeometryEntityCount >= 3)
+                {
+                    score += 0.15;
+                    reasons.Add($"GeomCount={c.GeometryEntityCount}");
                 }
 
                 if (!c.IsSparseBridgeLike)
                 {
-                    score += 0.15;
+                    score += 0.10;
                     reasons.Add("NotSparseBridge");
                 }
 
@@ -1477,6 +1526,31 @@ namespace FluxCAD.SheetAnalysis.ViewIsolation.Analysis
                 {
                     reasons.Add($"AspectHigh={candidate.AspectRatio:0.##}");
                 }
+
+                if (candidate.HasCenterLine)
+                {
+                    score += 0.20;
+                    reasons.Add("CenterLine");
+                }
+
+                if (candidate.HasHiddenLine)
+                {
+                    score += 0.15;
+                    reasons.Add("HiddenLine");
+                }
+
+                if (strong.HasCenterLine && candidate.HasCenterLine)
+                {
+                    score += 0.10;
+                    reasons.Add("CenterPair");
+                }
+
+                if (strong.HasHiddenLine && candidate.HasHiddenLine)
+                {
+                    score += 0.08;
+                    reasons.Add("HiddenPair");
+                }
+
 
                 if (candidate.HasDimension)
                 {

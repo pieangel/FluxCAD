@@ -86,6 +86,16 @@ namespace FluxCAD.SheetAnalysis.ViewIsolation.Analysis
         public string? RepresentativePrimaryReason { get; set; }
 
 
+        public int CenterLineCount { get; set; }
+        public int HiddenLineCount { get; set; }
+        public int GeometryEntityCount { get; set; }
+        public int TextEntityCount { get; set; }
+        public int DimensionEntityCount { get; set; }
+
+        public bool HasCenterLine => CenterLineCount > 0;
+        public bool HasHiddenLine => HiddenLineCount > 0;
+        public bool HasStrongGeometryEvidence =>
+            HasDimension || HasCenterLine || HasHiddenLine;
 
         public double AspectRatio
         {

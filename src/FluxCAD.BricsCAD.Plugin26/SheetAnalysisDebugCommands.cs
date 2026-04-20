@@ -531,60 +531,16 @@ namespace FluxCAD.BricsCAD.Plugin26
                     using (doc.LockDocument())
                     using (var tr = db.TransactionManager.StartTransaction())
                     {
-                        var selection = CollectBestSourceIdsForView(
+                        var selection = ResolveCopySourceIdsForView(
                             db,
                             tr,
                             work.SemanticEntities,
-                            work.SourceBounds,   // 중요: work.View.Bounds 아님
+                            work.SourceBounds,
                             sheetBounds,
                             ed,
                             work.View.IslandId);
 
                         sourceIds = selection.SourceIds;
-
-                        // ------------------------------------------------------------
-                        // 핵심 수정:
-                        // safe 모드에서는 global contour / loose contour를 절대 추가하지 않음
-                        // ------------------------------------------------------------
-                        bool isContainedSafe =
-                            !string.IsNullOrWhiteSpace(selection.SelectionMode) &&
-                            selection.SelectionMode.StartsWith("ContainedSafe:", StringComparison.OrdinalIgnoreCase);
-
-                        if (!isContainedSafe)
-                        {
-                            var globalContourIds = CollectRecoveredGlobalContourEntityIds(
-                                db,
-                                tr,
-                                work.SemanticEntities,
-                                work.SourceBounds,   // 중요: 병합 후에는 SourceBounds 기준
-                                sheetBounds,
-                                ed,
-                                work.View.IslandId);
-
-                            sourceIds = MergeObjectIds(sourceIds, globalContourIds);
-
-                            if (sourceIds.Count > 0)
-                            {
-                                var looseContourIds = CollectAdjacentLooseContourEntities(
-                                    db,
-                                    tr,
-                                    sourceIds,
-                                    work.SemanticEntities,
-                                    work.SourceBounds,   // 중요: work.View.Bounds 아님
-                                    sheetBounds,
-                                    ed,
-                                    work.View.IslandId);
-
-                                sourceIds = MergeObjectIds(sourceIds, looseContourIds);
-                            }
-                        }
-                        else
-                        {
-                            ed.WriteMessage(
-                                $"\n[FluxCAD] SafeModeSkipContour I:{work.View.IslandId}, " +
-                                $"SelectionMode={selection.SelectionMode}, " +
-                                $"SourceIds={sourceIds.Count}");
-                        }
 
                         if (sourceIds.Count == 0)
                         {
@@ -593,7 +549,7 @@ namespace FluxCAD.BricsCAD.Plugin26
                             continue;
                         }
 
-                        var inspection = InspectAcceptedSourceIds(sourceIds, tr);
+                        var inspection = selection.Inspection ?? InspectAcceptedSourceIds(sourceIds, tr);
 
                         ed.WriteMessage(
                             $"\n[FluxCAD] Island={work.View.IslandId}, " +
@@ -601,75 +557,21 @@ namespace FluxCAD.BricsCAD.Plugin26
                             $"{inspection.DescribeTypes()}, " +
                             $"{inspection.DescribeStrategy()}");
 
-                        /*
-                        var msId = SymbolUtilityServices.GetBlockModelSpaceId(db);
-                        var mapping = new IdMapping();
-                        db.DeepCloneObjects(sourceIds, msId, mapping, false);
+                        if (sourceIds.Count == 0)
+                        {
+                            ed.WriteMessage($"\n[FluxCAD] Island={work.View.IslandId} sourceIds가 비어 있습니다.");
+                            tr.Commit();
+                            continue;
+                        }
 
-                        // 핵심:
-                        // 기존 view.Bounds의 중심을 placement.TargetBounds 중심으로 이동
                         var dx = placement.TargetBounds.Center.X - work.SourceBounds.Center.X;
                         var dy = placement.TargetBounds.Center.Y - work.SourceBounds.Center.Y;
-                        var displacement = Matrix3d.Displacement(new Vector3d(dx, dy, 0.0));
 
-                        var clonedTopLevelIds = CollectDirectClonedIds(sourceIds, mapping);
-
-                        int copiedCount = 0;
-                        foreach (var clonedId in clonedTopLevelIds)
-                        {
-                            var cloned = tr.GetObject(clonedId, OpenMode.ForWrite, false) as Entity;
-                            if (cloned == null)
-                                continue;
-
-                            cloned.TransformBy(displacement);
-                            copiedCount++;
-                        }
-                        */
-
-                        var msId = SymbolUtilityServices.GetBlockModelSpaceId(db);
-                        var mapping = new IdMapping();
-                        db.DeepCloneObjects(sourceIds, msId, mapping, false);
-
-                        // 기존 view.Bounds의 중심을 placement.TargetBounds 중심으로 이동
-                        var dx = placement.TargetBounds.Center.X - work.SourceBounds.Center.X;
-                        var dy = placement.TargetBounds.Center.Y - work.SourceBounds.Center.Y;
-                        var displacement = Matrix3d.Displacement(new Vector3d(dx, dy, 0.0));
-
-                        int copiedCount = 0;
-
-                        if (inspection.IsSingleBlockReference)
-                        {
-                            // 현재 케이스:
-                            // view 전체가 BlockReference 하나로 묶여 있으므로
-                            // block 단위 복사를 우선 전략으로 사용
-                            var clonedTopLevelIds = CollectDirectClonedIds(sourceIds, mapping);
-
-                            foreach (var clonedId in clonedTopLevelIds)
-                            {
-                                var cloned = tr.GetObject(clonedId, OpenMode.ForWrite, false) as Entity;
-                                if (cloned == null)
-                                    continue;
-
-                                cloned.TransformBy(displacement);
-                                copiedCount++;
-                            }
-                        }
-                        else
-                        {
-                            // fallback:
-                            // 향후 흩어진 entity 도면에서 세부 제어를 넣을 자리
-                            var clonedTopLevelIds = CollectDirectClonedIds(sourceIds, mapping);
-
-                            foreach (var clonedId in clonedTopLevelIds)
-                            {
-                                var cloned = tr.GetObject(clonedId, OpenMode.ForWrite, false) as Entity;
-                                if (cloned == null)
-                                    continue;
-
-                                cloned.TransformBy(displacement);
-                                copiedCount++;
-                            }
-                        }
+                        int copiedCount = DeepCloneAndMoveTopLevelEntities(
+                            db,
+                            tr,
+                            sourceIds,
+                            new Vector3d(dx, dy, 0.0));
 
                         var labelPos = new Point2D(
                             placement.TargetBounds.Center.X,
@@ -709,6 +611,99 @@ namespace FluxCAD.BricsCAD.Plugin26
             {
                 ed.WriteMessage($"\n[FluxCAD] FLUX_COPY_NORMALIZED_GEOMETRY_VIEWS_OUTSIDE failed: {ex}");
             }
+        }
+
+        private static SourceSelectionResult ResolveCopySourceIdsForView(
+            Database db,
+            Transaction tr,
+            IReadOnlyList<SheetEntity> semanticEntities,
+            Bounds2D targetViewBounds,
+            Bounds2D sheetBounds,
+            Bricscad.EditorInput.Editor? ed,
+            int viewId)
+        {
+            var best = CollectBestSourceIdsForView(
+                db,
+                tr,
+                semanticEntities,
+                targetViewBounds,
+                sheetBounds,
+                ed,
+                viewId);
+
+            if (best.SourceIds != null && best.SourceIds.Count > 0)
+            {
+                ed?.WriteMessage(
+                    $"\n[FluxCAD] SourceResolve I:{viewId}, " +
+                    $"Mode={best.SelectionMode}, SourceIds={best.SourceIds.Count}");
+
+                return best;
+            }
+
+            var recovered = CollectRecoveredGlobalContourEntityIds(
+                db,
+                tr,
+                semanticEntities,
+                targetViewBounds,
+                sheetBounds,
+                ed,
+                viewId);
+
+            var recoveredInspection = InspectAcceptedSourceIds(recovered, tr);
+            var recoveredMode = recovered.Count > 0
+                ? "FallbackGlobalContourOnly"
+                : "Empty";
+
+            ed?.WriteMessage(
+                $"\n[FluxCAD] SourceResolve I:{viewId}, " +
+                $"Mode={recoveredMode}, SourceIds={recovered.Count}");
+
+            return new SourceSelectionResult
+            {
+                SourceIds = recovered,
+                Inspection = recoveredInspection,
+                SelectionMode = recoveredMode
+            };
+        }
+
+
+        private static int DeepCloneAndMoveTopLevelEntities(
+            Database db,
+            Transaction tr,
+            ObjectIdCollection sourceIds,
+            Vector3d offset)
+        {
+            if (db == null)
+                throw new ArgumentNullException(nameof(db));
+            if (tr == null)
+                throw new ArgumentNullException(nameof(tr));
+
+            if (sourceIds == null || sourceIds.Count == 0)
+                return 0;
+
+            var msId = SymbolUtilityServices.GetBlockModelSpaceId(db);
+            var mapping = new IdMapping();
+
+            db.DeepCloneObjects(sourceIds, msId, mapping, false);
+
+            var clonedTopLevelIds = CollectDirectClonedIds(sourceIds, mapping);
+
+            int moved = 0;
+
+            foreach (var clonedId in clonedTopLevelIds)
+            {
+                if (!clonedId.IsValid || clonedId.IsErased)
+                    continue;
+
+                var cloned = tr.GetObject(clonedId, OpenMode.ForWrite, false) as Entity;
+                if (cloned == null)
+                    continue;
+
+                cloned.TransformBy(Matrix3d.Displacement(offset));
+                moved++;
+            }
+
+            return moved;
         }
 
 
@@ -2994,7 +2989,7 @@ namespace FluxCAD.BricsCAD.Plugin26
                     return;
                 }
 
-                
+
 
                 var orderedViews = OrderViewsForProjectionCopy(
                     workItems.Select(x => x.View).ToList(),
@@ -3118,60 +3113,16 @@ namespace FluxCAD.BricsCAD.Plugin26
                     using (doc.LockDocument())
                     using (var tr = db.TransactionManager.StartTransaction())
                     {
-                        var selection = CollectBestSourceIdsForView(
+                        var selection = ResolveCopySourceIdsForView(
                             db,
                             tr,
                             work.SemanticEntities,
-                            work.SourceBounds,   // 중요: work.View.Bounds 아님
+                            work.SourceBounds,
                             sheetBounds,
                             ed,
                             work.View.IslandId);
 
                         sourceIds = selection.SourceIds;
-
-                        // ------------------------------------------------------------
-                        // 핵심 수정:
-                        // safe 모드에서는 global contour / loose contour를 절대 추가하지 않음
-                        // ------------------------------------------------------------
-                        bool isContainedSafe =
-                            !string.IsNullOrWhiteSpace(selection.SelectionMode) &&
-                            selection.SelectionMode.StartsWith("ContainedSafe:", StringComparison.OrdinalIgnoreCase);
-
-                        if (!isContainedSafe)
-                        {
-                            var globalContourIds = CollectRecoveredGlobalContourEntityIds(
-                                db,
-                                tr,
-                                work.SemanticEntities,
-                                work.SourceBounds,   // 중요: 병합 후에는 SourceBounds 기준
-                                sheetBounds,
-                                ed,
-                                work.View.IslandId);
-
-                            sourceIds = MergeObjectIds(sourceIds, globalContourIds);
-
-                            if (sourceIds.Count > 0)
-                            {
-                                var looseContourIds = CollectAdjacentLooseContourEntities(
-                                    db,
-                                    tr,
-                                    sourceIds,
-                                    work.SemanticEntities,
-                                    work.SourceBounds,   // 중요: work.View.Bounds 아님
-                                    sheetBounds,
-                                    ed,
-                                    work.View.IslandId);
-
-                                sourceIds = MergeObjectIds(sourceIds, looseContourIds);
-                            }
-                        }
-                        else
-                        {
-                            ed.WriteMessage(
-                                $"\n[FluxCAD] SafeModeSkipContour I:{work.View.IslandId}, " +
-                                $"SelectionMode={selection.SelectionMode}, " +
-                                $"SourceIds={sourceIds.Count}");
-                        }
 
                         if (sourceIds.Count == 0)
                         {
@@ -3180,7 +3131,7 @@ namespace FluxCAD.BricsCAD.Plugin26
                             continue;
                         }
 
-                        var inspection = InspectAcceptedSourceIds(sourceIds, tr);
+                        var inspection = selection.Inspection ?? InspectAcceptedSourceIds(sourceIds, tr);
 
                         ed.WriteMessage(
                             $"\n[FluxCAD] Island={work.View.IslandId}, " +
@@ -3188,28 +3139,11 @@ namespace FluxCAD.BricsCAD.Plugin26
                             $"{inspection.DescribeTypes()}, " +
                             $"{inspection.DescribeStrategy()}");
 
-                        var msId = SymbolUtilityServices.GetBlockModelSpaceId(db);
-                        var mapping = new IdMapping();
-                        db.DeepCloneObjects(sourceIds, msId, mapping, false);
-
-                        var displacement = Matrix3d.Displacement(new Vector3d(groupDx, groupDy, 0.0));
-                        copiedCount = 0;
-
-                        // ------------------------------------------------------------
-                        // 핵심 수정 3:
-                        // mapping 전체가 아니라 direct cloned ids만 이동
-                        // ------------------------------------------------------------
-                        var clonedTopLevelIds = CollectDirectClonedIds(sourceIds, mapping);
-
-                        foreach (var clonedId in clonedTopLevelIds)
-                        {
-                            var cloned = tr.GetObject(clonedId, OpenMode.ForWrite, false) as Entity;
-                            if (cloned == null)
-                                continue;
-
-                            cloned.TransformBy(displacement);
-                            copiedCount++;
-                        }
+                        copiedCount = DeepCloneAndMoveTopLevelEntities(
+                            db,
+                            tr,
+                            sourceIds,
+                            new Vector3d(groupDx, groupDy, 0.0));
 
                         var labelPos = new Point2D(
                             work.SourceBounds.Center.X + groupDx,
