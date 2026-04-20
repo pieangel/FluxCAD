@@ -292,6 +292,1019 @@ namespace FluxCAD.BricsCAD.Plugin26
         }
 
 
+        [CommandMethod("FLUX_COPY_TOPLEVEL_GEOMETRY_VIEWS_OUTSIDE_SNAPSHOT")]
+        public void FluxCopyTopLevelGeometryViewsOutsideSnapshot()
+        {
+            var doc = Bricscad.ApplicationServices.Application.DocumentManager.MdiActiveDocument;
+            if (doc == null)
+                return;
+
+            var db = doc.Database;
+            var ed = doc.Editor;
+
+            try
+            {
+                var sheetFilePath = db.Filename;
+                if (string.IsNullOrWhiteSpace(sheetFilePath))
+                {
+                    ed.WriteMessage("\n[FluxCAD] 저장된 DWG 파일이 아닙니다.");
+                    return;
+                }
+
+                var candidates = BuildResolvedViewCandidates(sheetFilePath, ed);
+                if (candidates == null || candidates.Count == 0)
+                {
+                    ed.WriteMessage("\n[FluxCAD] view candidate가 비어 있습니다.");
+                    return;
+                }
+
+                var topLevelGeometryViews = candidates
+                    .Where(x => x != null)
+                    .Where(x => x.FinalRole == ViewIslandSemanticRole.GeometryView)
+                    .Where(x => x.IsTopLevelView)
+                    .Where(x => !x.IsSparseBridgeLike)
+                    .ToList();
+
+                if (topLevelGeometryViews.Count == 0)
+                {
+                    ed.WriteMessage("\n[FluxCAD] 복사할 TopLevel GeometryView가 없습니다.");
+                    return;
+                }
+
+                IEntitySnapshotBuilder snapshotBuilder = new SimpleSheetFileSnapshotBuilder();
+                var fullEntities = snapshotBuilder.Build(sheetFilePath);
+
+                if (fullEntities == null || fullEntities.Count == 0)
+                {
+                    ed.WriteMessage("\n[FluxCAD] snapshot이 비어 있습니다.");
+                    return;
+                }
+
+                var pipeline = BuildSemanticIslandPipeline(
+                    fullEntities,
+                    ed,
+                    closeSingleCellGaps: false,
+                    targetCellSize: 12.0,
+                    excludeSparseBridgeFromGroups: false);
+
+                if (pipeline == null || pipeline.SemanticResults == null || pipeline.SemanticResults.Count == 0)
+                {
+                    ed.WriteMessage("\n[FluxCAD] semantic pipeline 결과가 비어 있습니다.");
+                    return;
+                }
+
+                var rebuiltSemanticResults = RebuildSemanticResultsWithReassignedRoles(
+                    pipeline.SemanticResults,
+                    fullEntities,
+                    ed);
+
+                var islandMap = rebuiltSemanticResults
+                    .Where(x => x != null && x.Island != null)
+                    .ToDictionary(x => x.Island.Id, x => x.Island);
+
+                var sheetBounds = Bounds2DHelper.FromEntities(fullEntities);
+                var semanticPool = BuildSemanticEvidencePool(fullEntities, sheetBounds, ed);
+
+                Bounds2D modelBounds;
+                using (doc.LockDocument())
+                using (var tr = db.TransactionManager.StartTransaction())
+                {
+                    var msId = SymbolUtilityServices.GetBlockModelSpaceId(db);
+                    var ms = (BlockTableRecord)tr.GetObject(msId, OpenMode.ForRead);
+                    modelBounds = GetModelSpaceBounds(ms, tr);
+                    tr.Commit();
+                }
+
+                if (modelBounds.IsEmpty)
+                {
+                    ed.WriteMessage("\n[FluxCAD] model bounds가 비어 있습니다.");
+                    return;
+                }
+
+                var groupGap = Math.Max(modelBounds.Width * 0.12, 220.0);
+                var workItems = new List<CopyViewWorkItem>();
+
+                foreach (var view in topLevelGeometryViews)
+                {
+                    if (!islandMap.TryGetValue(view.IslandId, out var island))
+                    {
+                        ed.WriteMessage($"\n[FluxCAD] Island={view.IslandId} semantic island를 찾지 못했습니다.");
+                        continue;
+                    }
+
+                    var dynamicTolerance = Math.Max(
+                        3.0,
+                        Math.Min(island.Bounds.Width, island.Bounds.Height) * 0.5);
+
+                    var semanticEntities = CollectIslandSemanticEntitiesFromPool(
+                        semanticPool,
+                        island,
+                        tolerance: dynamicTolerance,
+                        ed: ed);
+
+                    var filteredSemanticEntities = semanticEntities
+                        .Where(x => x != null)
+                        .Where(x => x.IsVisible)
+                        .Where(x => x.IsGeometryLike)
+                        .Where(x => !x.IsTextLike)
+                        .Where(x => !x.IsDimensionLike)
+                        .Where(x => !x.IsLikelySemanticNoise)
+                        .Where(x => !x.IsTableLikeLayer)
+                        .Where(x => !x.IsTitleLikeLayer)
+                        .Where(x => !IsSemanticFrameLikeEntity(x, sheetBounds))
+                        .ToList();
+
+                    ed.WriteMessage(
+                        $"\n[FluxCAD] SnapshotCopySemanticFilter I:{view.IslandId}, " +
+                        $"Before={semanticEntities.Count}, After={filteredSemanticEntities.Count}, " +
+                        $"HiddenOrCenter={filteredSemanticEntities.Count(x => IsHiddenOrCenterEntity(x))}, " +
+                        $"Line={filteredSemanticEntities.Count(x => x.Kind == SheetEntityKind.Line)}, " +
+                        $"Arc={filteredSemanticEntities.Count(x => x.Kind == SheetEntityKind.Arc)}, " +
+                        $"Circle={filteredSemanticEntities.Count(x => x.Kind == SheetEntityKind.Circle)}, " +
+                        $"Polyline={filteredSemanticEntities.Count(x => x.Kind == SheetEntityKind.Polyline)}, " +
+                        $"Ellipse={filteredSemanticEntities.Count(x => x.Kind == SheetEntityKind.Ellipse)}");
+
+                    if (filteredSemanticEntities.Count == 0)
+                    {
+                        ed.WriteMessage($"\n[FluxCAD] Island={view.IslandId} 복사할 snapshot semantic entity가 없습니다.");
+                        continue;
+                    }
+
+                    workItems.Add(new CopyViewWorkItem
+                    {
+                        View = view,
+                        Island = island,
+                        SemanticEntities = filteredSemanticEntities,
+                        SourceBounds = view.Bounds,
+                        MemberViews = new List<ViewCandidate> { view },
+                        MemberIslandIds = new List<int> { view.IslandId }
+                    });
+                }
+
+                if (workItems.Count == 0)
+                {
+                    ed.WriteMessage("\n[FluxCAD] 최종 복사 가능한 snapshot work item이 없습니다.");
+                    return;
+                }
+
+                var mergedWorkItems = MergeStripLikeCopyWorkItems(workItems, ed);
+                if (mergedWorkItems != null && mergedWorkItems.Count > 0)
+                    workItems = mergedWorkItems;
+
+                var groupBounds = UnionBounds(workItems.Select(x => x.SourceBounds));
+                if (groupBounds.IsEmpty)
+                {
+                    ed.WriteMessage("\n[FluxCAD] groupBounds가 비어 있습니다.");
+                    return;
+                }
+
+                var groupDx = modelBounds.MaxX - groupBounds.MinX + groupGap;
+                var groupDy = 0.0;
+
+                ed.WriteMessage(
+                    $"\n[FluxCAD] SnapshotCopyGroupBounds={groupBounds}, GroupOffset=({groupDx:0.##},{groupDy:0.##})");
+
+                int totalSourceCount = 0;
+                int totalCopiedCount = 0;
+
+                using (doc.LockDocument())
+                {
+                    foreach (var work in workItems.OrderByDescending(x => x.View.IsRepresentativePrimaryView)
+                                                  .ThenByDescending(x => x.View.IsPrimaryView)
+                                                  .ThenBy(x => x.View.IslandId))
+                    {
+                        var view = work.View;
+                        if (view == null)
+                            continue;
+
+                        using (var tr = db.TransactionManager.StartTransaction())
+                        {
+                            var msId = SymbolUtilityServices.GetBlockModelSpaceId(db);
+                            var ms = (BlockTableRecord)tr.GetObject(msId, OpenMode.ForWrite);
+                            var outLayer = EnsureCopyOutputLayer(db, tr);
+
+                            var snapshotLeaves = CollectSnapshotLeafGeometryForCopy(
+                                work.SemanticEntities,
+                                work.SourceBounds,
+                                sheetBounds,
+                                ed,
+                                work.View.IslandId);
+
+                            int copiedCount = 0;
+                            var displacement = Matrix3d.Displacement(new Vector3d(groupDx, groupDy, 0.0));
+
+                            foreach (var leaf in snapshotLeaves)
+                            {
+                                var ent = CreateCadEntityFromSnapshotLeaf(leaf, outLayer);
+                                if (ent == null)
+                                    continue;
+
+                                ent.TransformBy(displacement);
+                                ms.AppendEntity(ent);
+                                tr.AddNewlyCreatedDBObject(ent, true);
+                                copiedCount++;
+                            }
+
+                            var labelPos = new Point2D(
+                                work.SourceBounds.Center.X + groupDx,
+                                work.SourceBounds.MaxY + groupDy + Math.Max(work.SourceBounds.Height * 0.08, 20.0));
+
+                            DrawDebugText(
+                                db,
+                                tr,
+                                outLayer,
+                                labelPos,
+                                BuildCopiedViewLabel(view),
+                                ResolveCopiedViewColor(view),
+                                Math.Max(10.0, Math.Min(view.Bounds.Width, view.Bounds.Height) * 0.08));
+
+                            totalSourceCount += snapshotLeaves.Count;
+                            totalCopiedCount += copiedCount;
+
+                            tr.Commit();
+
+                            ed.WriteMessage(
+                                $"\n[FluxCAD] SnapshotCopied View Island={view.IslandId}, " +
+                                $"Members=[{string.Join(",", work.MemberIslandIds)}], " +
+                                $"SnapshotLeaves={snapshotLeaves.Count}, Copied={copiedCount}, " +
+                                $"SourceBounds={work.SourceBounds}, " +
+                                $"GroupOffset=({groupDx:0.##},{groupDy:0.##})");
+                        }
+                    }
+                }
+
+                ed.WriteMessage(
+                    $"\n[FluxCAD] Snapshot Geometry Views copied outside. Views={workItems.Count}, " +
+                    $"TotalSource={totalSourceCount}, TotalCopied={totalCopiedCount}, " +
+                    $"GroupOffset=({groupDx:0.##},{groupDy:0.##})");
+            }
+            catch (System.Exception ex)
+            {
+                ed.WriteMessage($"\n[FluxCAD] FLUX_COPY_TOPLEVEL_GEOMETRY_VIEWS_OUTSIDE_SNAPSHOT failed: {ex}");
+            }
+        }
+
+
+        private static List<SheetEntity> CollectSnapshotLeafGeometryForCopy(
+    IReadOnlyList<SheetEntity> semanticEntities,
+    Bounds2D viewBounds,
+    Bounds2D sheetBounds,
+    Bricscad.EditorInput.Editor? ed,
+    int? viewId)
+        {
+            var result = new List<SheetEntity>();
+
+            if (semanticEntities == null || semanticEntities.Count == 0)
+                return result;
+
+            foreach (var e in semanticEntities)
+            {
+                if (e == null)
+                    continue;
+
+                if (!e.IsVisible)
+                    continue;
+
+                if (!e.IsGeometryLike)
+                    continue;
+
+                if (e.Kind != SheetEntityKind.Line &&
+                    e.Kind != SheetEntityKind.Polyline &&
+                    e.Kind != SheetEntityKind.Arc &&
+                    e.Kind != SheetEntityKind.Circle &&
+                    e.Kind != SheetEntityKind.Ellipse)
+                    continue;
+
+                if (e.Bounds.IsEmpty)
+                    continue;
+
+                if (!Bounds2DHelper.Intersects(e.Bounds, viewBounds, tolerance: 0.0))
+                    continue;
+
+                result.Add(e);
+            }
+
+            ed?.WriteMessage(
+                $"\n[FluxCAD] SnapshotLeafCollect I:{viewId}, " +
+                $"View={viewBounds}, Accepted={result.Count}");
+
+            return result;
+        }
+
+
+        private static Entity? CreateCadEntityFromSnapshotLeaf(
+    SheetEntity e,
+    string outLayer)
+        {
+            if (e == null)
+                return null;
+
+            Entity? created = null;
+
+            switch (e.Kind)
+            {
+                case SheetEntityKind.Line:
+                    {
+                        if (!e.StartPoint.HasValue || !e.EndPoint.HasValue)
+                            return null;
+
+                        created = new Line(
+                            new Point3d(e.StartPoint.Value.X, e.StartPoint.Value.Y, 0.0),
+                            new Point3d(e.EndPoint.Value.X, e.EndPoint.Value.Y, 0.0));
+                        break;
+                    }
+
+                case SheetEntityKind.Polyline:
+                    {
+                        if (e.Vertices == null || e.Vertices.Count < 2)
+                            return null;
+
+                        var pl = new Teigha.DatabaseServices.Polyline();
+                        for (int i = 0; i < e.Vertices.Count; i++)
+                        {
+                            var p = e.Vertices[i];
+                            pl.AddVertexAt(i, new Point2d(p.X, p.Y), 0.0, 0.0, 0.0);
+                        }
+
+                        pl.Closed = e.IsClosed;
+                        created = pl;
+                        break;
+                    }
+
+                case SheetEntityKind.Circle:
+                    {
+                        var center = e.CenterPoint ?? e.Center;
+                        if (!center.HasValue || !e.Radius.HasValue || e.Radius.Value <= 0.0)
+                            return null;
+
+                        created = new Circle(
+                            new Point3d(center.Value.X, center.Value.Y, 0.0),
+                            Vector3d.ZAxis,
+                            e.Radius.Value);
+                        break;
+                    }
+
+                case SheetEntityKind.Arc:
+                    {
+                        var center = e.CenterPoint ?? e.Center;
+                        if (!center.HasValue || !e.Radius.HasValue || e.Radius.Value <= 0.0)
+                            return null;
+
+                        double startDeg = e.StartAngleDeg2D ?? e.StartAngleDeg;
+                        double endDeg = e.EndAngleDeg2D ?? e.EndAngleDeg;
+
+                        created = new Arc(
+                            new Point3d(center.Value.X, center.Value.Y, 0.0),
+                            e.Radius.Value,
+                            DegreesToRadians(startDeg),
+                            DegreesToRadians(endDeg));
+                        break;
+                    }
+
+                case SheetEntityKind.Ellipse:
+                    {
+                        var center = e.CenterPoint ?? e.Center;
+                        if (!center.HasValue)
+                            return null;
+
+                        if (!e.MajorRadius.HasValue || !e.MinorRadius.HasValue)
+                            return null;
+
+                        if (e.MajorRadius.Value <= 0.0 || e.MinorRadius.Value <= 0.0)
+                            return null;
+
+                        double rotDeg = e.EllipseRotationDeg2D ?? 0.0;
+                        double rotRad = DegreesToRadians(rotDeg);
+
+                        var majorVector = new Vector3d(
+                            Math.Cos(rotRad) * e.MajorRadius.Value,
+                            Math.Sin(rotRad) * e.MajorRadius.Value,
+                            0.0);
+
+                        double ratio = e.MinorRadius.Value / e.MajorRadius.Value;
+
+                        created = new Ellipse(
+                            new Point3d(center.Value.X, center.Value.Y, 0.0),
+                            Vector3d.ZAxis,
+                            majorVector,
+                            ratio,
+                            0.0,
+                            Math.PI * 2.0);
+                        break;
+                    }
+
+                default:
+                    return null;
+            }
+
+            if (created == null)
+                return null;
+
+            created.Layer = outLayer;
+            return created;
+        }
+
+
+        private static double DegreesToRadians(double deg)
+        {
+            return deg * Math.PI / 180.0;
+        }
+
+
+        [CommandMethod("FLUX_COPY_TOPLEVEL_GEOMETRY_VIEWS_OUTSIDE_FORCE")]
+        public void FluxCopyTopLevelGeometryViewsOutsideForce()
+        {
+            var doc = Bricscad.ApplicationServices.Application.DocumentManager.MdiActiveDocument;
+            if (doc == null)
+                return;
+
+            var db = doc.Database;
+            var ed = doc.Editor;
+
+            try
+            {
+                var sheetFilePath = db.Filename;
+                if (string.IsNullOrWhiteSpace(sheetFilePath))
+                {
+                    ed.WriteMessage("\n[FluxCAD] 저장된 DWG 파일이 아닙니다.");
+                    return;
+                }
+
+                // ------------------------------------------------------------
+                // 1) 현재까지 완성된 해석 파이프라인 재사용
+                // ------------------------------------------------------------
+                var candidates = BuildResolvedViewCandidates(sheetFilePath, ed);
+                if (candidates == null || candidates.Count == 0)
+                {
+                    ed.WriteMessage("\n[FluxCAD] view candidate가 비어 있습니다.");
+                    return;
+                }
+
+                var topLevelGeometryViews = candidates
+                    .Where(x => x != null)
+                    .Where(x => x.FinalRole == ViewIslandSemanticRole.GeometryView)
+                    .Where(x => x.IsTopLevelView)
+                    .Where(x => !x.IsSparseBridgeLike)
+                    .ToList();
+
+                if (topLevelGeometryViews.Count == 0)
+                {
+                    ed.WriteMessage("\n[FluxCAD] 복사할 TopLevel GeometryView가 없습니다.");
+                    return;
+                }
+
+                // ------------------------------------------------------------
+                // 2) snapshot + semantic pipeline 다시 확보
+                // ------------------------------------------------------------
+                IEntitySnapshotBuilder snapshotBuilder = new SimpleSheetFileSnapshotBuilder();
+                var fullEntities = snapshotBuilder.Build(sheetFilePath);
+
+                if (fullEntities == null || fullEntities.Count == 0)
+                {
+                    ed.WriteMessage("\n[FluxCAD] snapshot이 비어 있습니다.");
+                    return;
+                }
+
+                var pipeline = BuildSemanticIslandPipeline(
+                    fullEntities,
+                    ed,
+                    closeSingleCellGaps: false,
+                    targetCellSize: 12.0,
+                    excludeSparseBridgeFromGroups: false);
+
+                if (pipeline == null || pipeline.SemanticResults == null || pipeline.SemanticResults.Count == 0)
+                {
+                    ed.WriteMessage("\n[FluxCAD] semantic pipeline 결과가 비어 있습니다.");
+                    return;
+                }
+
+                var rebuiltSemanticResults = RebuildSemanticResultsWithReassignedRoles(
+                    pipeline.SemanticResults,
+                    fullEntities,
+                    ed);
+
+                var islandMap = rebuiltSemanticResults
+                    .Where(x => x != null && x.Island != null)
+                    .ToDictionary(x => x.Island.Id, x => x.Island);
+
+                var sheetBounds = Bounds2DHelper.FromEntities(fullEntities);
+                var semanticPool = BuildSemanticEvidencePool(fullEntities, sheetBounds, ed);
+
+                // ------------------------------------------------------------
+                // 3) DB 전체 bounds 확보 (복사 배치용)
+                // ------------------------------------------------------------
+                Bounds2D modelBounds;
+                ObjectIdCollection baseModelSpaceIds;
+
+                using (doc.LockDocument())
+                using (var tr = db.TransactionManager.StartTransaction())
+                {
+                    var msId = SymbolUtilityServices.GetBlockModelSpaceId(db);
+                    var ms = (BlockTableRecord)tr.GetObject(msId, OpenMode.ForRead);
+                    modelBounds = GetModelSpaceBounds(ms, tr);
+                    baseModelSpaceIds = CaptureBaseModelSpaceEntityIds(db, tr);
+                    tr.Commit();
+                }
+
+                ed.WriteMessage($"\n[FluxCAD] BaseModelSpaceCount={baseModelSpaceIds.Count}");
+
+                if (modelBounds.IsEmpty)
+                {
+                    ed.WriteMessage("\n[FluxCAD] model bounds가 비어 있습니다.");
+                    return;
+                }
+
+                var groupGap = Math.Max(modelBounds.Width * 0.12, 220.0);
+
+                // ------------------------------------------------------------
+                // 4) view별 복사 작업 데이터 미리 구성
+                // ------------------------------------------------------------
+                var workItems = new List<CopyViewWorkItem>();
+
+                foreach (var view in topLevelGeometryViews)
+                {
+                    if (!islandMap.TryGetValue(view.IslandId, out var island))
+                    {
+                        ed.WriteMessage($"\n[FluxCAD] Island={view.IslandId} semantic island를 찾지 못했습니다.");
+                        continue;
+                    }
+
+                    var dynamicTolerance = Math.Max(
+                        3.0,
+                        Math.Min(island.Bounds.Width, island.Bounds.Height) * 0.5);
+
+                    var semanticEntities = CollectIslandSemanticEntitiesFromPool(
+                        semanticPool,
+                        island,
+                        tolerance: dynamicTolerance,
+                        ed: ed);
+
+                    var filteredSemanticEntities = semanticEntities
+                        .Where(x => x != null)
+                        .Where(x => x.IsVisible)
+                        .Where(x => x.IsGeometryLike)
+                        .Where(x => !x.IsTextLike)
+                        .Where(x => !x.IsDimensionLike)
+                        .Where(x => !x.IsLikelySemanticNoise)
+                        .Where(x => !x.IsTableLikeLayer)
+                        .Where(x => !x.IsTitleLikeLayer)
+                        .Where(x => !IsSemanticFrameLikeEntity(x, sheetBounds))
+                        .ToList();
+
+                    ed.WriteMessage(
+                        $"\n[FluxCAD] CopySemanticFilter I:{view.IslandId}, " +
+                        $"Before={semanticEntities.Count}, After={filteredSemanticEntities.Count}, " +
+                        $"HiddenOrCenterInSource={semanticEntities.Count(x => IsHiddenOrCenterEntity(x))}, " +
+                        $"DimInSource={semanticEntities.Count(x => x.IsDimensionLike)}, " +
+                        $"TextInSource={semanticEntities.Count(x => x.IsTextLike)}");
+
+                    if (filteredSemanticEntities.Count == 0)
+                    {
+                        ed.WriteMessage($"\n[FluxCAD] Island={view.IslandId} 복사할 semantic entity가 없습니다.");
+                        continue;
+                    }
+
+                    workItems.Add(new CopyViewWorkItem
+                    {
+                        View = view,
+                        Island = island,
+                        SemanticEntities = filteredSemanticEntities,
+                        SourceBounds = view.Bounds,
+                        MemberViews = new List<ViewCandidate> { view },
+                        MemberIslandIds = new List<int> { view.IslandId }
+                    });
+                }
+
+                if (workItems.Count == 0)
+                {
+                    ed.WriteMessage("\n[FluxCAD] 최종 복사 가능한 work item이 없습니다.");
+                    return;
+                }
+
+                ed.WriteMessage($"\n[FluxCAD] CopyWorkItems.BeforeMerge Count={workItems.Count}");
+                foreach (var item in workItems.OrderBy(x => x.View.IslandId))
+                {
+                    ed.WriteMessage(
+                        $"\n  [BeforeMerge] I:{item.View.IslandId}, " +
+                        $"SourceEmpty={item.SourceBounds.IsEmpty}, " +
+                        $"Semantic={item.SemanticEntities.Count}, " +
+                        $"Members={item.MemberIslandIds.Count}");
+                }
+
+                var mergedWorkItems = MergeStripLikeCopyWorkItems(workItems, ed);
+
+                ed.WriteMessage($"\n[FluxCAD] CopyWorkItems.AfterMerge Count={mergedWorkItems.Count}");
+                foreach (var item in mergedWorkItems.OrderBy(x => x.View.IslandId))
+                {
+                    ed.WriteMessage(
+                        $"\n  [AfterMerge] I:{item.View.IslandId}, " +
+                        $"SourceEmpty={item.SourceBounds.IsEmpty}, " +
+                        $"Semantic={item.SemanticEntities.Count}, " +
+                        $"Members=[{string.Join(",", item.MemberIslandIds)}]");
+                }
+
+                if (mergedWorkItems.Count == 0)
+                {
+                    ed.WriteMessage("\n[FluxCAD] StripMerge returned empty. Fallback to original workItems.");
+                }
+                else
+                {
+                    workItems = mergedWorkItems;
+                }
+
+                ed.WriteMessage($"\n[FluxCAD] AnchorSelection WorkItems={workItems.Count}");
+                foreach (var item in workItems.Where(x => x?.View != null).OrderBy(x => x.View.IslandId))
+                {
+                    var v = item.View;
+                    ed.WriteMessage(
+                        $"\n  [AnchorCandidate] I:{v.IslandId}, " +
+                        $"Primary={v.IsPrimaryView}, Rep={v.IsRepresentativePrimaryView}, " +
+                        $"Area={v.Area:0.##}, BoundsEmpty={item.SourceBounds.IsEmpty}, " +
+                        $"Members={item.MemberIslandIds.Count}");
+                }
+
+                // ------------------------------------------------------------
+                // 5) anchor / ordered view 계산
+                //    주의: 정렬 순서/로그용으로만 사용하고 배치 좌표는 건드리지 않음
+                // ------------------------------------------------------------
+                var anchorCandidate = workItems
+                    .Select(x => x.View)
+                    .Where(x => x != null)
+                    .FirstOrDefault(x => x.IsRepresentativePrimaryView)
+                    ?? workItems
+                        .Select(x => x.View)
+                        .Where(x => x != null)
+                        .Where(x => x.IsPrimaryView)
+                        .OrderByDescending(x => x.RepresentativePrimaryScore)
+                        .ThenByDescending(x => x.PrimaryScore)
+                        .ThenByDescending(x => x.Area)
+                        .FirstOrDefault()
+                    ?? workItems
+                        .Select(x => x.View)
+                        .Where(x => x != null)
+                        .OrderByDescending(x => x.Area)
+                        .FirstOrDefault();
+
+                if (anchorCandidate == null)
+                {
+                    ed.WriteMessage("\n[FluxCAD] anchorCandidate 결정 실패.");
+                    return;
+                }
+
+
+
+                var orderedViews = OrderViewsForProjectionCopy(
+                    workItems.Select(x => x.View).ToList(),
+                    anchorCandidate,
+                    ed);
+
+                // ------------------------------------------------------------
+                // 5-1) 복사본에 표시할 relation graph 계산
+                //      주의: 배치에는 사용하지 않고, 표시용으로만 사용
+                // ------------------------------------------------------------
+                var geometryPrimaryCandidates = workItems
+                    .Select(x => x.View)
+                    .Where(x => x != null)
+                    .Where(x => x.FinalRole == ViewIslandSemanticRole.GeometryView)
+                    .Where(x => x.IsTopLevelView || x.IsPrimaryView || x.IsRepresentativePrimaryView)
+                    .OrderBy(x => x.IslandId)
+                    .ToList();
+
+                ViewGraph? copiedGraph = null;
+                RelativePositionMap? copiedPositionMap = null;
+
+                if (geometryPrimaryCandidates.Count > 0)
+                {
+                    var graphAnchorCandidate = geometryPrimaryCandidates
+                        .FirstOrDefault(x => x.IsRepresentativePrimaryView)
+                        ?? geometryPrimaryCandidates
+                            .Where(x => x.IsPrimaryView)
+                            .OrderByDescending(x => x.RepresentativePrimaryScore)
+                            .ThenByDescending(x => x.PrimaryScore)
+                            .ThenByDescending(x => x.Area)
+                            .FirstOrDefault()
+                        ?? geometryPrimaryCandidates
+                            .OrderByDescending(x => x.Area)
+                            .FirstOrDefault();
+
+                    if (graphAnchorCandidate != null)
+                    {
+                        var viewClusters = BuildViewClustersFromCandidates(
+                            geometryPrimaryCandidates,
+                            graphAnchorCandidate,
+                            ed);
+
+                        var anchorView = viewClusters.FirstOrDefault(x => x.Id == graphAnchorCandidate.IslandId);
+
+                        if (anchorView != null)
+                        {
+                            var policy = new ProjectionLayoutPolicy
+                            {
+                                PreferThirdAngleLayout = true,
+                                MinBandOverlapRatio = 0.45,
+                                MaxNormalizedNeighborGap = 1.50,
+                                MinRelationScore = 0.40,
+
+                                AllowTopView = false,
+                                AllowBottomView = false,
+                                AllowLeftView = false,
+                                AllowRightView = false,
+                                AllowSectionView = false,
+                                AllowDetailView = false
+                            };
+
+                            var analyzer = new ProjectionLayoutAnalyzer();
+                            var rawLayout = analyzer.Analyze(viewClusters, policy);
+
+                            var filteredRelations = rawLayout.Relations
+                                .Where(x => x != null)
+                                .Where(x => x.Score >= policy.MinRelationScore)
+                                .Where(x => x.Direction != ProjectionDirection.Overlapping)
+                                .OrderByDescending(x => x.Score)
+                                .ToList();
+
+                            copiedGraph = new ViewGraph
+                            {
+                                Anchor = anchorView,
+                                Nodes = viewClusters,
+                                Layout = new ProjectionLayoutResult
+                                {
+                                    Relations = filteredRelations
+                                }
+                            };
+
+                            copiedPositionMap = BuildRelativePositionMap(copiedGraph, minScore: 0.40);
+                        }
+                    }
+                }
+
+                // ------------------------------------------------------------
+                // 6) 전체 group bounds 계산
+                //    핵심: 원본 상대 위치는 그대로 두고 group 전체만 이동
+                // ------------------------------------------------------------
+                var groupBounds = UnionBounds(workItems.Select(x => x.SourceBounds));
+                if (groupBounds.IsEmpty)
+                {
+                    ed.WriteMessage("\n[FluxCAD] group bounds가 비어 있습니다.");
+                    return;
+                }
+
+                var targetGroupMinX = modelBounds.MaxX + groupGap;
+                var groupDx = targetGroupMinX - groupBounds.MinX;
+                var groupDy = 0.0;
+
+                ed.WriteMessage(
+                    $"\n[FluxCAD] CopyGroupBounds={groupBounds}, " +
+                    $"GroupOffset=({groupDx:0.##},{groupDy:0.##}), Anchor={anchorCandidate.IslandId}");
+
+                int totalSourceCount = 0;
+                int totalCopiedCount = 0;
+
+                // ------------------------------------------------------------
+                // 7) 모든 view에 동일 displacement 적용
+                // ------------------------------------------------------------
+                foreach (var view in orderedViews)
+                {
+                    var work = workItems.FirstOrDefault(x => x.View.IslandId == view.IslandId);
+                    if (work == null)
+                        continue;
+
+                    ObjectIdCollection sourceIds;
+                    int copiedCount;
+
+                    using (doc.LockDocument())
+                    using (var tr = db.TransactionManager.StartTransaction())
+                    {
+                        var selection = CollectForceRawCurveSourceIdsForView(
+                            db,
+                            tr,
+                            baseModelSpaceIds,
+                            work.SourceBounds,
+                            sheetBounds,
+                            ed,
+                            work.View.IslandId);
+
+                        sourceIds = selection.SourceIds;
+                        
+
+                        if (sourceIds.Count == 0)
+                        {
+                            ed.WriteMessage($"\n[FluxCAD] Island={work.View.IslandId} sourceIds가 비어 있습니다.");
+                            tr.Commit();
+                            continue;
+                        }
+
+                        var inspection = InspectAcceptedSourceIds(sourceIds, tr);
+
+                        ed.WriteMessage(
+                            $"\n[FluxCAD] Island={work.View.IslandId}, " +
+                            $"SelectionMode={selection.SelectionMode}, " +
+                            $"{inspection.DescribeTypes()}, " +
+                            $"{inspection.DescribeStrategy()}");
+
+
+                        var displacement = Matrix3d.Displacement(new Vector3d(groupDx, groupDy, 0.0));
+                        copiedCount = 0;
+
+                        // ------------------------------------------------------------
+                        // FLUX_COPY_TOPLEVEL_GEOMETRY_VIEWS_OUTSIDE 에서는
+                        // primitive line clip을 사용하지 않는다.
+                        // 선택된 sourceIds 전체를 그대로 복사한다.
+                        // ------------------------------------------------------------
+                        var msId = SymbolUtilityServices.GetBlockModelSpaceId(db);
+                        var mapping = new IdMapping();
+                        db.DeepCloneObjects(sourceIds, msId, mapping, false);
+
+                        var clonedTopLevelIds = CollectDirectClonedIds(sourceIds, mapping);
+                        foreach (var clonedId in clonedTopLevelIds)
+                        {
+                            var cloned = tr.GetObject(clonedId, OpenMode.ForWrite, false) as Entity;
+                            if (cloned == null)
+                                continue;
+
+                            cloned.TransformBy(displacement);
+                            copiedCount++;
+                        }
+
+                        ed.WriteMessage(
+                            $"\n[FluxCAD] PrimitiveClipDisabled I:{work.View.IslandId}, " +
+                            $"SelectionMode={selection.SelectionMode}, " +
+                            $"Reason=TopLevelCopyKeepsSelectedSourceIdsAsIs");
+
+                        var labelPos = new Point2D(
+                            work.SourceBounds.Center.X + groupDx,
+                            work.SourceBounds.MaxY + groupDy + Math.Max(work.SourceBounds.Height * 0.08, 20.0));
+
+                        DrawDebugText(
+                            db,
+                            tr,
+                            EnsureCopyOutputLayer(db, tr),
+                            labelPos,
+                            BuildCopiedViewLabel(view),
+                            ResolveCopiedViewColor(view),
+                            Math.Max(10.0, Math.Min(view.Bounds.Width, view.Bounds.Height) * 0.08));
+
+                        totalSourceCount += sourceIds.Count;
+                        totalCopiedCount += copiedCount;
+
+                        tr.Commit();
+
+                        ed.WriteMessage(
+                            $"\n[FluxCAD] Copied View Island={view.IslandId}, " +
+                            $"Members=[{string.Join(",", work.MemberIslandIds)}], " +
+                            $"Semantic={work.SemanticEntities.Count}, SourceIds={sourceIds.Count}, Copied={copiedCount}, " +
+                            $"SourceBounds={work.SourceBounds}, " +
+                            $"GroupOffset=({groupDx:0.##},{groupDy:0.##})");
+                    }
+                }
+
+                // ------------------------------------------------------------
+                // 8) 복사된 그룹 위에 relation overlay 표시
+                // ------------------------------------------------------------
+                if (copiedGraph != null && copiedPositionMap != null)
+                {
+                    using (doc.LockDocument())
+                    using (var tr = db.TransactionManager.StartTransaction())
+                    {
+                        DrawCopiedViewGraphOverlays(
+                            db,
+                            tr,
+                            copiedGraph,
+                            copiedPositionMap,
+                            geometryPrimaryCandidates,
+                            groupDx,
+                            groupDy,
+                            clearLayerFirst: true,
+                            drawLabels: true,
+                            drawRelations: true);
+
+                        tr.Commit();
+                    }
+
+                    ed.WriteMessage(
+                        $"\n[FluxCAD] Copied relation overlay drawn. " +
+                        $"Anchor={copiedGraph.Anchor.Id}, Nodes={copiedGraph.Nodes.Count}, Edges={copiedGraph.Edges.Count}");
+                }
+
+                ed.WriteMessage(
+                    $"\n[FluxCAD] TopLevel Geometry Views copied outside. " +
+                    $"Views={orderedViews.Count}, TotalSource={totalSourceCount}, TotalCopied={totalCopiedCount}, " +
+                    $"GroupOffset=({groupDx:0.##},{groupDy:0.##})");
+            }
+            catch (System.Exception ex)
+            {
+                ed.WriteMessage($"\n[FluxCAD] FLUX_COPY_TOPLEVEL_GEOMETRY_VIEWS_OUTSIDE_FORCE failed: {ex}");
+            }
+        }
+
+
+        private static SourceSelectionResult CollectForceRawCurveSourceIdsForView(
+            Database db,
+            Transaction tr,
+            ObjectIdCollection baseModelSpaceIds,
+            Bounds2D targetViewBounds,
+            Bounds2D sheetBounds,
+            Bricscad.EditorInput.Editor? ed,
+            int viewId)
+        {
+            if (db == null)
+                throw new ArgumentNullException(nameof(db));
+            if (tr == null)
+                throw new ArgumentNullException(nameof(tr));
+            if (baseModelSpaceIds == null)
+                throw new ArgumentNullException(nameof(baseModelSpaceIds));
+
+            var result = new ObjectIdCollection();
+            var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+            double expandX = Math.Max(6.0, targetViewBounds.Width * 0.01);
+            double expandY = Math.Max(6.0, targetViewBounds.Height * 0.08);
+            var probeBounds = ExpandBounds(targetViewBounds, expandX, expandY);
+
+            int totalModelSpace = 0;
+            int skippedInvalidOrErased = 0;
+            int skippedNullEntity = 0;
+            int rejectedNonCurve = 0;
+            int rejectedNoBounds = 0;
+            int rejectedFrameLike = 0;
+            int rejectedOutsideProbe = 0;
+            int accepted = 0;
+
+            foreach (ObjectId id in baseModelSpaceIds)
+            {
+                totalModelSpace++;
+
+                if (!id.IsValid || id.IsErased)
+                {
+                    skippedInvalidOrErased++;
+                    continue;
+                }
+
+                var ent = tr.GetObject(id, OpenMode.ForRead, false) as Entity;
+                if (ent == null)
+                {
+                    skippedNullEntity++;
+                    continue;
+                }
+
+                if (!(ent is Line ||
+                      ent is Arc ||
+                      ent is Circle ||
+                      ent is Ellipse ||
+                      //ent is Polyline ||
+                      ent is Polyline2d ||
+                      ent is Polyline3d))
+                {
+                    rejectedNonCurve++;
+                    continue;
+                }
+
+                if (!TryGetEntityBoundsSafe(ent, out var bounds) || bounds.IsEmpty)
+                {
+                    rejectedNoBounds++;
+                    continue;
+                }
+
+                if (IsCadEntityFrameLike(bounds, sheetBounds))
+                {
+                    rejectedFrameLike++;
+                    continue;
+                }
+
+                if (!Bounds2DHelper.Intersects(probeBounds, bounds, tolerance: 0.0))
+                {
+                    rejectedOutsideProbe++;
+                    continue;
+                }
+
+                string key = id.Handle.ToString();
+                if (!seen.Add(key))
+                    continue;
+
+                result.Add(id);
+                accepted++;
+            }
+
+            var inspection = InspectAcceptedSourceIds(result, tr);
+
+            ed?.WriteMessage(
+                $"[FluxCAD] ForceRawCurveCollect I:{ viewId}, " +
+                $"View={targetViewBounds}, Probe={probeBounds}, " +
+                $"ModelSpace={totalModelSpace}, Accepted={accepted}, " +
+                $"InvalidOrErased={skippedInvalidOrErased}, NullEntity={skippedNullEntity}, " +
+                $"NonCurve={rejectedNonCurve}, NoBounds={rejectedNoBounds}, " +
+                $"FrameLike={rejectedFrameLike}, OutsideProbe={rejectedOutsideProbe}");
+
+            return new SourceSelectionResult
+            {
+                SourceIds = result,
+                Inspection = inspection,
+                SelectionMode = $"ForceRawViewBounds:{accepted}"
+            };
+        }
+
+
+
         [CommandMethod("FLUX_COPY_NORMALIZED_GEOMETRY_VIEWS_OUTSIDE")]
         public void FluxCopyNormalizedGeometryViewsOutside()
         {
