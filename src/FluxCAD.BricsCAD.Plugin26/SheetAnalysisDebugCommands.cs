@@ -12,15 +12,18 @@ using FluxCAD.SheetAnalysis.ViewIsolation.Loops;
 using FluxCAD.SheetAnalysis.ViewProjection;
 using System;
 using System.Collections.Generic;
+using System.Diagnostics.Metrics;
 using System.IO;
 using System.Linq;
 using System.Text;
+using System.Windows.Controls.Primitives;
 using Teigha.DatabaseServices;
 //using Teigha.EditorInput;
 using Teigha.Geometry;
 using Teigha.GraphicsInterface;
 using Teigha.GraphicsSystem;
 using Teigha.Runtime;
+using static System.Formats.Asn1.AsnWriter;
 using TeighaColor = Teigha.Colors.Color;
 
 namespace FluxCAD.BricsCAD.Plugin26
@@ -375,6 +378,7 @@ namespace FluxCAD.BricsCAD.Plugin26
                 // 3) DB 전체 bounds 확보
                 // ------------------------------------------------------------
                 Bounds2D modelBounds;
+                ObjectIdCollection baseModelSpaceIds;
 
                 using (doc.LockDocument())
                 using (var tr = db.TransactionManager.StartTransaction())
@@ -382,8 +386,11 @@ namespace FluxCAD.BricsCAD.Plugin26
                     var msId = SymbolUtilityServices.GetBlockModelSpaceId(db);
                     var ms = (BlockTableRecord)tr.GetObject(msId, OpenMode.ForRead);
                     modelBounds = GetModelSpaceBounds(ms, tr);
+                    baseModelSpaceIds = CaptureBaseModelSpaceEntityIds(db, tr);
                     tr.Commit();
                 }
+
+                ed.WriteMessage($"\n[FluxCAD] BaseModelSpaceCount={baseModelSpaceIds.Count}");
 
                 if (modelBounds.IsEmpty)
                 {
@@ -531,16 +538,70 @@ namespace FluxCAD.BricsCAD.Plugin26
                     using (doc.LockDocument())
                     using (var tr = db.TransactionManager.StartTransaction())
                     {
-                        var selection = ResolveCopySourceIdsForView(
+                        var selection = CollectBestSourceIdsForView(
                             db,
                             tr,
+                            baseModelSpaceIds,
                             work.SemanticEntities,
-                            work.SourceBounds,
+                            work.SourceBounds,   // 중요: work.View.Bounds 아님
                             sheetBounds,
                             ed,
                             work.View.IslandId);
 
                         sourceIds = selection.SourceIds;
+
+                        // ------------------------------------------------------------
+                        // 핵심 수정:
+                        // safe 모드에서는 global contour / loose contour를 절대 추가하지 않음
+                        // ------------------------------------------------------------
+                        bool isContainedSafe =
+    !string.IsNullOrWhiteSpace(selection.SelectionMode) &&
+    selection.SelectionMode.StartsWith("ContainedSafe:", StringComparison.OrdinalIgnoreCase);
+
+                        bool alreadyRecovered =
+                            !string.IsNullOrWhiteSpace(selection.SelectionMode) &&
+                            (
+                                selection.SelectionMode.StartsWith("GlobalContourRecovery:", StringComparison.OrdinalIgnoreCase) ||
+                                selection.SelectionMode.StartsWith("ExactSemanticSourceRecovery", StringComparison.OrdinalIgnoreCase) ||
+                                selection.SelectionMode.StartsWith("ExactPlusPrimaryRecovery", StringComparison.OrdinalIgnoreCase)
+                            );
+
+                        if (!isContainedSafe && !alreadyRecovered)
+                        {
+                            var globalContourIds = CollectRecoveredGlobalContourEntityIds(
+                                db,
+                                tr,
+                                baseModelSpaceIds,
+                                work.SemanticEntities,
+                                work.SourceBounds,
+                                sheetBounds,
+                                ed,
+                                work.View.IslandId);
+
+                            sourceIds = MergeObjectIds(sourceIds, globalContourIds);
+
+                            if (sourceIds.Count > 0)
+                            {
+                                var looseContourIds = CollectAdjacentLooseContourEntities(
+                                    db,
+                                    tr,
+                                    baseModelSpaceIds,
+                                    sourceIds,
+                                    work.SemanticEntities,
+                                    work.SourceBounds,
+                                    sheetBounds,
+                                    ed,
+                                    work.View.IslandId);
+
+                                sourceIds = MergeObjectIds(sourceIds, looseContourIds);
+                            }
+                        }
+                        else
+                        {
+                            ed.WriteMessage(
+                                $"\n[FluxCAD] SkipExtraContourRecovery I:{work.View.IslandId}, " +
+                                $"SelectionMode={selection.SelectionMode}, SourceIds={sourceIds.Count}");
+                        }
 
                         if (sourceIds.Count == 0)
                         {
@@ -549,7 +610,7 @@ namespace FluxCAD.BricsCAD.Plugin26
                             continue;
                         }
 
-                        var inspection = selection.Inspection ?? InspectAcceptedSourceIds(sourceIds, tr);
+                        var inspection = InspectAcceptedSourceIds(sourceIds, tr);
 
                         ed.WriteMessage(
                             $"\n[FluxCAD] Island={work.View.IslandId}, " +
@@ -557,21 +618,50 @@ namespace FluxCAD.BricsCAD.Plugin26
                             $"{inspection.DescribeTypes()}, " +
                             $"{inspection.DescribeStrategy()}");
 
-                        if (sourceIds.Count == 0)
-                        {
-                            ed.WriteMessage($"\n[FluxCAD] Island={work.View.IslandId} sourceIds가 비어 있습니다.");
-                            tr.Commit();
-                            continue;
-                        }
+                        var msId = SymbolUtilityServices.GetBlockModelSpaceId(db);
+                        var mapping = new IdMapping();
+                        db.DeepCloneObjects(sourceIds, msId, mapping, false);
 
+                        // 기존 view.Bounds의 중심을 placement.TargetBounds 중심으로 이동
                         var dx = placement.TargetBounds.Center.X - work.SourceBounds.Center.X;
                         var dy = placement.TargetBounds.Center.Y - work.SourceBounds.Center.Y;
+                        var displacement = Matrix3d.Displacement(new Vector3d(dx, dy, 0.0));
 
-                        int copiedCount = DeepCloneAndMoveTopLevelEntities(
-                            db,
-                            tr,
-                            sourceIds,
-                            new Vector3d(dx, dy, 0.0));
+                        int copiedCount = 0;
+
+                        if (inspection.IsSingleBlockReference)
+                        {
+                            // 현재 케이스:
+                            // view 전체가 BlockReference 하나로 묶여 있으므로
+                            // block 단위 복사를 우선 전략으로 사용
+                            var clonedTopLevelIds = CollectDirectClonedIds(sourceIds, mapping);
+
+                            foreach (var clonedId in clonedTopLevelIds)
+                            {
+                                var cloned = tr.GetObject(clonedId, OpenMode.ForWrite, false) as Entity;
+                                if (cloned == null)
+                                    continue;
+
+                                cloned.TransformBy(displacement);
+                                copiedCount++;
+                            }
+                        }
+                        else
+                        {
+                            // fallback:
+                            // 향후 흩어진 entity 도면에서 세부 제어를 넣을 자리
+                            var clonedTopLevelIds = CollectDirectClonedIds(sourceIds, mapping);
+
+                            foreach (var clonedId in clonedTopLevelIds)
+                            {
+                                var cloned = tr.GetObject(clonedId, OpenMode.ForWrite, false) as Entity;
+                                if (cloned == null)
+                                    continue;
+
+                                cloned.TransformBy(displacement);
+                                copiedCount++;
+                            }
+                        }
 
                         var labelPos = new Point2D(
                             placement.TargetBounds.Center.X,
@@ -613,110 +703,608 @@ namespace FluxCAD.BricsCAD.Plugin26
             }
         }
 
-        private static SourceSelectionResult ResolveCopySourceIdsForView(
-            Database db,
-            Transaction tr,
-            IReadOnlyList<SheetEntity> semanticEntities,
-            Bounds2D targetViewBounds,
-            Bounds2D sheetBounds,
-            Bricscad.EditorInput.Editor? ed,
-            int viewId)
+        private static bool ShouldUsePrimitiveLineClip(
+    string? selectionMode,
+    SourceIdInspectionResult? inspection)
         {
-            var best = CollectBestSourceIdsForView(
-                db,
-                tr,
-                semanticEntities,
-                targetViewBounds,
-                sheetBounds,
-                ed,
-                viewId);
+            if (inspection != null && inspection.IsSingleBlockReference)
+                return false;
 
-            if (best.SourceIds != null && best.SourceIds.Count > 0)
+            if (string.IsNullOrWhiteSpace(selectionMode))
+                return false;
+
+            return selectionMode.StartsWith("GlobalContourRecovery:", StringComparison.OrdinalIgnoreCase)
+                || selectionMode.StartsWith("ExactUnderRecoveredPlusFallback", StringComparison.OrdinalIgnoreCase)
+                || selectionMode.StartsWith("PrimaryPlusHandlePlusSpatialFallback", StringComparison.OrdinalIgnoreCase);
+        }
+
+        private static ObjectIdCollection FilterSourceIdsForDeepCloneWhenUsingLineClip(
+            Transaction tr,
+            ObjectIdCollection sourceIds)
+        {
+            var result = new ObjectIdCollection();
+
+            if (tr == null || sourceIds == null || sourceIds.Count == 0)
+                return result;
+
+            foreach (ObjectId id in sourceIds)
             {
-                ed?.WriteMessage(
-                    $"\n[FluxCAD] SourceResolve I:{viewId}, " +
-                    $"Mode={best.SelectionMode}, SourceIds={best.SourceIds.Count}");
+                if (!id.IsValid || id.IsErased)
+                    continue;
 
-                return best;
+                var ent = tr.GetObject(id, OpenMode.ForRead, false) as Entity;
+                if (ent == null)
+                    continue;
+
+                // line은 clip 경로에서 새 엔티티로 생성한다.
+                if (ent is Line)
+                    continue;
+
+                result.Add(id);
             }
 
-            var recovered = CollectRecoveredGlobalContourEntityIds(
-                db,
-                tr,
-                semanticEntities,
-                targetViewBounds,
-                sheetBounds,
-                ed,
-                viewId);
-
-            var recoveredInspection = InspectAcceptedSourceIds(recovered, tr);
-            var recoveredMode = recovered.Count > 0
-                ? "FallbackGlobalContourOnly"
-                : "Empty";
-
-            ed?.WriteMessage(
-                $"\n[FluxCAD] SourceResolve I:{viewId}, " +
-                $"Mode={recoveredMode}, SourceIds={recovered.Count}");
-
-            return new SourceSelectionResult
-            {
-                SourceIds = recovered,
-                Inspection = recoveredInspection,
-                SelectionMode = recoveredMode
-            };
+            return result;
         }
 
 
-        private static int DeepCloneAndMoveTopLevelEntities(
+        private static int AppendClippedLineEntitiesForView(
             Database db,
             Transaction tr,
-            ObjectIdCollection sourceIds,
-            Vector3d offset)
+            ObjectIdCollection baseModelSpaceIds,
+            Bounds2D targetBounds,
+            Bounds2D sheetBounds,
+            double dx,
+            double dy,
+            Bricscad.EditorInput.Editor? ed,
+            int? viewId)
         {
+            if (db == null) throw new ArgumentNullException(nameof(db));
+            if (tr == null) throw new ArgumentNullException(nameof(tr));
+
+            var msId = SymbolUtilityServices.GetBlockModelSpaceId(db);
+            var ms = (BlockTableRecord)tr.GetObject(msId, OpenMode.ForWrite);
+
+            int created = 0;
+            int totalLines = 0;
+            int noBounds = 0;
+            int outside = 0;
+            int frameLike = 0;
+            int noClip = 0;
+            int tiny = 0;
+
+            foreach (ObjectId id in baseModelSpaceIds)
+            {
+                if (!id.IsValid || id.IsErased)
+                    continue;
+
+                var ent = tr.GetObject(id, OpenMode.ForRead, false) as Entity;
+                if (ent is not Line srcLine)
+                    continue;
+
+                totalLines++;
+
+                if (!TryGetEntityBoundsSafe(srcLine, out var b) || b.IsEmpty)
+                {
+                    noBounds++;
+                    continue;
+                }
+
+                if (IsCadEntityFrameLike(b, sheetBounds))
+                {
+                    frameLike++;
+                    continue;
+                }
+
+                if (!Bounds2DHelper.Intersects(targetBounds, b, tolerance: 0.0))
+                {
+                    outside++;
+                    continue;
+                }
+
+                var p1 = new Point3d(srcLine.StartPoint.X, srcLine.StartPoint.Y, srcLine.StartPoint.Z);
+                var p2 = new Point3d(srcLine.EndPoint.X, srcLine.EndPoint.Y, srcLine.EndPoint.Z);
+
+                if (!TryClipLineToBounds(p1, p2, targetBounds, out var c1, out var c2))
+                {
+                    noClip++;
+                    continue;
+                }
+
+                if (Distance(c1, c2) < 1e-6)
+                {
+                    tiny++;
+                    continue;
+                }
+
+                var newStart = new Point3d(c1.X + dx, c1.Y + dy, srcLine.StartPoint.Z);
+                var newEnd = new Point3d(c2.X + dx, c2.Y + dy, srcLine.EndPoint.Z);
+
+                var newLine = new Line(newStart, newEnd);
+
+                // 원본 시각 속성 보존
+                newLine.LayerId = srcLine.LayerId;
+                newLine.LinetypeId = srcLine.LinetypeId;
+                newLine.Color = srcLine.Color;
+                newLine.LineWeight = srcLine.LineWeight;
+                newLine.LinetypeScale = srcLine.LinetypeScale;
+                newLine.Transparency = srcLine.Transparency;
+                newLine.Visible = srcLine.Visible;
+
+                ms.AppendEntity(newLine);
+                tr.AddNewlyCreatedDBObject(newLine, true);
+
+                created++;
+            }
+
+            if (ed != null)
+            {
+                var tag = viewId.HasValue ? $"I:{viewId.Value}" : "I:?";
+                ed.WriteMessage(
+                    $"\n[FluxCAD] PrimitiveLineClip {tag}, " +
+                    $"Target={targetBounds}, TotalLines={totalLines}, Created={created}, " +
+                    $"NoBounds={noBounds}, FrameLike={frameLike}, Outside={outside}, NoClip={noClip}, Tiny={tiny}, " +
+                    $"Offset=({dx:0.##},{dy:0.##})");
+            }
+
+            return created;
+        }
+
+        private static string BuildClippedLineKey(Point3d a, Point3d b)
+        {
+            static string K(Point3d p) => $"{Math.Round(p.X, 3):0.###},{Math.Round(p.Y, 3):0.###}";
+
+            var ka = K(a);
+            var kb = K(b);
+            return string.CompareOrdinal(ka, kb) <= 0 ? $"{ka}|{kb}" : $"{kb}|{ka}";
+        }
+
+        private static bool TryClipLineToBounds(
+            Point3d start,
+            Point3d end,
+            Bounds2D bounds,
+            out Point3d clippedStart,
+            out Point3d clippedEnd)
+        {
+            clippedStart = start;
+            clippedEnd = end;
+
+            if (bounds.IsEmpty)
+                return false;
+
+            double x0 = start.X;
+            double y0 = start.Y;
+            double x1 = end.X;
+            double y1 = end.Y;
+
+            double dx = x1 - x0;
+            double dy = y1 - y0;
+
+            double t0 = 0.0;
+            double t1 = 1.0;
+
+            if (!ClipTest(-dx, x0 - bounds.MinX, ref t0, ref t1)) return false;
+            if (!ClipTest(dx, bounds.MaxX - x0, ref t0, ref t1)) return false;
+            if (!ClipTest(-dy, y0 - bounds.MinY, ref t0, ref t1)) return false;
+            if (!ClipTest(dy, bounds.MaxY - y0, ref t0, ref t1)) return false;
+
+            clippedStart = new Point3d(x0 + (t0 * dx), y0 + (t0 * dy), start.Z);
+            clippedEnd = new Point3d(x0 + (t1 * dx), y0 + (t1 * dy), end.Z);
+            return true;
+        }
+
+        private static bool ClipTest(double p, double q, ref double t0, ref double t1)
+        {
+            const double eps = 1e-12;
+
+            if (Math.Abs(p) < eps)
+                return q >= 0.0;
+
+            var r = q / p;
+
+            if (p < 0.0)
+            {
+                if (r > t1) return false;
+                if (r > t0) t0 = r;
+            }
+            else
+            {
+                if (r < t0) return false;
+                if (r < t1) t1 = r;
+            }
+
+            return true;
+        }
+
+
+
+        private static ObjectIdCollection CollectCurvesByViewBounds(
+            Database db,
+            Transaction tr,
+            ObjectIdCollection baseModelSpaceIds,
+            IReadOnlyList<SheetEntity> semanticEntities,
+            Bounds2D targetViewBounds,
+            Bounds2D sheetBounds,
+            Bricscad.EditorInput.Editor? ed = null,
+            int? viewId = null)
+        {
+            var result = new ObjectIdCollection();
+
+            if (db == null)
+                throw new ArgumentNullException(nameof(db));
+            if (tr == null)
+                throw new ArgumentNullException(nameof(tr));
+            if (baseModelSpaceIds == null || baseModelSpaceIds.Count == 0)
+                return result;
+            if (targetViewBounds.IsEmpty)
+                return result;
+
+            var semanticBounds = semanticEntities?
+                .Where(x => x != null && !x.Bounds.IsEmpty)
+                .Select(x => x.Bounds)
+                .ToList() ?? new List<Bounds2D>();
+
+            var expandedViewBounds = ComputeAdaptiveExpandedViewBounds(targetViewBounds, semanticBounds);
+            if (expandedViewBounds.IsEmpty)
+                expandedViewBounds = targetViewBounds;
+
+            int accepted = 0;
+            int rejectedNotCurve = 0;
+            int rejectedNoBounds = 0;
+            int rejectedFrameLike = 0;
+            int rejectedOutsideExpanded = 0;
+            int rejectedSpatial = 0;
+            int sampledCurveCount = 0;
+            int totalSamplePoints = 0;
+            int totalInsidePoints = 0;
+
+            foreach (ObjectId id in baseModelSpaceIds)
+            {
+                if (!id.IsValid || id.IsErased)
+                    continue;
+
+                var ent = tr.GetObject(id, OpenMode.ForRead, false) as Entity;
+                if (ent == null)
+                    continue;
+
+                if (!IsCurveLikeCadEntity(ent))
+                {
+                    rejectedNotCurve++;
+                    continue;
+                }
+
+                if (!TryGetEntityBoundsSafe(ent, out var bounds) || bounds.IsEmpty)
+                {
+                    rejectedNoBounds++;
+                    continue;
+                }
+
+                if (IsCadEntityFrameLike(bounds, sheetBounds))
+                {
+                    rejectedFrameLike++;
+                    continue;
+                }
+
+                if (!Bounds2DHelper.Intersects(expandedViewBounds, bounds, tolerance: 0.0))
+                {
+                    rejectedOutsideExpanded++;
+                    continue;
+                }
+
+                sampledCurveCount++;
+                if (!IsCurveSpatiallyOwnedByView(
+                        ent,
+                        targetViewBounds,
+                        expandedViewBounds,
+                        out int sampleCount,
+                        out int insideCount))
+                {
+                    totalSamplePoints += sampleCount;
+                    totalInsidePoints += insideCount;
+                    rejectedSpatial++;
+                    continue;
+                }
+
+                totalSamplePoints += sampleCount;
+                totalInsidePoints += insideCount;
+                result.Add(id);
+                accepted++;
+            }
+
+            if (ed != null)
+            {
+                var tag = viewId.HasValue ? $"I:{viewId.Value}" : "I:?";
+                var insideRatio = totalSamplePoints > 0
+                    ? (double)totalInsidePoints / totalSamplePoints
+                    : 0.0;
+
+                ed.WriteMessage(
+                    $"\n[FluxCAD] SpatialCurveHarvest {tag}, " +
+                    $"View={targetViewBounds}, Expanded={expandedViewBounds}, " +
+                    $"Accepted={accepted}, SampledCurves={sampledCurveCount}, " +
+                    $"SampleInsideRatio={insideRatio:0.00}, " +
+                    $"NotCurve={rejectedNotCurve}, NoBounds={rejectedNoBounds}, " +
+                    $"FrameLike={rejectedFrameLike}, OutsideExpanded={rejectedOutsideExpanded}, " +
+                    $"RejectedSpatial={rejectedSpatial}");
+            }
+
+            return result;
+        }
+
+        private static bool IsCurveSpatiallyOwnedByView(
+            Entity ent,
+            Bounds2D targetViewBounds,
+            Bounds2D expandedViewBounds,
+            out int sampleCount,
+            out int insideCount)
+        {
+            sampleCount = 0;
+            insideCount = 0;
+
+            if (ent == null || targetViewBounds.IsEmpty || expandedViewBounds.IsEmpty)
+                return false;
+
+            if (!TryGetEntityBoundsSafe(ent, out var bounds) || bounds.IsEmpty)
+                return false;
+
+            if (!Bounds2DHelper.Intersects(expandedViewBounds, bounds, tolerance: 0.0))
+                return false;
+
+            var samples = SampleCurvePoints(ent);
+            sampleCount = samples.Count;
+            if (sampleCount == 0)
+                return false;
+
+            foreach (var pt in samples)
+            {
+                if (IsPointInsideBounds2D(targetViewBounds, pt, 2.0))
+                    insideCount++;
+            }
+
+            var insideRatio = (double)insideCount / sampleCount;
+            if (insideRatio >= 0.60)
+                return true;
+
+            if (insideRatio >= 0.40)
+            {
+                var center = new Point2D(
+                    (bounds.MinX + bounds.MaxX) * 0.5,
+                    (bounds.MinY + bounds.MaxY) * 0.5);
+
+                if (IsPointInsideBounds2D(targetViewBounds, center, 2.0))
+                    return true;
+            }
+
+            return false;
+        }
+
+        private static List<Point2D> SampleCurvePoints(Entity ent)
+        {
+            var result = new List<Point2D>();
+
+            if (ent == null)
+                return result;
+
+            if (ent is Line line)
+            {
+                AddLineSamples(result, line.StartPoint, line.EndPoint, 7);
+                return result;
+            }
+
+            if (ent is Arc arc)
+            {
+                AddArcSamples(result, arc.Center, arc.Radius, arc.StartAngle, arc.EndAngle, 9);
+                return result;
+            }
+
+            if (ent is Circle circle)
+            {
+                AddArcSamples(result, circle.Center, circle.Radius, 0.0, Math.PI * 2.0, 12);
+                return result;
+            }
+
+            if (ent is Ellipse ellipse)
+            {
+                AddEllipseSamples(result, ellipse, 12);
+                return result;
+            }
+
+            if (ent is Teigha.DatabaseServices.Polyline pline)
+            {
+                AddPolylineSamples(result, pline);
+                return result;
+            }
+
+            if (ent is Curve curve)
+            {
+                AddGenericCurveSamples(result, curve, 9);
+                return result;
+            }
+
+            if (TryGetEntityBoundsSafe(ent, out var bounds) && !bounds.IsEmpty)
+            {
+                result.Add(new Point2D(bounds.MinX, bounds.MinY));
+                result.Add(new Point2D(bounds.MaxX, bounds.MinY));
+                result.Add(new Point2D(bounds.MaxX, bounds.MaxY));
+                result.Add(new Point2D(bounds.MinX, bounds.MaxY));
+                result.Add(new Point2D((bounds.MinX + bounds.MaxX) * 0.5, (bounds.MinY + bounds.MaxY) * 0.5));
+            }
+
+            return result;
+        }
+
+        private static void AddLineSamples(List<Point2D> buffer, Point3d start, Point3d end, int divisions)
+        {
+            if (buffer == null)
+                return;
+
+            int count = Math.Max(divisions, 2);
+            for (int i = 0; i < count; i++)
+            {
+                double t = count == 1 ? 0.0 : (double)i / (count - 1);
+                double x = start.X + ((end.X - start.X) * t);
+                double y = start.Y + ((end.Y - start.Y) * t);
+                buffer.Add(new Point2D(x, y));
+            }
+        }
+
+        private static void AddArcSamples(List<Point2D> buffer, Point3d center, double radius, double startAngle, double endAngle, int divisions)
+        {
+            if (buffer == null || radius <= 0.0)
+                return;
+
+            double sweep = NormalizeAngleSweep(startAngle, endAngle);
+            int count = Math.Max(divisions, 2);
+
+            for (int i = 0; i < count; i++)
+            {
+                double t = count == 1 ? 0.0 : (double)i / (count - 1);
+                double angle = startAngle + (sweep * t);
+                double x = center.X + (Math.Cos(angle) * radius);
+                double y = center.Y + (Math.Sin(angle) * radius);
+                buffer.Add(new Point2D(x, y));
+            }
+        }
+
+        private static void AddEllipseSamples(List<Point2D> buffer, Ellipse ellipse, int divisions)
+        {
+            if (buffer == null || ellipse == null)
+                return;
+
+            int count = Math.Max(divisions, 4);
+            double start = 0.0;
+            double end = Math.PI * 2.0;
+
+            try
+            {
+                start = ellipse.StartAngle;
+                end = ellipse.EndAngle;
+            }
+            catch
+            {
+            }
+
+            double sweep = NormalizeAngleSweep(start, end);
+            var majorDir = ellipse.MajorAxis.GetNormal();
+            var major = majorDir * ellipse.MajorRadius;
+            var minorDir = majorDir.GetPerpendicularVector().GetNormal();
+            var minor = minorDir * ellipse.MinorRadius;
+
+            for (int i = 0; i < count; i++)
+            {
+                double t = count == 1 ? 0.0 : (double)i / (count - 1);
+                double angle = start + (sweep * t);
+                Point3d p = ellipse.Center + (major * Math.Cos(angle)) + (minor * Math.Sin(angle));
+                buffer.Add(new Point2D(p.X, p.Y));
+            }
+        }
+
+        private static void AddPolylineSamples(List<Point2D> buffer, Teigha.DatabaseServices.Polyline pline)
+        {
+            if (buffer == null || pline == null)
+                return;
+
+            int vn = pline.NumberOfVertices;
+            if (vn <= 0)
+                return;
+
+            for (int i = 0; i < vn - 1; i++)
+            {
+                AddLineSamples(buffer, pline.GetPoint3dAt(i), pline.GetPoint3dAt(i + 1), 4);
+            }
+
+            if (pline.Closed && vn >= 2)
+            {
+                AddLineSamples(buffer, pline.GetPoint3dAt(vn - 1), pline.GetPoint3dAt(0), 4);
+            }
+        }
+
+        private static void AddGenericCurveSamples(List<Point2D> buffer, Curve curve, int divisions)
+        {
+            if (buffer == null || curve == null)
+                return;
+
+            try
+            {
+                double start = curve.StartParam;
+                double end = curve.EndParam;
+                int count = Math.Max(divisions, 2);
+
+                for (int i = 0; i < count; i++)
+                {
+                    double t = count == 1 ? start : start + ((end - start) * i / (count - 1));
+                    Point3d p = curve.GetPointAtParameter(t);
+                    buffer.Add(new Point2D(p.X, p.Y));
+                }
+            }
+            catch
+            {
+                if (TryGetEntityBoundsSafe(curve, out var bounds) && !bounds.IsEmpty)
+                {
+                    buffer.Add(new Point2D(bounds.MinX, bounds.MinY));
+                    buffer.Add(new Point2D(bounds.MaxX, bounds.MaxY));
+                    buffer.Add(new Point2D((bounds.MinX + bounds.MaxX) * 0.5, (bounds.MinY + bounds.MaxY) * 0.5));
+                }
+            }
+        }
+
+        private static bool IsPointInsideBounds2D(Bounds2D bounds, Point2D point, double tolerance = 0.0)
+        {
+            if (bounds.IsEmpty)
+                return false;
+
+            return point.X >= bounds.MinX - tolerance &&
+                   point.X <= bounds.MaxX + tolerance &&
+                   point.Y >= bounds.MinY - tolerance &&
+                   point.Y <= bounds.MaxY + tolerance;
+        }
+
+        private static double NormalizeAngleSweep(double startAngle, double endAngle)
+        {
+            double sweep = endAngle - startAngle;
+            while (sweep <= 0.0)
+                sweep += Math.PI * 2.0;
+            while (sweep > Math.PI * 2.0)
+                sweep -= Math.PI * 2.0;
+            return sweep;
+        }
+
+
+        private static ObjectIdCollection CaptureBaseModelSpaceEntityIds(
+            Database db,
+            Transaction tr)
+        {
+            var result = new ObjectIdCollection();
+
             if (db == null)
                 throw new ArgumentNullException(nameof(db));
             if (tr == null)
                 throw new ArgumentNullException(nameof(tr));
 
-            if (sourceIds == null || sourceIds.Count == 0)
-                return 0;
-
             var msId = SymbolUtilityServices.GetBlockModelSpaceId(db);
-            var mapping = new IdMapping();
+            var ms = (BlockTableRecord)tr.GetObject(msId, OpenMode.ForRead);
 
-            db.DeepCloneObjects(sourceIds, msId, mapping, false);
-
-            var clonedTopLevelIds = CollectDirectClonedIds(sourceIds, mapping);
-
-            int moved = 0;
-
-            foreach (var clonedId in clonedTopLevelIds)
+            foreach (ObjectId id in ms)
             {
-                if (!clonedId.IsValid || clonedId.IsErased)
+                if (!id.IsValid || id.IsErased)
                     continue;
 
-                var cloned = tr.GetObject(clonedId, OpenMode.ForWrite, false) as Entity;
-                if (cloned == null)
-                    continue;
-
-                cloned.TransformBy(Matrix3d.Displacement(offset));
-                moved++;
+                result.Add(id);
             }
 
-            return moved;
+            return result;
         }
 
-
         private static List<GlobalCurveCandidate> CollectWideGlobalCurveCandidates(
-    Database db,
-    Transaction tr,
-    IReadOnlyList<SheetEntity> semanticEntities,
-    Bounds2D targetViewBounds,
-    Bounds2D sheetBounds,
-    Bounds2D searchBounds,
-    Bounds2D outerBand,
-    Bricscad.EditorInput.Editor? ed,
-    int? viewId)
+            Database db,
+            Transaction tr,
+            ObjectIdCollection baseModelSpaceIds,
+            IReadOnlyList<SheetEntity> semanticEntities,
+            Bounds2D targetViewBounds,
+            Bounds2D sheetBounds,
+            Bounds2D searchBounds,
+            Bounds2D outerBand,
+            Bricscad.EditorInput.Editor? ed,
+            int? viewId)
         {
             var result = new List<GlobalCurveCandidate>();
 
@@ -738,26 +1326,30 @@ namespace FluxCAD.BricsCAD.Plugin26
             if (seedUnion.IsEmpty)
                 return result;
 
-            var msId = SymbolUtilityServices.GetBlockModelSpaceId(db);
-            var ms = (BlockTableRecord)tr.GetObject(msId, OpenMode.ForRead);
-
             int totalCurve = 0;
             int accepted = 0;
             int rejectedOutsideSearch = 0;
             int rejectedFrame = 0;
             int rejectedHuge = 0;
             int rejectedArrow = 0;
+            int rejectedTableLike = 0;
+
+            bool smallView =
+                targetViewBounds.Width < 500.0 ||
+                targetViewBounds.Height < 80.0 ||
+                targetViewBounds.Area < 60000.0;
 
             var rawArrowHandles = CollectRawProjectionArrowLikeHandles(
                 db,
                 tr,
+                baseModelSpaceIds,
                 searchBounds,
                 targetViewBounds,
                 sheetBounds,
                 ed: null,
                 viewId: viewId);
 
-            foreach (ObjectId id in ms)
+            foreach (ObjectId id in baseModelSpaceIds)
             {
                 if (!id.IsValid || id.IsErased)
                     continue;
@@ -774,6 +1366,12 @@ namespace FluxCAD.BricsCAD.Plugin26
                 if (!TryGetEntityBoundsSafe(ent, out var bounds) || bounds.IsEmpty)
                     continue;
 
+                if (!Bounds2DHelper.Intersects(searchBounds, bounds, tolerance: 0.0))
+                {
+                    rejectedOutsideSearch++;
+                    continue;
+                }
+
                 if (rawArrowHandles.Contains(id.Handle.ToString()))
                 {
                     rejectedArrow++;
@@ -786,19 +1384,21 @@ namespace FluxCAD.BricsCAD.Plugin26
                     continue;
                 }
 
-                if (!Bounds2DHelper.Intersects(searchBounds, bounds, tolerance: 0.0))
+                var widthRatio = bounds.Width / Math.Max(targetViewBounds.Width, 1e-9);
+                var heightRatio = bounds.Height / Math.Max(targetViewBounds.Height, 1e-9);
+                var areaRatio = bounds.Area / Math.Max(targetViewBounds.Area, 1e-9);
+
+                if (widthRatio >= (smallView ? 12.0 : 8.0) ||
+                    heightRatio >= (smallView ? 12.0 : 8.0) ||
+                    areaRatio >= (smallView ? 120.0 : 80.0))
                 {
-                    rejectedOutsideSearch++;
+                    rejectedHuge++;
                     continue;
                 }
 
-                var widthRatio = bounds.Width / Math.Max(targetViewBounds.Width, 1e-9);
-                var heightRatio = bounds.Height / Math.Max(targetViewBounds.Height, 1e-9);
-
-                // 전체 시트급/과대 개체 차단
-                if (widthRatio >= 6.0 || heightRatio >= 6.0)
+                if (LooksLikeTableRuleCandidate(ent, bounds, targetViewBounds, semanticBounds))
                 {
-                    rejectedHuge++;
+                    rejectedTableLike++;
                     continue;
                 }
 
@@ -810,17 +1410,24 @@ namespace FluxCAD.BricsCAD.Plugin26
                     Bounds2DHelper.Intersects(targetViewBounds, bounds, tolerance: 3.0);
 
                 bool isLongThin = IsLongThinContourCandidate(bounds, targetViewBounds);
+                bool isOuterSide = IsOuterSideRelativeToSeedUnion(
+                    bounds,
+                    seedUnion,
+                    tolerance: Math.Max(6.0, Math.Min(targetViewBounds.Width, targetViewBounds.Height) * 0.08));
 
                 double seedScore = 0.0;
 
                 if (inOuterBand)
-                    seedScore += 2.0;
+                    seedScore += smallView ? 2.8 : 2.0;
 
                 if (intersectsTarget)
-                    seedScore += 1.0;
+                    seedScore += smallView ? 1.6 : 1.0;
 
                 if (isLongThin)
-                    seedScore += 1.5;
+                    seedScore += smallView ? 1.0 : 1.5;
+
+                if (isOuterSide)
+                    seedScore += 2.2;
 
                 if (IsNearSeedGeometry(
                     bounds,
@@ -848,13 +1455,14 @@ namespace FluxCAD.BricsCAD.Plugin26
             {
                 var tag = viewId.HasValue ? $"I:{viewId.Value}" : "I:?";
                 ed.WriteMessage(
-                    $"\n[FluxCAD] WideGlobalCurveCandidates {tag}, " +
+                    $"[FluxCAD] WideGlobalCurveCandidates { tag}, " +
                     $"TotalCurve={totalCurve}, Accepted={accepted}, " +
-                    $"OutsideSearch={rejectedOutsideSearch}, Frame={rejectedFrame}, Huge={rejectedHuge}, Arrow={rejectedArrow}");
+                    $"OutsideSearch={rejectedOutsideSearch}, Frame={rejectedFrame}, Huge={rejectedHuge}, Arrow={rejectedArrow}, TableLike={rejectedTableLike}");
             }
 
             return result;
         }
+
 
         private static ObjectIdCollection CollectTopScoredClusterEntityIds(
     IReadOnlyList<GlobalCurveCluster> clusters,
@@ -869,6 +1477,11 @@ namespace FluxCAD.BricsCAD.Plugin26
             if (clusters == null || clusters.Count == 0)
                 return result;
 
+            bool smallView =
+                targetViewBounds.Width < 500.0 ||
+                targetViewBounds.Height < 80.0 ||
+                targetViewBounds.Area < 60000.0;
+
             foreach (var cluster in clusters)
             {
                 cluster.ClusterScore = ScoreGlobalCurveCluster(
@@ -881,16 +1494,85 @@ namespace FluxCAD.BricsCAD.Plugin26
             var ordered = clusters
                 .Where(x => x != null && x.Members.Count > 0)
                 .OrderByDescending(x => x.ClusterScore)
+                .ThenByDescending(x => x.TargetIntersectCount)
+                .ThenByDescending(x => x.OuterBandCount)
                 .ThenByDescending(x => x.Members.Count)
                 .ToList();
 
-            // 상위 cluster 선택:
-            // 1) score가 일정 이상
-            // 2) top 3까지만
+            bool ExtendsOutsideSeed(GlobalCurveCluster c)
+            {
+                if (c == null || c.Bounds.IsEmpty || seedUnion.IsEmpty)
+                    return true;
+
+                return c.Bounds.MinX < seedUnion.MinX - 2.0 ||
+                       c.Bounds.MaxX > seedUnion.MaxX + 2.0 ||
+                       c.Bounds.MinY < seedUnion.MinY - 2.0 ||
+                       c.Bounds.MaxY > seedUnion.MaxY + 2.0;
+            }
+
+            bool MostlyInsideSeed(GlobalCurveCluster c)
+            {
+                if (c == null || c.Bounds.IsEmpty || seedUnion.IsEmpty)
+                    return false;
+
+                double interArea = ComputeBoundsIntersectionArea(c.Bounds, seedUnion);
+                double ratio = interArea / Math.Max(c.Bounds.Area, 1e-9);
+                return ratio >= 0.85;
+            }
+
+            bool HasDirectEvidence(GlobalCurveCluster c)
+            {
+                if (c == null)
+                    return false;
+
+                return c.TargetIntersectCount > 0 || c.OuterBandCount > 0;
+            }
+
+            bool HasStripLikeEvidence(GlobalCurveCluster c)
+            {
+                if (c == null || c.Bounds.IsEmpty || targetViewBounds.IsEmpty)
+                    return false;
+
+                bool longHorizontal =
+                    c.LongThinCount > 0 &&
+                    c.Bounds.Width >= targetViewBounds.Width * 0.30;
+
+                bool longVertical =
+                    c.LongThinCount > 0 &&
+                    c.Bounds.Height >= targetViewBounds.Height * 0.30;
+
+                return longHorizontal || longVertical;
+            }
+
             var selected = ordered
-                .Where(x => x.ClusterScore >= 5.0)
-                .Take(3)
+                .Where(x => x.ClusterScore >= (smallView ? 5.5 : 5.0))
+                .Where(x =>
+                {
+                    if (!smallView)
+                        return true;
+
+                    // small view에서는 무조건 직접 근거 또는 strip 근거 필요
+                    if (!HasDirectEvidence(x) && !HasStripLikeEvidence(x))
+                        return false;
+
+                    // seed 내부 점상 잡음 제거
+                    if (MostlyInsideSeed(x) && x.TargetIntersectCount == 0)
+                        return false;
+
+                    return true;
+                })
+                .Where(x => !smallView || ExtendsOutsideSeed(x) || x.TargetIntersectCount >= 2 || x.OuterBandCount >= 2)
+                .Take(smallView ? 5 : 5)
                 .ToList();
+
+            if (selected.Count == 0)
+            {
+                selected = ordered
+                    .Where(x => x.ClusterScore >= (smallView ? 4.5 : 5.0))
+                    .Where(x => !smallView || HasDirectEvidence(x) || HasStripLikeEvidence(x))
+                    .Take(smallView ? 4 : 5)
+                    .ToList();
+            }
 
             var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
@@ -909,13 +1591,14 @@ namespace FluxCAD.BricsCAD.Plugin26
             if (ed != null)
             {
                 var tag = viewId.HasValue ? $"I:{viewId.Value}" : "I:?";
-                ed.WriteMessage($"\n[FluxCAD] GlobalCurveClusters {tag}, Total={clusters.Count}, Selected={selected.Count}");
+                ed.WriteMessage(
+                    $"\n[FluxCAD] GlobalCurveClusters {tag}, Total={clusters.Count}, Selected={selected.Count}, SmallView={smallView}");
 
                 int rank = 1;
-                foreach (var c in ordered.Take(6))
+                foreach (var c in ordered.Take(8))
                 {
                     ed.WriteMessage(
-                        $"\n  [Cluster {rank}] Score={c.ClusterScore:0.00}, Members={c.Members.Count}, " +
+                        $"[Cluster {rank}] Score={c.ClusterScore:0.00}, Members={c.Members.Count}, " +
                         $"Outer={c.OuterBandCount}, LongThin={c.LongThinCount}, TargetHit={c.TargetIntersectCount}, Bounds={c.Bounds}");
                     rank++;
                 }
@@ -923,6 +1606,7 @@ namespace FluxCAD.BricsCAD.Plugin26
 
             return result;
         }
+
 
         private static double ScoreGlobalCurveCluster(
     GlobalCurveCluster cluster,
@@ -935,70 +1619,114 @@ namespace FluxCAD.BricsCAD.Plugin26
 
             double score = 0.0;
 
-            var widthRatio = cluster.Bounds.Width / Math.Max(targetViewBounds.Width, 1e-9);
-            var heightRatio = cluster.Bounds.Height / Math.Max(targetViewBounds.Height, 1e-9);
+            bool smallView =
+                targetViewBounds.Width < 500.0 ||
+                targetViewBounds.Height < 80.0 ||
+                targetViewBounds.Area < 60000.0;
 
-            // 기본 멤버 수
-            score += Math.Min(cluster.Members.Count, 12) * 0.45;
+            double widthRatio = cluster.Bounds.Width / Math.Max(targetViewBounds.Width, 1e-9);
+            double heightRatio = cluster.Bounds.Height / Math.Max(targetViewBounds.Height, 1e-9);
 
-            // outer band에 많이 분포할수록 가점
-            score += cluster.OuterBandCount * 1.35;
+            // 1. 기본 점수
+            score += Math.Min(cluster.Members.Count, 12) * 0.25;
+            score += cluster.OuterBandCount * (smallView ? 1.2 : 1.0);
+            score += cluster.TargetIntersectCount * (smallView ? 1.0 : 0.7);
+            score += cluster.LongThinCount * (smallView ? 0.25 : 0.45);
 
-            // 길고 얇은 선이 많을수록 가점
-            score += cluster.LongThinCount * 0.95;
-
-            // view와 실제 접하는 선도 가점
-            score += cluster.TargetIntersectCount * 0.55;
-
-            // 클러스터 폭/높이가 view와 어느 정도 스케일이 맞아야 함
-            if (cluster.Bounds.Width >= targetViewBounds.Width * 0.30)
-                score += 2.0;
-
-            if (cluster.Bounds.Height >= targetViewBounds.Height * 0.18)
-                score += 1.5;
-
-            // outer band 안에서 차지하는 범위 가점
-            if (!outerBand.IsEmpty)
-            {
-                var overlapArea = ComputeBoundsIntersectionArea(cluster.Bounds, outerBand);
-                var ratio = overlapArea / Math.Max(cluster.Bounds.Area, 1e-9);
-                score += Math.Min(ratio, 1.0) * 2.0;
-            }
-
-            // seedUnion 바로 바깥을 감싸는 쪽이면 가점
+            // 2. seed 외곽 확장 보상
             if (!seedUnion.IsEmpty)
             {
-                var nearSeedRing = new Bounds2D(
-                    seedUnion.MinX - Math.Max(8.0, targetViewBounds.Width * 0.05),
-                    seedUnion.MinY - Math.Max(8.0, targetViewBounds.Height * 0.10),
-                    seedUnion.MaxX + Math.Max(8.0, targetViewBounds.Width * 0.05),
-                    seedUnion.MaxY + Math.Max(8.0, targetViewBounds.Height * 0.10));
+                bool extendsLeft = cluster.Bounds.MinX < seedUnion.MinX - 2.0;
+                bool extendsRight = cluster.Bounds.MaxX > seedUnion.MaxX + 2.0;
+                bool extendsBottom = cluster.Bounds.MinY < seedUnion.MinY - 2.0;
+                bool extendsTop = cluster.Bounds.MaxY > seedUnion.MaxY + 2.0;
 
-                if (Bounds2DHelper.Intersects(cluster.Bounds, nearSeedRing, tolerance: 0.0) &&
-                    !Bounds2DHelper.Intersects(cluster.Bounds, seedUnion, tolerance: 1.0))
-                {
-                    score += 2.0;
-                }
+                int outerExpandSides = 0;
+                if (extendsLeft) outerExpandSides++;
+                if (extendsRight) outerExpandSides++;
+                if (extendsBottom) outerExpandSides++;
+                if (extendsTop) outerExpandSides++;
+
+                score += outerExpandSides * (smallView ? 5.0 : 4.0);
+
+                double interArea = ComputeBoundsIntersectionArea(cluster.Bounds, seedUnion);
+                double outsideArea = Math.Max(0.0, cluster.Bounds.Area - interArea);
+                double outsideRatio = outsideArea / Math.Max(cluster.Bounds.Area, 1e-9);
+
+                score += outsideRatio * (smallView ? 8.0 : 6.0);
+
+                double insideRatio = interArea / Math.Max(cluster.Bounds.Area, 1e-9);
+                if (insideRatio >= 0.85)
+                    score -= smallView ? 10.0 : 8.0;
+                else if (insideRatio >= 0.65)
+                    score -= smallView ? 5.0 : 4.0;
+
+                var ring = new Bounds2D(
+                    seedUnion.MinX - Math.Max(8.0, targetViewBounds.Width * 0.08),
+                    seedUnion.MinY - Math.Max(8.0, targetViewBounds.Height * 0.18),
+                    seedUnion.MaxX + Math.Max(8.0, targetViewBounds.Width * 0.08),
+                    seedUnion.MaxY + Math.Max(8.0, targetViewBounds.Height * 0.18));
+
+                bool touchesRing =
+                    Bounds2DHelper.Intersects(cluster.Bounds, ring, tolerance: 0.0) &&
+                    !Bounds2DHelper.Contains(seedUnion, cluster.Bounds, tolerance: 1.0);
+
+                if (touchesRing)
+                    score += smallView ? 3.0 : 2.0;
             }
 
-            // 너무 작은 cluster는 감점
-            if (cluster.Members.Count <= 1)
-                score -= 2.5;
-            else if (cluster.Members.Count == 2)
-                score -= 1.0;
+            // 3. 외곽다운 형태 보상
+            if (cluster.Bounds.Width >= targetViewBounds.Width * 0.55)
+                score += 3.0;
+            if (cluster.Bounds.Height >= targetViewBounds.Height * 0.55)
+                score += 3.0;
 
-            // 너무 작은 bounds는 감점
-            if (cluster.Bounds.Width < targetViewBounds.Width * 0.08 &&
-                cluster.Bounds.Height < targetViewBounds.Height * 0.08)
+            if (cluster.Bounds.Width >= targetViewBounds.Width * 0.80)
+                score += 2.5;
+            if (cluster.Bounds.Height >= targetViewBounds.Height * 0.80)
+                score += 2.5;
+
+            if (!outerBand.IsEmpty)
             {
-                score -= 2.0;
+                double overlapArea = ComputeBoundsIntersectionArea(cluster.Bounds, outerBand);
+                double overlapRatio = overlapArea / Math.Max(cluster.Bounds.Area, 1e-9);
+                score += overlapRatio * (smallView ? 2.0 : 1.5);
             }
 
-            // view 전체보다 과도하게 크면 감점
-            if (widthRatio >= 3.2)
-                score -= 2.0;
-            if (heightRatio >= 3.2)
-                score -= 2.0;
+            // 4. 내부 조각 / 점상 cluster 패널티
+            bool tinyBoth =
+                cluster.Bounds.Width < targetViewBounds.Width * 0.10 &&
+                cluster.Bounds.Height < targetViewBounds.Height * 0.35;
+
+            if (tinyBoth)
+                score -= smallView ? 7.0 : 5.0;
+
+            if (cluster.Members.Count <= 2)
+                score -= 3.0;
+            else if (cluster.Members.Count == 3)
+                score -= 1.5;
+
+            bool horizontalStrip =
+                widthRatio >= 0.60 && heightRatio <= 0.18;
+            bool verticalStrip =
+                heightRatio >= 0.60 && widthRatio <= 0.18;
+
+            if (horizontalStrip || verticalStrip)
+                score -= smallView ? 4.0 : 3.0;
+
+            // 5. 핵심 추가 패널티: target와 무관한 군집 강하게 감점
+            if (smallView)
+            {
+                if (cluster.TargetIntersectCount == 0 && cluster.OuterBandCount == 0)
+                    score -= 12.0;
+
+                bool weakCoverage =
+                    cluster.Bounds.Width < targetViewBounds.Width * 0.18 &&
+                    cluster.Bounds.Height < targetViewBounds.Height * 0.18;
+
+                if (weakCoverage && cluster.LongThinCount == 0)
+                    score -= 6.0;
+            }
 
             return score;
         }
@@ -1111,6 +1839,13 @@ namespace FluxCAD.BricsCAD.Plugin26
             return Math.Sqrt(dx * dx + dy * dy);
         }
 
+        private static double Distance(Point3d a, Point3d b)
+        {
+            var dx = a.X - b.X;
+            var dy = a.Y - b.Y;
+            return Math.Sqrt(dx * dx + dy * dy);
+        }
+
         private static bool TryGetLineEndpointsAndAngle(Entity ent, out Point2D start, out Point2D end, out double length, out double angleDegrees)
         {
             start = default;
@@ -1141,6 +1876,7 @@ namespace FluxCAD.BricsCAD.Plugin26
         private static List<RawCurveCandidate> CollectRawLineCandidates(
     Database db,
     Transaction tr,
+    ObjectIdCollection baseModelSpaceIds,
     Bounds2D searchBounds,
     Bounds2D sheetBounds)
         {
@@ -1150,13 +1886,12 @@ namespace FluxCAD.BricsCAD.Plugin26
                 throw new ArgumentNullException(nameof(db));
             if (tr == null)
                 throw new ArgumentNullException(nameof(tr));
+            if (baseModelSpaceIds == null)
+                throw new ArgumentNullException(nameof(baseModelSpaceIds));
             if (searchBounds.IsEmpty)
                 return result;
 
-            var msId = SymbolUtilityServices.GetBlockModelSpaceId(db);
-            var ms = (BlockTableRecord)tr.GetObject(msId, OpenMode.ForRead);
-
-            foreach (ObjectId id in ms)
+            foreach (ObjectId id in baseModelSpaceIds)
             {
                 if (!id.IsValid || id.IsErased)
                     continue;
@@ -1197,6 +1932,7 @@ namespace FluxCAD.BricsCAD.Plugin26
 
             return result;
         }
+
 
         private static bool AreRawCurveCandidatesConnected(
     RawCurveCandidate a,
@@ -1365,6 +2101,7 @@ namespace FluxCAD.BricsCAD.Plugin26
         private static HashSet<string> CollectRawProjectionArrowLikeHandles(
     Database db,
     Transaction tr,
+    ObjectIdCollection baseModelSpaceIds,
     Bounds2D searchBounds,
     Bounds2D targetViewBounds,
     Bounds2D sheetBounds,
@@ -1376,6 +2113,7 @@ namespace FluxCAD.BricsCAD.Plugin26
             var candidates = CollectRawLineCandidates(
                 db,
                 tr,
+                baseModelSpaceIds,
                 searchBounds,
                 sheetBounds);
 
@@ -1748,6 +2486,7 @@ namespace FluxCAD.BricsCAD.Plugin26
         private static ObjectIdCollection CollectFallbackSpatialEntityIds(
             Database db,
             Transaction tr,
+            ObjectIdCollection baseModelSpaceIds,
             IReadOnlyList<SheetEntity> semanticEntities,
             Bounds2D targetViewBounds,
             Bounds2D sheetBounds,
@@ -1775,16 +2514,13 @@ namespace FluxCAD.BricsCAD.Plugin26
             if (expandedViewBounds.IsEmpty)
                 return result;
 
-            var msId = SymbolUtilityServices.GetBlockModelSpaceId(db);
-            var ms = (BlockTableRecord)tr.GetObject(msId, OpenMode.ForRead);
-
             int accepted = 0;
             int rejectedOutsideExpanded = 0;
             int rejectedOther = 0;
             int curveAccepted = 0;
             double bestScore = 0.0;
 
-            foreach (ObjectId id in ms)
+            foreach (ObjectId id in baseModelSpaceIds)
             {
                 if (!id.IsValid || id.IsErased)
                     continue;
@@ -1829,7 +2565,7 @@ namespace FluxCAD.BricsCAD.Plugin26
             {
                 var tag = viewId.HasValue ? $"I:{viewId.Value}" : "I:?";
                 ed.WriteMessage(
-                    $"[FluxCAD] SpatialFallback { tag}, " +
+                    $"[FluxCAD] SpatialFallback {tag}, " +
                     $"View={targetViewBounds}, Expanded={expandedViewBounds}, " +
                     $"Accepted={accepted}, CurveAccepted={curveAccepted}, BestScore={bestScore:0.00}, " +
                     $"OutsideExpanded={rejectedOutsideExpanded}, RejectedOther={rejectedOther}");
@@ -1868,14 +2604,107 @@ namespace FluxCAD.BricsCAD.Plugin26
         }
 
 
-        private static SourceSelectionResult CollectAdaptiveSourceIdsForView(
+        private static bool PreferGlobalRecoveryForMixed(
+    ObjectIdCollection exactIds,
+    ObjectIdCollection mergedWithGlobal,
     Database db,
     Transaction tr,
-    IReadOnlyList<SheetEntity> semanticEntities,
     Bounds2D targetViewBounds,
-    Bounds2D sheetBounds,
-    Bricscad.EditorInput.Editor? ed,
-    int viewId)
+    DrawingStructureDiagnosis diagnosis)
+        {
+            if (mergedWithGlobal == null || mergedWithGlobal.Count == 0)
+                return false;
+
+            if (exactIds == null || exactIds.Count == 0)
+                return true;
+
+            if (diagnosis == null)
+                return mergedWithGlobal.Count > exactIds.Count;
+
+            if (diagnosis.DrawingType != DrawingType.Mixed &&
+                diagnosis.DrawingType != DrawingType.GlobalLinePool)
+            {
+                return mergedWithGlobal.Count > exactIds.Count;
+            }
+
+            var exactBounds = ComputeObjectIdCollectionBounds(db, tr, exactIds);
+            var mergedBounds = ComputeObjectIdCollectionBounds(db, tr, mergedWithGlobal);
+
+            if (exactBounds.IsEmpty)
+                return true;
+            if (mergedBounds.IsEmpty)
+                return false;
+
+            double widthGain = mergedBounds.Width - exactBounds.Width;
+            double heightGain = mergedBounds.Height - exactBounds.Height;
+
+            double minWidthGain = Math.Max(8.0, targetViewBounds.Width * 0.06);
+            double minHeightGain = Math.Max(4.0, targetViewBounds.Height * 0.06);
+
+            if (widthGain >= minWidthGain)
+                return true;
+
+            if (heightGain >= minHeightGain)
+                return true;
+
+            int gained = mergedWithGlobal.Count - exactIds.Count;
+
+            if (gained >= 6)
+                return true;
+
+            if (diagnosis.ExactCoverageRatio < 0.55 && gained >= 3)
+                return true;
+
+            if (diagnosis.ExactCoverageRatio < 0.45 && gained >= 2)
+                return true;
+
+            return false;
+        }
+
+
+        private static Bounds2D ComputeObjectIdCollectionBounds(
+            Database db,
+            Transaction tr,
+            ObjectIdCollection ids)
+        {
+            if (db == null)
+                throw new ArgumentNullException(nameof(db));
+            if (tr == null)
+                throw new ArgumentNullException(nameof(tr));
+            if (ids == null || ids.Count == 0)
+                return Bounds2D.Empty;
+
+            var boundsList = new List<Bounds2D>();
+
+            foreach (ObjectId id in ids)
+            {
+                if (!id.IsValid || id.IsErased)
+                    continue;
+
+                var ent = tr.GetObject(id, OpenMode.ForRead, false) as Entity;
+                if (ent == null)
+                    continue;
+
+                if (!TryGetEntityBoundsSafe(ent, out var bounds) || bounds.IsEmpty)
+                    continue;
+
+                boundsList.Add(bounds);
+            }
+
+            return boundsList.Count == 0
+                ? Bounds2D.Empty
+                : UnionBounds(boundsList);
+        }
+
+        private static SourceSelectionResult CollectAdaptiveSourceIdsForView(
+            Database db,
+            Transaction tr,
+            ObjectIdCollection baseModelSpaceIds,
+            IReadOnlyList<SheetEntity> semanticEntities,
+            Bounds2D targetViewBounds,
+            Bounds2D sheetBounds,
+            Bricscad.EditorInput.Editor? ed,
+            int viewId)
         {
             // ------------------------------------------------------------
             // PASS 0: semantic entity direct-handle exact recovery
@@ -1895,6 +2724,7 @@ namespace FluxCAD.BricsCAD.Plugin26
             var primary = CollectModelSpaceEntitiesForSemanticView(
                 db,
                 tr,
+                baseModelSpaceIds,
                 semanticEntities,
                 targetViewBounds,
                 sheetBounds,
@@ -1931,6 +2761,16 @@ namespace FluxCAD.BricsCAD.Plugin26
             var spatialFallback = CollectFallbackSpatialEntityIds(
                 db,
                 tr,
+                baseModelSpaceIds,
+                semanticEntities,
+                targetViewBounds,
+                sheetBounds,
+                ed,
+                viewId);
+
+            var spatialCurveHarvest = CollectCurvesByViewBounds(db,
+                tr,
+                baseModelSpaceIds,
                 semanticEntities,
                 targetViewBounds,
                 sheetBounds,
@@ -1961,6 +2801,7 @@ namespace FluxCAD.BricsCAD.Plugin26
                 ? CollectRecoveredGlobalContourEntityIds(
                     db,
                     tr,
+                    baseModelSpaceIds,
                     semanticEntities,
                     targetViewBounds,
                     sheetBounds,
@@ -1973,8 +2814,8 @@ namespace FluxCAD.BricsCAD.Plugin26
             // ------------------------------------------------------------
             var mergedExactPrimary = MergeObjectIds(exactIds, primary);
             var mergedExactPrimaryHandle = MergeObjectIds(exactIds, primary, recoveredFiltered);
-            var mergedAll = MergeObjectIds(exactIds, primary, recoveredFiltered, spatialFallback);
-            var mergedWithGlobal = MergeObjectIds(exactIds, primary, recoveredFiltered, spatialFallback, globalContour);
+            var mergedAll = MergeObjectIds(exactIds, primary, recoveredFiltered, spatialFallback, spatialCurveHarvest);
+            var mergedWithGlobal = MergeObjectIds(exactIds, primary, recoveredFiltered, spatialFallback, spatialCurveHarvest, globalContour);
 
             var mergedExactPrimaryInspection = InspectAcceptedSourceIds(mergedExactPrimary, tr);
             var mergedExactPrimaryHandleInspection = InspectAcceptedSourceIds(mergedExactPrimaryHandle, tr);
@@ -1984,6 +2825,7 @@ namespace FluxCAD.BricsCAD.Plugin26
             ed?.WriteMessage(
                 $"\n[FluxCAD] SourceSelectCompare I:{viewId}, " +
                 $"Semantic={semanticEntities?.Count ?? 0}, " +
+                $"SpatialCurve={spatialCurveHarvest.Count}, " +
                 $"Exact={exactIds.Count}, Primary={primary.Count}, Handle={recoveredFiltered.Count}, Spatial={spatialFallback.Count}, GlobalContour={globalContour.Count}, " +
                 $"MergedEP={mergedExactPrimary.Count}, MergedEPH={mergedExactPrimaryHandle.Count}, MergedAll={mergedAll.Count}, MergedGlobal={mergedWithGlobal.Count}");
 
@@ -1995,7 +2837,13 @@ namespace FluxCAD.BricsCAD.Plugin26
             if (diagnosis.DrawingType == DrawingType.GlobalLinePool ||
                 diagnosis.DrawingType == DrawingType.Mixed)
             {
-                if (mergedWithGlobal.Count > 0)
+                if (PreferGlobalRecoveryForMixed(
+                    exactIds,
+                    mergedWithGlobal,
+                    db,
+                    tr,
+                    targetViewBounds,
+                    diagnosis))
                 {
                     return new SourceSelectionResult
                     {
@@ -2094,6 +2942,7 @@ namespace FluxCAD.BricsCAD.Plugin26
         private static SourceSelectionResult CollectBestSourceIdsForView(
     Database db,
     Transaction tr,
+    ObjectIdCollection baseModelSpaceIds,
     IReadOnlyList<SheetEntity> semanticEntities,
     Bounds2D targetViewBounds,
     Bounds2D sheetBounds,
@@ -2110,6 +2959,7 @@ namespace FluxCAD.BricsCAD.Plugin26
             var primary = CollectModelSpaceEntitiesForSemanticView(
                 db,
                 tr,
+                baseModelSpaceIds,
                 semanticEntities,
                 targetViewBounds,
                 sheetBounds,
@@ -2139,6 +2989,7 @@ namespace FluxCAD.BricsCAD.Plugin26
             var spatialFallback = CollectFallbackSpatialEntityIds(
                 db,
                 tr,
+                baseModelSpaceIds,
                 semanticEntities,
                 targetViewBounds,
                 sheetBounds,
@@ -2177,6 +3028,7 @@ namespace FluxCAD.BricsCAD.Plugin26
                 return CollectContainedSafeSourceIdsForView(
                     db,
                     tr,
+                    baseModelSpaceIds,
                     semanticEntities,
                     targetViewBounds,
                     sheetBounds,
@@ -2187,6 +3039,7 @@ namespace FluxCAD.BricsCAD.Plugin26
             return CollectAdaptiveSourceIdsForView(
                 db,
                 tr,
+                baseModelSpaceIds,
                 semanticEntities,
                 targetViewBounds,
                 sheetBounds,
@@ -2195,9 +3048,268 @@ namespace FluxCAD.BricsCAD.Plugin26
         }
 
 
+        private static bool IsCurveLikeEntity(Entity ent)
+        {
+            if (ent == null)
+                return false;
+
+            return ent is Line ||
+                   ent is Arc ||
+                   ent is Circle ||
+                   ent is Ellipse ||
+                   //ent is Polyline ||
+                   ent is Polyline2d ||
+                   ent is Polyline3d;
+        }
+
+        private static List<Point2D> GetCurveRepresentativeEndpoints(Entity ent)
+        {
+            var result = new List<Point2D>();
+            if (ent == null)
+                return result;
+
+            switch (ent)
+            {
+                case Line line:
+                    result.Add(new Point2D(line.StartPoint.X, line.StartPoint.Y));
+                    result.Add(new Point2D(line.EndPoint.X, line.EndPoint.Y));
+                    break;
+
+                case Arc arc:
+                    result.Add(new Point2D(arc.StartPoint.X, arc.StartPoint.Y));
+                    result.Add(new Point2D(arc.EndPoint.X, arc.EndPoint.Y));
+                    break;
+
+                case Circle circle:
+                    result.Add(new Point2D(circle.Center.X - circle.Radius, circle.Center.Y));
+                    result.Add(new Point2D(circle.Center.X + circle.Radius, circle.Center.Y));
+                    result.Add(new Point2D(circle.Center.X, circle.Center.Y - circle.Radius));
+                    result.Add(new Point2D(circle.Center.X, circle.Center.Y + circle.Radius));
+                    break;
+
+                case Ellipse ellipse:
+                    {
+                        try
+                        {
+                            var s = ellipse.StartPoint;
+                            var e = ellipse.EndPoint;
+                            result.Add(new Point2D(s.X, s.Y));
+                            result.Add(new Point2D(e.X, e.Y));
+                        }
+                        catch
+                        {
+                            result.Add(new Point2D(ellipse.Center.X, ellipse.Center.Y));
+                        }
+                    }
+                    break;
+
+//                 case Polyline pl:
+//                     if (pl.NumberOfVertices > 0)
+//                     {
+//                         var s = pl.GetPoint3dAt(0);
+//                         var e = pl.GetPoint3dAt(pl.NumberOfVertices - 1);
+//                         result.Add(new Point2D(s.X, s.Y));
+//                         result.Add(new Point2D(e.X, e.Y));
+//                     }
+//                     break;
+
+                case Polyline2d pl2:
+                    {
+                        Point2D? first = null;
+                        Point2D? last = null;
+
+                        foreach (ObjectId vId in pl2)
+                        {
+                            if (!vId.IsValid || vId.IsErased)
+                                continue;
+
+                            // caller 쪽 transaction 사용이 안전하므로 여기서는 직접 접근하지 않음
+                        }
+
+                        // Polyline2d는 endpoint 추출이 까다로우므로 bounds fallback
+                        if (TryGetEntityBoundsSafe(pl2, out var b2) && !b2.IsEmpty)
+                        {
+                            result.Add(new Point2D(b2.MinX, b2.Center.Y));
+                            result.Add(new Point2D(b2.MaxX, b2.Center.Y));
+                        }
+                    }
+                    break;
+
+                case Polyline3d pl3:
+                    if (TryGetEntityBoundsSafe(pl3, out var b3) && !b3.IsEmpty)
+                    {
+                        result.Add(new Point2D(b3.MinX, b3.Center.Y));
+                        result.Add(new Point2D(b3.MaxX, b3.Center.Y));
+                    }
+                    break;
+            }
+
+            return result;
+        }
+
+//         private static double Distance(Point2D a, Point2D b)
+//         {
+//             double dx = a.X - b.X;
+//             double dy = a.Y - b.Y;
+//             return Math.Sqrt(dx * dx + dy * dy);
+//         }
+
+        private static bool IsWithinExpandedBounds(Bounds2D bounds, Bounds2D target, double expandX, double expandY)
+        {
+            if (bounds.IsEmpty || target.IsEmpty)
+                return false;
+
+            var expanded = new Bounds2D(
+                target.MinX - expandX,
+                target.MinY - expandY,
+                target.MaxX + expandX,
+                target.MaxY + expandY);
+
+            return Bounds2DHelper.Intersects(bounds, expanded, tolerance: 0.0);
+        }
+
+        private static bool IsNearAnyEndpoint(
+            IReadOnlyList<Point2D> candidatePoints,
+            IReadOnlyList<Point2D> seedPoints,
+            double tolerance)
+        {
+            if (candidatePoints == null || candidatePoints.Count == 0)
+                return false;
+            if (seedPoints == null || seedPoints.Count == 0)
+                return false;
+
+            foreach (var cp in candidatePoints)
+            {
+                foreach (var sp in seedPoints)
+                {
+                    if (Distance(cp, sp) <= tolerance)
+                        return true;
+                }
+            }
+
+            return false;
+        }
+
+        private static ObjectIdCollection ExpandGlobalContourByEndpointConnectivity(
+            Database db,
+            Transaction tr,
+            ObjectIdCollection baseModelSpaceIds,
+            ObjectIdCollection seedIds,
+            Bounds2D targetViewBounds,
+            Bounds2D seedUnion,
+            Bounds2D outerBand,
+            Bounds2D sheetBounds,
+            Bricscad.EditorInput.Editor? ed,
+            int? viewId)
+        {
+            var result = new ObjectIdCollection();
+
+            if (db == null)
+                throw new ArgumentNullException(nameof(db));
+            if (tr == null)
+                throw new ArgumentNullException(nameof(tr));
+            if (baseModelSpaceIds == null || baseModelSpaceIds.Count == 0)
+                return result;
+            if (seedIds == null || seedIds.Count == 0)
+                return result;
+
+            var acceptedHandles = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            var seedEndpoints = new List<Point2D>();
+
+            foreach (ObjectId id in seedIds)
+            {
+                if (!id.IsValid || id.IsErased)
+                    continue;
+
+                var ent = tr.GetObject(id, OpenMode.ForRead, false) as Entity;
+                if (ent == null)
+                    continue;
+
+                if (!IsCurveLikeEntity(ent))
+                    continue;
+
+                string key = id.Handle.ToString();
+                if (acceptedHandles.Add(key))
+                    result.Add(id);
+
+                seedEndpoints.AddRange(GetCurveRepresentativeEndpoints(ent));
+            }
+
+            if (seedEndpoints.Count == 0)
+                return result;
+
+            double endpointTol = Math.Max(6.0, Math.Min(targetViewBounds.Width, targetViewBounds.Height) * 0.06);
+            double expandX = Math.Max(24.0, targetViewBounds.Width * 0.18);
+            double expandY = Math.Max(24.0, targetViewBounds.Height * 0.18);
+
+            int addedCount = 0;
+            bool added;
+
+            do
+            {
+                added = false;
+
+                foreach (ObjectId id in baseModelSpaceIds)
+                {
+                    if (!id.IsValid || id.IsErased)
+                        continue;
+
+                    string key = id.Handle.ToString();
+                    if (acceptedHandles.Contains(key))
+                        continue;
+
+                    var ent = tr.GetObject(id, OpenMode.ForRead, false) as Entity;
+                    if (ent == null)
+                        continue;
+
+                    if (!IsCurveLikeEntity(ent))
+                        continue;
+
+                    if (!TryGetEntityBoundsSafe(ent, out var bounds) || bounds.IsEmpty)
+                        continue;
+
+                    if (IsCadEntityFrameLike(bounds, sheetBounds))
+                        continue;
+
+                    // targetView 주변이거나 outerBand와 닿는 것만 허용
+                    if (!Bounds2DHelper.Intersects(bounds, outerBand, tolerance: 0.0) &&
+                        !IsWithinExpandedBounds(bounds, targetViewBounds, expandX, expandY))
+                    {
+                        continue;
+                    }
+
+                    var candidateEndpoints = GetCurveRepresentativeEndpoints(ent);
+                    if (candidateEndpoints.Count == 0)
+                        continue;
+
+                    if (!IsNearAnyEndpoint(candidateEndpoints, seedEndpoints, endpointTol))
+                        continue;
+
+                    acceptedHandles.Add(key);
+                    result.Add(id);
+                    seedEndpoints.AddRange(candidateEndpoints);
+                    addedCount++;
+                    added = true;
+                }
+            }
+            while (added);
+
+            if (ed != null)
+            {
+                var tag = viewId.HasValue ? $"I:{viewId.Value}" : "I:?";
+                ed.WriteMessage(
+                    $"\n[FluxCAD] EndpointContourExpand {tag}, Seed={seedIds.Count}, Added={addedCount}, Final={result.Count}, EndpointTol={endpointTol:0.##}");
+            }
+
+            return result;
+        }
+
+
+
         private static ObjectIdCollection CollectRecoveredGlobalContourEntityIds(
     Database db,
     Transaction tr,
+    ObjectIdCollection baseModelSpaceIds,
     IReadOnlyList<SheetEntity> semanticEntities,
     Bounds2D targetViewBounds,
     Bounds2D sheetBounds,
@@ -2238,12 +3350,11 @@ namespace FluxCAD.BricsCAD.Plugin26
             if (outerBand.IsEmpty)
                 outerBand = searchBounds;
 
-            // ------------------------------------------------------------
             // 1) 후보를 넓게 수집
-            // ------------------------------------------------------------
             var candidates = CollectWideGlobalCurveCandidates(
                 db,
                 tr,
+                baseModelSpaceIds,
                 semanticEntities,
                 targetViewBounds,
                 sheetBounds,
@@ -2263,9 +3374,7 @@ namespace FluxCAD.BricsCAD.Plugin26
                 return result;
             }
 
-            // ------------------------------------------------------------
             // 2) cluster 구성
-            // ------------------------------------------------------------
             var clusters = BuildGlobalCurveClusters(
                 candidates,
                 targetViewBounds);
@@ -2281,10 +3390,8 @@ namespace FluxCAD.BricsCAD.Plugin26
                 return result;
             }
 
-            // ------------------------------------------------------------
             // 3) 상위 cluster 선택
-            // ------------------------------------------------------------
-            result = CollectTopScoredClusterEntityIds(
+            var selectedIds = CollectTopScoredClusterEntityIds(
                 clusters,
                 targetViewBounds,
                 outerBand,
@@ -2292,17 +3399,48 @@ namespace FluxCAD.BricsCAD.Plugin26
                 ed,
                 viewId);
 
+            if (selectedIds.Count == 0)
+            {
+                if (ed != null)
+                {
+                    var tag = viewId.HasValue ? $"I:{viewId.Value}" : "I:?";
+                    ed.WriteMessage(
+                        $"\n[FluxCAD] GlobalContourRecovery {tag}, Search={searchBounds}, SeedUnion={seedUnion}, OuterBand={outerBand}, Candidates={candidates.Count}, Clusters={clusters.Count}, Accepted=0");
+                }
+
+                return result;
+            }
+
+            // 4) endpoint connectivity 기반 외곽선 확장
+            var expandedIds = ExpandGlobalContourByEndpointConnectivity(
+                db,
+                tr,
+                baseModelSpaceIds,
+                selectedIds,
+                targetViewBounds,
+                seedUnion,
+                outerBand,
+                sheetBounds,
+                ed,
+                viewId);
+
+            result = expandedIds.Count > 0
+                ? expandedIds
+                : selectedIds;
+
             if (ed != null)
             {
                 var tag = viewId.HasValue ? $"I:{viewId.Value}" : "I:?";
                 ed.WriteMessage(
                     $"\n[FluxCAD] GlobalContourRecovery {tag}, " +
                     $"Search={searchBounds}, SeedUnion={seedUnion}, OuterBand={outerBand}, " +
-                    $"Candidates={candidates.Count}, Clusters={clusters.Count}, Accepted={result.Count}");
+                    $"Candidates={candidates.Count}, Clusters={clusters.Count}, Selected={selectedIds.Count}, Expanded={result.Count}");
             }
 
             return result;
         }
+
+
 
 
         private static bool IsOuterSideRelativeToSeedUnion(
@@ -2836,6 +3974,7 @@ namespace FluxCAD.BricsCAD.Plugin26
                 // 3) DB 전체 bounds 확보 (복사 배치용)
                 // ------------------------------------------------------------
                 Bounds2D modelBounds;
+                ObjectIdCollection baseModelSpaceIds;
 
                 using (doc.LockDocument())
                 using (var tr = db.TransactionManager.StartTransaction())
@@ -2843,8 +3982,11 @@ namespace FluxCAD.BricsCAD.Plugin26
                     var msId = SymbolUtilityServices.GetBlockModelSpaceId(db);
                     var ms = (BlockTableRecord)tr.GetObject(msId, OpenMode.ForRead);
                     modelBounds = GetModelSpaceBounds(ms, tr);
+                    baseModelSpaceIds = CaptureBaseModelSpaceEntityIds(db, tr);
                     tr.Commit();
                 }
+
+                ed.WriteMessage($"\n[FluxCAD] BaseModelSpaceCount={baseModelSpaceIds.Count}");
 
                 if (modelBounds.IsEmpty)
                 {
@@ -3113,16 +4255,70 @@ namespace FluxCAD.BricsCAD.Plugin26
                     using (doc.LockDocument())
                     using (var tr = db.TransactionManager.StartTransaction())
                     {
-                        var selection = ResolveCopySourceIdsForView(
+                        var selection = CollectBestSourceIdsForView(
                             db,
                             tr,
+                            baseModelSpaceIds,
                             work.SemanticEntities,
-                            work.SourceBounds,
+                            work.SourceBounds,   // 중요: work.View.Bounds 아님
                             sheetBounds,
                             ed,
                             work.View.IslandId);
 
                         sourceIds = selection.SourceIds;
+
+                        // ------------------------------------------------------------
+                        // 핵심 수정:
+                        // safe 모드에서는 global contour / loose contour를 절대 추가하지 않음
+                        // ------------------------------------------------------------
+                        bool isContainedSafe =
+     !string.IsNullOrWhiteSpace(selection.SelectionMode) &&
+     selection.SelectionMode.StartsWith("ContainedSafe:", StringComparison.OrdinalIgnoreCase);
+
+                        bool alreadyRecovered =
+                            !string.IsNullOrWhiteSpace(selection.SelectionMode) &&
+                            (
+                                selection.SelectionMode.StartsWith("GlobalContourRecovery:", StringComparison.OrdinalIgnoreCase) ||
+                                selection.SelectionMode.StartsWith("ExactSemanticSourceRecovery", StringComparison.OrdinalIgnoreCase) ||
+                                selection.SelectionMode.StartsWith("ExactPlusPrimaryRecovery", StringComparison.OrdinalIgnoreCase)
+                            );
+
+                        if (!isContainedSafe && !alreadyRecovered)
+                        {
+                            var globalContourIds = CollectRecoveredGlobalContourEntityIds(
+                                db,
+                                tr,
+                                baseModelSpaceIds,
+                                work.SemanticEntities,
+                                work.SourceBounds,
+                                sheetBounds,
+                                ed,
+                                work.View.IslandId);
+
+                            sourceIds = MergeObjectIds(sourceIds, globalContourIds);
+
+                            if (sourceIds.Count > 0)
+                            {
+                                var looseContourIds = CollectAdjacentLooseContourEntities(
+                                    db,
+                                    tr,
+                                    baseModelSpaceIds,
+                                    sourceIds,
+                                    work.SemanticEntities,
+                                    work.SourceBounds,
+                                    sheetBounds,
+                                    ed,
+                                    work.View.IslandId);
+
+                                sourceIds = MergeObjectIds(sourceIds, looseContourIds);
+                            }
+                        }
+                        else
+                        {
+                            ed.WriteMessage(
+                                $"\n[FluxCAD] SkipExtraContourRecovery I:{work.View.IslandId}, " +
+                                $"SelectionMode={selection.SelectionMode}, SourceIds={sourceIds.Count}");
+                        }
 
                         if (sourceIds.Count == 0)
                         {
@@ -3131,7 +4327,7 @@ namespace FluxCAD.BricsCAD.Plugin26
                             continue;
                         }
 
-                        var inspection = selection.Inspection ?? InspectAcceptedSourceIds(sourceIds, tr);
+                        var inspection = InspectAcceptedSourceIds(sourceIds, tr);
 
                         ed.WriteMessage(
                             $"\n[FluxCAD] Island={work.View.IslandId}, " +
@@ -3139,11 +4335,34 @@ namespace FluxCAD.BricsCAD.Plugin26
                             $"{inspection.DescribeTypes()}, " +
                             $"{inspection.DescribeStrategy()}");
 
-                        copiedCount = DeepCloneAndMoveTopLevelEntities(
-                            db,
-                            tr,
-                            sourceIds,
-                            new Vector3d(groupDx, groupDy, 0.0));
+
+                        var displacement = Matrix3d.Displacement(new Vector3d(groupDx, groupDy, 0.0));
+                        copiedCount = 0;
+
+                        // ------------------------------------------------------------
+                        // FLUX_COPY_TOPLEVEL_GEOMETRY_VIEWS_OUTSIDE 에서는
+                        // primitive line clip을 사용하지 않는다.
+                        // 선택된 sourceIds 전체를 그대로 복사한다.
+                        // ------------------------------------------------------------
+                        var msId = SymbolUtilityServices.GetBlockModelSpaceId(db);
+                        var mapping = new IdMapping();
+                        db.DeepCloneObjects(sourceIds, msId, mapping, false);
+
+                        var clonedTopLevelIds = CollectDirectClonedIds(sourceIds, mapping);
+                        foreach (var clonedId in clonedTopLevelIds)
+                        {
+                            var cloned = tr.GetObject(clonedId, OpenMode.ForWrite, false) as Entity;
+                            if (cloned == null)
+                                continue;
+
+                            cloned.TransformBy(displacement);
+                            copiedCount++;
+                        }
+
+                        ed.WriteMessage(
+                            $"\n[FluxCAD] PrimitiveClipDisabled I:{work.View.IslandId}, " +
+                            $"SelectionMode={selection.SelectionMode}, " +
+                            $"Reason=TopLevelCopyKeepsSelectedSourceIdsAsIs");
 
                         var labelPos = new Point2D(
                             work.SourceBounds.Center.X + groupDx,
@@ -3211,9 +4430,222 @@ namespace FluxCAD.BricsCAD.Plugin26
             }
         }
 
+//         private static ObjectIdCollection SemanticBackfillSourceIds(
+//     Database db,
+//     Transaction tr,
+//     ObjectIdCollection baseModelSpaceIds,
+//     IReadOnlyList<SheetEntity> semanticEntities,
+//     Bounds2D targetViewBounds,
+//     Bounds2D sheetBounds,
+//     ObjectIdCollection currentSourceIds,
+//     Bricscad.EditorInput.Editor? ed,
+//     int? viewId)
+//         {
+//             var merged = MergeObjectIds(new ObjectIdCollection(currentSourceIds), currentSourceIds);
+// 
+//             if (semanticEntities == null || semanticEntities.Count == 0)
+//                 return merged;
+// 
+//             var existing = new HashSet<ObjectId>(merged.Cast<ObjectId>());
+// 
+//             int geomSemanticCount = 0;
+//             int candidateChecked = 0;
+//             int added = 0;
+//             int skippedNonGeom = 0;
+//             int skippedFrame = 0;
+//             int skippedOutside = 0;
+// 
+//             foreach (var sem in semanticEntities)
+//             {
+//                 if (!IsSemanticGeometryCandidate(sem))
+//                 {
+//                     skippedNonGeom++;
+//                     continue;
+//                 }
+// 
+//                 geomSemanticCount++;
+// 
+//                 var semBounds = sem.Bounds;
+//                 if (semBounds.IsEmpty)
+//                     continue;
+// 
+//                 // semantic entity 주변만 탐색
+//                 var probe = ExpandBounds(
+//                     semBounds,
+//                     Math.Max(6.0, semBounds.Width * 0.15),
+//                     Math.Max(6.0, semBounds.Height * 0.15));
+// 
+//                 foreach (ObjectId id in baseModelSpaceIds)
+//                 {
+//                     if (!id.IsValid || id.IsErased || existing.Contains(id))
+//                         continue;
+// 
+//                     var ent = tr.GetObject(id, OpenMode.ForRead, false) as Entity;
+//                     if (ent == null)
+//                         continue;
+// 
+//                     if (!IsBackfillableCadEntity(ent))
+//                         continue;
+// 
+//                     if (!TryGetEntityBoundsSafe(ent, out var b) || b.IsEmpty)
+//                         continue;
+// 
+//                     candidateChecked++;
+// 
+//                     if (IsCadEntityFrameLike(b, sheetBounds))
+//                     {
+//                         skippedFrame++;
+//                         continue;
+//                     }
+// 
+//                     if (!Bounds2DHelper.Intersects(probe, b, tolerance: 0.0) &&
+//                         !Bounds2DHelper.Intersects(targetViewBounds, b, tolerance: 0.0))
+//                     {
+//                         skippedOutside++;
+//                         continue;
+//                     }
+// 
+//                     if (!IsEntityMatchedToSemanticSeed(ent, b, sem, semBounds))
+//                         continue;
+// 
+//                     merged.Add(id);
+//                     existing.Add(id);
+//                     added++;
+//                 }
+//             }
+// 
+//             if (ed != null)
+//             {
+//                 var tag = viewId.HasValue ? $"I:{viewId.Value}" : "I:?";
+//                 ed.WriteMessage(
+//                     $"\n[FluxCAD] SemanticBackfill {tag}, " +
+//                     $"SemanticGeom={geomSemanticCount}, Checked={candidateChecked}, Added={added}, " +
+//                     $"SkippedNonGeom={skippedNonGeom}, Frame={skippedFrame}, Outside={skippedOutside}, " +
+//                     $"Before={currentSourceIds.Count}, After={merged.Count}");
+//             }
+// 
+//             return merged;
+//         }
+
+        private static bool IsSemanticGeometryCandidate(SheetEntity e)
+        {
+            if (e == null)
+                return false;
+
+            if (e.Role != SheetEntityRole.Geometry &&
+                e.Role != SheetEntityRole.Unknown)
+            {
+                return false;
+            }
+
+            return e.Kind == SheetEntityKind.Line
+                || e.Kind == SheetEntityKind.Arc
+                || e.Kind == SheetEntityKind.Circle
+                || e.Kind == SheetEntityKind.Polyline
+                || e.Kind == SheetEntityKind.Ellipse;
+        }
+
+        private static bool IsBackfillableCadEntity(Entity ent)
+        {
+            return ent is Line
+                || ent is Arc
+                || ent is Circle
+                //|| ent is Polyline
+                || ent is Ellipse;
+        }
+// 
+//         private static bool IsEntityMatchedToSemanticSeed(
+//     Entity ent,
+//     Bounds2D entityBounds,
+//     SheetEntity sem,
+//     Bounds2D semBounds)
+//         {
+//             // 1) bounds 유사도
+//             double iou = ComputeIoU(entityBounds, semBounds);
+//             if (iou >= 0.55)
+//                 return true;
+// 
+//             // 2) 중심점 근접
+//             var dc = Distance(entityBounds.Center, semBounds.Center);
+//             double centerTol = Math.Max(8.0, Math.Min(semBounds.Width, semBounds.Height) * 0.35);
+//             if (dc <= centerTol)
+//                 return true;
+// 
+//             // 3) line/arc/polyline 계열이면 endpoint / sample point 근접
+//             if (ent is Curve curve)
+//             {
+//                 var semCenter = semBounds.Center;
+//                 int insideOrNear = 0;
+//                 int total = 0;
+// 
+//                 foreach (var p in SampleCurvePoints(curve, 7))
+//                 {
+//                     total++;
+//                     if (IsPointNearBounds(p, semBounds, 6.0))
+//                         insideOrNear++;
+//                 }
+// 
+//                 if (total > 0 && insideOrNear >= Math.Max(2, total / 2))
+//                     return true;
+//             }
+// 
+//             return false;
+//         }
+
+        private static double ComputeIoU(Bounds2D a, Bounds2D b)
+        {
+            if (a.IsEmpty || b.IsEmpty)
+                return 0.0;
+
+            double minX = Math.Max(a.MinX, b.MinX);
+            double minY = Math.Max(a.MinY, b.MinY);
+            double maxX = Math.Min(a.MaxX, b.MaxX);
+            double maxY = Math.Min(a.MaxY, b.MaxY);
+
+            double w = maxX - minX;
+            double h = maxY - minY;
+            if (w <= 0 || h <= 0)
+                return 0.0;
+
+            double inter = w * h;
+            double union = a.Area + b.Area - inter;
+            if (union <= 1e-9)
+                return 0.0;
+
+            return inter / union;
+        }
+
+        private static Bounds2D ExpandBounds(Bounds2D b, double ex, double ey)
+        {
+            if (b.IsEmpty)
+                return b;
+
+            return new Bounds2D(
+                b.MinX - ex,
+                b.MinY - ey,
+                b.MaxX + ex,
+                b.MaxY + ey);
+        }
+
+        private static bool IsPointNearBounds(Point3d p, Bounds2D b, double tol)
+        {
+            return p.X >= b.MinX - tol &&
+                   p.X <= b.MaxX + tol &&
+                   p.Y >= b.MinY - tol &&
+                   p.Y <= b.MaxY + tol;
+        }
+
+//         private static double Distance(Point2D a, Point2D b)
+//         {
+//             double dx = a.X - b.X;
+//             double dy = a.Y - b.Y;
+//             return Math.Sqrt(dx * dx + dy * dy);
+//         }
+
         private static ObjectIdCollection CollectAdjacentLooseContourEntities(
     Database db,
     Transaction tr,
+    ObjectIdCollection baseModelSpaceIds,
     ObjectIdCollection seedIds,
     IReadOnlyList<SheetEntity> semanticEntities,
     Bounds2D targetViewBounds,
@@ -3227,6 +4659,8 @@ namespace FluxCAD.BricsCAD.Plugin26
                 throw new ArgumentNullException(nameof(db));
             if (tr == null)
                 throw new ArgumentNullException(nameof(tr));
+            if (baseModelSpaceIds == null)
+                throw new ArgumentNullException(nameof(baseModelSpaceIds));
 
             if (seedIds == null || seedIds.Count == 0)
                 return result;
@@ -3277,16 +4711,13 @@ namespace FluxCAD.BricsCAD.Plugin26
                 seedSet.Add(id.Handle.ToString());
             }
 
-            var msId = SymbolUtilityServices.GetBlockModelSpaceId(db);
-            var ms = (BlockTableRecord)tr.GetObject(msId, OpenMode.ForRead);
-
             int accepted = 0;
             int rejectedOutsideExpanded = 0;
             int rejectedNonCurve = 0;
             int rejectedFar = 0;
             int rejectedOther = 0;
 
-            foreach (ObjectId id in ms)
+            foreach (ObjectId id in baseModelSpaceIds)
             {
                 if (!id.IsValid || id.IsErased)
                     continue;
@@ -3342,6 +4773,7 @@ namespace FluxCAD.BricsCAD.Plugin26
                 var tag = viewId.HasValue ? $"I:{viewId.Value}" : "I:?";
                 ed.WriteMessage(
                     $"\n[FluxCAD] LooseContour {tag}, Seed={seedIds.Count}, Added={accepted}, " +
+                    $"BaseModel={baseModelSpaceIds.Count}, " +
                     $"SeedUnion={seedUnion}, Expanded={expanded}, " +
                     $"OutsideExpanded={rejectedOutsideExpanded}, NonCurve={rejectedNonCurve}, " +
                     $"Far={rejectedFar}, RejectedOther={rejectedOther}");
@@ -3354,6 +4786,7 @@ namespace FluxCAD.BricsCAD.Plugin26
         private static SourceSelectionResult CollectContainedSafeSourceIdsForView(
     Database db,
     Transaction tr,
+    ObjectIdCollection baseModelSpaceIds,
     IReadOnlyList<SheetEntity> semanticEntities,
     Bounds2D targetViewBounds,
     Bounds2D sheetBounds,
@@ -3372,6 +4805,7 @@ namespace FluxCAD.BricsCAD.Plugin26
             var primary = CollectModelSpaceEntitiesForSemanticView(
                 db,
                 tr,
+                baseModelSpaceIds,
                 semanticEntities,
                 targetViewBounds,
                 sheetBounds,
@@ -3481,22 +4915,44 @@ namespace FluxCAD.BricsCAD.Plugin26
             if (semanticCount <= 0)
                 return false;
 
-            // 정상 문서 보호 우선:
-            // exact가 조금이라도 있고 primary 또는 handle이 살아 있으면
-            // 공격 경로로 보내지 않는다.
-            if (exactCount >= 1 && (primaryCount >= 1 || handleCount >= 1))
-                return true;
+            var exactRatio = semanticCount > 0 ? (double)exactCount / semanticCount : 0.0;
+            var primaryRatio = semanticCount > 0 ? (double)primaryCount / semanticCount : 0.0;
+            var handleRatio = semanticCount > 0 ? (double)handleCount / semanticCount : 0.0;
 
-            // semantic 규모가 크지 않고, primary/handle 중 하나라도 있으면
-            // 우선 contained-safe로 본다.
-            if (semanticCount <= 40 && (primaryCount >= 1 || handleCount >= 1))
-                return true;
+            // Mixed / GlobalLinePool은 절대 contained-safe로 보내지 않는다.
+            if (diagnosis != null &&
+                (diagnosis.DrawingType == DrawingType.Mixed ||
+                 diagnosis.DrawingType == DrawingType.GlobalLinePool))
+            {
+                return false;
+            }
 
+            // truly contained일 때만 보호
             if (diagnosis != null && diagnosis.DrawingType == DrawingType.Contained)
-                return true;
+            {
+                if (exactRatio >= 0.60)
+                    return true;
+
+                if (primaryRatio >= 0.75)
+                    return true;
+
+                if (handleRatio >= 0.75)
+                    return true;
+            }
+
+            // 작은 정상 문서 보호
+            if (semanticCount <= 40)
+            {
+                if (exactRatio >= 0.70 && (primaryCount >= 1 || handleCount >= 1))
+                    return true;
+
+                if (primaryRatio >= 0.85)
+                    return true;
+            }
 
             return false;
         }
+
 
         private static bool ShouldConsiderLooseContourEntity(Entity ent, Bounds2D sheetBounds)
         {
@@ -4163,6 +5619,7 @@ namespace FluxCAD.BricsCAD.Plugin26
         private static ObjectIdCollection CollectModelSpaceEntitiesForSemanticView(
     Database db,
     Transaction tr,
+    ObjectIdCollection baseModelSpaceIds,
     IReadOnlyList<SheetEntity> semanticEntities,
     Bounds2D targetViewBounds,
     Bounds2D sheetBounds,
@@ -4186,9 +5643,6 @@ namespace FluxCAD.BricsCAD.Plugin26
             if (semanticBounds.Count == 0)
                 return result;
 
-            var msId = SymbolUtilityServices.GetBlockModelSpaceId(db);
-            var ms = (BlockTableRecord)tr.GetObject(msId, OpenMode.ForRead);
-
             int totalModelSpace = 0;
             int skippedInvalidOrErased = 0;
             int skippedNullEntity = 0;
@@ -4208,7 +5662,7 @@ namespace FluxCAD.BricsCAD.Plugin26
             const double viewTolerance = 3.0;
             const double semanticTolerance = 3.0;
 
-            foreach (ObjectId id in ms)
+            foreach (ObjectId id in baseModelSpaceIds)
             {
                 totalModelSpace++;
 
