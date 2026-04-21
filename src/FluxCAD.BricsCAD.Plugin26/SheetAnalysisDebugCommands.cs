@@ -549,19 +549,93 @@ namespace FluxCAD.BricsCAD.Plugin26
                                 sheetBounds,
                                 ed,
                                 work.View.IslandId);
-
                             int copiedCount = 0;
+                            int deepClonedCount = 0;
+                            int recreatedCount = 0;
                             var displacement = Matrix3d.Displacement(new Vector3d(groupDx, groupDy, 0.0));
 
-                            foreach (var leaf in snapshotLeaves)
+                            var deepCloneLeaves = snapshotLeaves
+                                .Where(x => x != null && CanDeepCloneSnapshotLeafAsWorldEntity(x))
+                                .ToList();
+
+                            var recreateLeaves = snapshotLeaves
+                                .Where(x => x == null || !CanDeepCloneSnapshotLeafAsWorldEntity(x))
+                                .ToList();
+
+                            var sourceHandles = deepCloneLeaves
+                                .Select(x => x?.Handle)
+                                .Where(x => !string.IsNullOrWhiteSpace(x))
+                                .Cast<string>()
+                                .Distinct(StringComparer.OrdinalIgnoreCase)
+                                .ToList();
+
+                            var sourceIds = ResolveObjectIdsFromDirectHandles(db, tr, sourceHandles);
+                            var resolvedHandleSet = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                            foreach (ObjectId sourceId in sourceIds)
+                            {
+                                if (!sourceId.IsValid || sourceId.IsErased)
+                                    continue;
+
+                                try
+                                {
+                                    var obj = tr.GetObject(sourceId, OpenMode.ForRead, false) as DBObject;
+                                    if (obj == null)
+                                        continue;
+
+                                    resolvedHandleSet.Add(obj.Handle.ToString());
+                                }
+                                catch
+                                {
+                                }
+                            }
+
+                            if (sourceIds.Count > 0)
+                            {
+                                var mapping = new IdMapping();
+                                db.DeepCloneObjects(sourceIds, msId, mapping, false);
+
+                                var clonedTopLevelIds = CollectDirectClonedIds(sourceIds, mapping);
+                                foreach (var clonedId in clonedTopLevelIds)
+                                {
+                                    var cloned = tr.GetObject(clonedId, OpenMode.ForWrite, false) as Entity;
+                                    if (cloned == null)
+                                        continue;
+
+                                    cloned.TransformBy(displacement);
+                                    deepClonedCount++;
+                                    copiedCount++;
+                                }
+                            }
+
+                            foreach (var leaf in recreateLeaves)
                             {
                                 var ent = CreateCadEntityFromSnapshotLeaf(leaf, outLayer);
                                 if (ent == null)
                                     continue;
 
+                                ApplySnapshotVisualPropertiesFromSource(db, tr, ent, leaf, outLayer);
                                 ent.TransformBy(displacement);
                                 ms.AppendEntity(ent);
                                 tr.AddNewlyCreatedDBObject(ent, true);
+                                recreatedCount++;
+                                copiedCount++;
+                            }
+
+                            foreach (var leaf in deepCloneLeaves)
+                            {
+                                var handle = (leaf.Handle ?? string.Empty).Trim();
+                                if (string.IsNullOrWhiteSpace(handle) || resolvedHandleSet.Contains(handle))
+                                    continue;
+
+                                var ent = CreateCadEntityFromSnapshotLeaf(leaf, outLayer);
+                                if (ent == null)
+                                    continue;
+
+                                ApplySnapshotVisualPropertiesFromSource(db, tr, ent, leaf, outLayer);
+                                ent.TransformBy(displacement);
+                                ms.AppendEntity(ent);
+                                tr.AddNewlyCreatedDBObject(ent, true);
+                                recreatedCount++;
                                 copiedCount++;
                             }
 
@@ -587,6 +661,7 @@ namespace FluxCAD.BricsCAD.Plugin26
                                 $"\n[FluxCAD] SnapshotCopied View Island={view.IslandId}, " +
                                 $"Members=[{string.Join(",", work.MemberIslandIds)}], " +
                                 $"SnapshotLeaves={snapshotLeaves.Count}, Copied={copiedCount}, " +
+                                $"DeepCloned={deepClonedCount}, Recreated={recreatedCount}, " +
                                 $"SourceBounds={work.SourceBounds}, " +
                                 $"GroupOffset=({groupDx:0.##},{groupDy:0.##})");
                         }
@@ -617,6 +692,12 @@ namespace FluxCAD.BricsCAD.Plugin26
             if (semanticEntities == null || semanticEntities.Count == 0)
                 return result;
 
+            int rejectedNoRecoveredBounds = 0;
+            int rejectedOutside = 0;
+            int rejectedTooLarge = 0;
+            int deduped = 0;
+            var seenHandles = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
             foreach (var e in semanticEntities)
             {
                 if (e == null)
@@ -635,22 +716,158 @@ namespace FluxCAD.BricsCAD.Plugin26
                     e.Kind != SheetEntityKind.Ellipse)
                     continue;
 
-                if (e.Bounds.IsEmpty)
+                var candidate = CloneWithFallbackBounds(e);
+                if (candidate == null || candidate.Bounds.IsEmpty)
+                {
+                    rejectedNoRecoveredBounds++;
                     continue;
+                }
 
-                if (!Bounds2DHelper.Intersects(e.Bounds, viewBounds, tolerance: 0.0))
+                var entityBounds = candidate.Bounds;
+                if (!Bounds2DHelper.Intersects(entityBounds, viewBounds, tolerance: 0.0))
+                {
+                    rejectedOutside++;
                     continue;
+                }
 
-                result.Add(e);
+                if (!IsReasonableLocalEntityForView(viewBounds, entityBounds))
+                {
+                    rejectedTooLarge++;
+                    continue;
+                }
+
+                var handle = (candidate.Handle ?? string.Empty).Trim();
+                if (!string.IsNullOrWhiteSpace(handle) && !seenHandles.Add(handle))
+                {
+                    deduped++;
+                    continue;
+                }
+
+                result.Add(candidate);
             }
 
             ed?.WriteMessage(
-                $"\n[FluxCAD] SnapshotLeafCollect I:{viewId}, " +
-                $"View={viewBounds}, Accepted={result.Count}");
+                $"[FluxCAD] SnapshotLeafCollect I:{ viewId}, " +
+                $"View={viewBounds}, Accepted={result.Count}, " +
+                $"RejectedNoRecoveredBounds={rejectedNoRecoveredBounds}, " +
+                $"RejectedOutside={rejectedOutside}, RejectedTooLarge={rejectedTooLarge}, " +
+                $"Deduped={deduped}");
 
             return result;
         }
 
+
+        private static bool CanDeepCloneSnapshotLeafAsWorldEntity(SheetEntity? leaf)
+        {
+            if (leaf == null)
+                return false;
+
+            // block-expanded leaf를 그대로 DeepClone하면 block definition 내부 좌표로 복제될 수 있으므로
+            // direct/world entity로 볼 수 있는 경우에만 DeepClone 허용
+            return leaf.Depth <= 0;
+        }
+
+        private static void ApplySnapshotVisualPropertiesFromSource(
+            Database db,
+            Transaction tr,
+            Entity target,
+            SheetEntity source,
+            string outLayer)
+        {
+            if (target == null || source == null)
+                return;
+
+            try
+            {
+                var handleText = (source.Handle ?? string.Empty).Trim();
+                if (!string.IsNullOrWhiteSpace(handleText) &&
+                    TryGetObjectIdFromHandle(db, handleText, out var sourceId) &&
+                    sourceId.IsValid &&
+                    !sourceId.IsErased)
+                {
+                    var original = tr.GetObject(sourceId, OpenMode.ForRead, false) as Entity;
+                    if (original != null)
+                    {
+                        CopyEntityVisualProperties(original, target, outLayer);
+                        return;
+                    }
+                }
+            }
+            catch
+            {
+            }
+
+            if (!string.IsNullOrWhiteSpace(source.Layer))
+                target.Layer = source.Layer;
+            else if (!string.IsNullOrWhiteSpace(outLayer))
+                target.Layer = outLayer;
+        }
+
+        private static bool TryGetObjectIdFromHandle(
+    Database db,
+    string handleText,
+    out ObjectId objectId)
+        {
+            objectId = ObjectId.Null;
+
+            if (db == null)
+                return false;
+
+            if (string.IsNullOrWhiteSpace(handleText))
+                return false;
+
+            try
+            {
+                long rawHandleValue;
+                try
+                {
+                    rawHandleValue = Convert.ToInt64(handleText.Trim(), 16);
+                }
+                catch
+                {
+                    return false;
+                }
+
+                var handle = new Handle(rawHandleValue);
+                var id = db.GetObjectId(false, handle, 0);
+
+                if (!id.IsValid || id.IsErased)
+                    return false;
+
+                objectId = id;
+                return true;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        private static void CopyEntityVisualProperties(
+            Entity source,
+            Entity target,
+            string outLayer)
+        {
+            if (source == null || target == null)
+                return;
+
+            try
+            {
+                target.Layer = !string.IsNullOrWhiteSpace(source.Layer)
+                    ? source.Layer
+                    : outLayer;
+            }
+            catch
+            {
+            }
+
+            try { target.Linetype = source.Linetype; } catch { }
+            try { target.LinetypeScale = source.LinetypeScale; } catch { }
+            try { target.LineWeight = source.LineWeight; } catch { }
+            try { target.Color = source.Color; } catch { }
+            try { target.Transparency = source.Transparency; } catch { }
+            try { target.Material = source.Material; } catch { }
+        }
 
         private static Entity? CreateCadEntityFromSnapshotLeaf(
     SheetEntity e,
@@ -760,7 +977,9 @@ namespace FluxCAD.BricsCAD.Plugin26
             if (created == null)
                 return null;
 
-            created.Layer = outLayer;
+            created.Layer = !string.IsNullOrWhiteSpace(e.Layer)
+                ? e.Layer
+                : outLayer;
             return created;
         }
 
@@ -1145,7 +1364,7 @@ namespace FluxCAD.BricsCAD.Plugin26
                             work.View.IslandId);
 
                         sourceIds = selection.SourceIds;
-                        
+
 
                         if (sourceIds.Count == 0)
                         {
@@ -1348,7 +1567,7 @@ namespace FluxCAD.BricsCAD.Plugin26
             var inspection = InspectAcceptedSourceIds(result, tr);
 
             ed?.WriteMessage(
-                $"[FluxCAD] ForceRawCurveCollect I:{ viewId}, " +
+                $"[FluxCAD] ForceRawCurveCollect I:{viewId}, " +
                 $"View={targetViewBounds}, Probe={probeBounds}, " +
                 $"ModelSpace={totalModelSpace}, Accepted={accepted}, " +
                 $"InvalidOrErased={skippedInvalidOrErased}, NullEntity={skippedNullEntity}, " +
@@ -2528,7 +2747,7 @@ namespace FluxCAD.BricsCAD.Plugin26
             {
                 var tag = viewId.HasValue ? $"I:{viewId.Value}" : "I:?";
                 ed.WriteMessage(
-                    $"[FluxCAD] WideGlobalCurveCandidates { tag}, " +
+                    $"[FluxCAD] WideGlobalCurveCandidates {tag}, " +
                     $"TotalCurve={totalCurve}, Accepted={accepted}, " +
                     $"OutsideSearch={rejectedOutsideSearch}, Frame={rejectedFrame}, Huge={rejectedHuge}, Arrow={rejectedArrow}, TableLike={rejectedTableLike}");
             }
@@ -4176,15 +4395,15 @@ namespace FluxCAD.BricsCAD.Plugin26
                     }
                     break;
 
-//                 case Polyline pl:
-//                     if (pl.NumberOfVertices > 0)
-//                     {
-//                         var s = pl.GetPoint3dAt(0);
-//                         var e = pl.GetPoint3dAt(pl.NumberOfVertices - 1);
-//                         result.Add(new Point2D(s.X, s.Y));
-//                         result.Add(new Point2D(e.X, e.Y));
-//                     }
-//                     break;
+                //                 case Polyline pl:
+                //                     if (pl.NumberOfVertices > 0)
+                //                     {
+                //                         var s = pl.GetPoint3dAt(0);
+                //                         var e = pl.GetPoint3dAt(pl.NumberOfVertices - 1);
+                //                         result.Add(new Point2D(s.X, s.Y));
+                //                         result.Add(new Point2D(e.X, e.Y));
+                //                     }
+                //                     break;
 
                 case Polyline2d pl2:
                     {
@@ -4220,12 +4439,12 @@ namespace FluxCAD.BricsCAD.Plugin26
             return result;
         }
 
-//         private static double Distance(Point2D a, Point2D b)
-//         {
-//             double dx = a.X - b.X;
-//             double dy = a.Y - b.Y;
-//             return Math.Sqrt(dx * dx + dy * dy);
-//         }
+        //         private static double Distance(Point2D a, Point2D b)
+        //         {
+        //             double dx = a.X - b.X;
+        //             double dy = a.Y - b.Y;
+        //             return Math.Sqrt(dx * dx + dy * dy);
+        //         }
 
         private static bool IsWithinExpandedBounds(Bounds2D bounds, Bounds2D target, double expandX, double expandY)
         {
@@ -5503,102 +5722,102 @@ namespace FluxCAD.BricsCAD.Plugin26
             }
         }
 
-//         private static ObjectIdCollection SemanticBackfillSourceIds(
-//     Database db,
-//     Transaction tr,
-//     ObjectIdCollection baseModelSpaceIds,
-//     IReadOnlyList<SheetEntity> semanticEntities,
-//     Bounds2D targetViewBounds,
-//     Bounds2D sheetBounds,
-//     ObjectIdCollection currentSourceIds,
-//     Bricscad.EditorInput.Editor? ed,
-//     int? viewId)
-//         {
-//             var merged = MergeObjectIds(new ObjectIdCollection(currentSourceIds), currentSourceIds);
-// 
-//             if (semanticEntities == null || semanticEntities.Count == 0)
-//                 return merged;
-// 
-//             var existing = new HashSet<ObjectId>(merged.Cast<ObjectId>());
-// 
-//             int geomSemanticCount = 0;
-//             int candidateChecked = 0;
-//             int added = 0;
-//             int skippedNonGeom = 0;
-//             int skippedFrame = 0;
-//             int skippedOutside = 0;
-// 
-//             foreach (var sem in semanticEntities)
-//             {
-//                 if (!IsSemanticGeometryCandidate(sem))
-//                 {
-//                     skippedNonGeom++;
-//                     continue;
-//                 }
-// 
-//                 geomSemanticCount++;
-// 
-//                 var semBounds = sem.Bounds;
-//                 if (semBounds.IsEmpty)
-//                     continue;
-// 
-//                 // semantic entity 주변만 탐색
-//                 var probe = ExpandBounds(
-//                     semBounds,
-//                     Math.Max(6.0, semBounds.Width * 0.15),
-//                     Math.Max(6.0, semBounds.Height * 0.15));
-// 
-//                 foreach (ObjectId id in baseModelSpaceIds)
-//                 {
-//                     if (!id.IsValid || id.IsErased || existing.Contains(id))
-//                         continue;
-// 
-//                     var ent = tr.GetObject(id, OpenMode.ForRead, false) as Entity;
-//                     if (ent == null)
-//                         continue;
-// 
-//                     if (!IsBackfillableCadEntity(ent))
-//                         continue;
-// 
-//                     if (!TryGetEntityBoundsSafe(ent, out var b) || b.IsEmpty)
-//                         continue;
-// 
-//                     candidateChecked++;
-// 
-//                     if (IsCadEntityFrameLike(b, sheetBounds))
-//                     {
-//                         skippedFrame++;
-//                         continue;
-//                     }
-// 
-//                     if (!Bounds2DHelper.Intersects(probe, b, tolerance: 0.0) &&
-//                         !Bounds2DHelper.Intersects(targetViewBounds, b, tolerance: 0.0))
-//                     {
-//                         skippedOutside++;
-//                         continue;
-//                     }
-// 
-//                     if (!IsEntityMatchedToSemanticSeed(ent, b, sem, semBounds))
-//                         continue;
-// 
-//                     merged.Add(id);
-//                     existing.Add(id);
-//                     added++;
-//                 }
-//             }
-// 
-//             if (ed != null)
-//             {
-//                 var tag = viewId.HasValue ? $"I:{viewId.Value}" : "I:?";
-//                 ed.WriteMessage(
-//                     $"\n[FluxCAD] SemanticBackfill {tag}, " +
-//                     $"SemanticGeom={geomSemanticCount}, Checked={candidateChecked}, Added={added}, " +
-//                     $"SkippedNonGeom={skippedNonGeom}, Frame={skippedFrame}, Outside={skippedOutside}, " +
-//                     $"Before={currentSourceIds.Count}, After={merged.Count}");
-//             }
-// 
-//             return merged;
-//         }
+        //         private static ObjectIdCollection SemanticBackfillSourceIds(
+        //     Database db,
+        //     Transaction tr,
+        //     ObjectIdCollection baseModelSpaceIds,
+        //     IReadOnlyList<SheetEntity> semanticEntities,
+        //     Bounds2D targetViewBounds,
+        //     Bounds2D sheetBounds,
+        //     ObjectIdCollection currentSourceIds,
+        //     Bricscad.EditorInput.Editor? ed,
+        //     int? viewId)
+        //         {
+        //             var merged = MergeObjectIds(new ObjectIdCollection(currentSourceIds), currentSourceIds);
+        // 
+        //             if (semanticEntities == null || semanticEntities.Count == 0)
+        //                 return merged;
+        // 
+        //             var existing = new HashSet<ObjectId>(merged.Cast<ObjectId>());
+        // 
+        //             int geomSemanticCount = 0;
+        //             int candidateChecked = 0;
+        //             int added = 0;
+        //             int skippedNonGeom = 0;
+        //             int skippedFrame = 0;
+        //             int skippedOutside = 0;
+        // 
+        //             foreach (var sem in semanticEntities)
+        //             {
+        //                 if (!IsSemanticGeometryCandidate(sem))
+        //                 {
+        //                     skippedNonGeom++;
+        //                     continue;
+        //                 }
+        // 
+        //                 geomSemanticCount++;
+        // 
+        //                 var semBounds = sem.Bounds;
+        //                 if (semBounds.IsEmpty)
+        //                     continue;
+        // 
+        //                 // semantic entity 주변만 탐색
+        //                 var probe = ExpandBounds(
+        //                     semBounds,
+        //                     Math.Max(6.0, semBounds.Width * 0.15),
+        //                     Math.Max(6.0, semBounds.Height * 0.15));
+        // 
+        //                 foreach (ObjectId id in baseModelSpaceIds)
+        //                 {
+        //                     if (!id.IsValid || id.IsErased || existing.Contains(id))
+        //                         continue;
+        // 
+        //                     var ent = tr.GetObject(id, OpenMode.ForRead, false) as Entity;
+        //                     if (ent == null)
+        //                         continue;
+        // 
+        //                     if (!IsBackfillableCadEntity(ent))
+        //                         continue;
+        // 
+        //                     if (!TryGetEntityBoundsSafe(ent, out var b) || b.IsEmpty)
+        //                         continue;
+        // 
+        //                     candidateChecked++;
+        // 
+        //                     if (IsCadEntityFrameLike(b, sheetBounds))
+        //                     {
+        //                         skippedFrame++;
+        //                         continue;
+        //                     }
+        // 
+        //                     if (!Bounds2DHelper.Intersects(probe, b, tolerance: 0.0) &&
+        //                         !Bounds2DHelper.Intersects(targetViewBounds, b, tolerance: 0.0))
+        //                     {
+        //                         skippedOutside++;
+        //                         continue;
+        //                     }
+        // 
+        //                     if (!IsEntityMatchedToSemanticSeed(ent, b, sem, semBounds))
+        //                         continue;
+        // 
+        //                     merged.Add(id);
+        //                     existing.Add(id);
+        //                     added++;
+        //                 }
+        //             }
+        // 
+        //             if (ed != null)
+        //             {
+        //                 var tag = viewId.HasValue ? $"I:{viewId.Value}" : "I:?";
+        //                 ed.WriteMessage(
+        //                     $"\n[FluxCAD] SemanticBackfill {tag}, " +
+        //                     $"SemanticGeom={geomSemanticCount}, Checked={candidateChecked}, Added={added}, " +
+        //                     $"SkippedNonGeom={skippedNonGeom}, Frame={skippedFrame}, Outside={skippedOutside}, " +
+        //                     $"Before={currentSourceIds.Count}, After={merged.Count}");
+        //             }
+        // 
+        //             return merged;
+        //         }
 
         private static bool IsSemanticGeometryCandidate(SheetEntity e)
         {
@@ -5626,44 +5845,44 @@ namespace FluxCAD.BricsCAD.Plugin26
                 //|| ent is Polyline
                 || ent is Ellipse;
         }
-// 
-//         private static bool IsEntityMatchedToSemanticSeed(
-//     Entity ent,
-//     Bounds2D entityBounds,
-//     SheetEntity sem,
-//     Bounds2D semBounds)
-//         {
-//             // 1) bounds 유사도
-//             double iou = ComputeIoU(entityBounds, semBounds);
-//             if (iou >= 0.55)
-//                 return true;
-// 
-//             // 2) 중심점 근접
-//             var dc = Distance(entityBounds.Center, semBounds.Center);
-//             double centerTol = Math.Max(8.0, Math.Min(semBounds.Width, semBounds.Height) * 0.35);
-//             if (dc <= centerTol)
-//                 return true;
-// 
-//             // 3) line/arc/polyline 계열이면 endpoint / sample point 근접
-//             if (ent is Curve curve)
-//             {
-//                 var semCenter = semBounds.Center;
-//                 int insideOrNear = 0;
-//                 int total = 0;
-// 
-//                 foreach (var p in SampleCurvePoints(curve, 7))
-//                 {
-//                     total++;
-//                     if (IsPointNearBounds(p, semBounds, 6.0))
-//                         insideOrNear++;
-//                 }
-// 
-//                 if (total > 0 && insideOrNear >= Math.Max(2, total / 2))
-//                     return true;
-//             }
-// 
-//             return false;
-//         }
+        // 
+        //         private static bool IsEntityMatchedToSemanticSeed(
+        //     Entity ent,
+        //     Bounds2D entityBounds,
+        //     SheetEntity sem,
+        //     Bounds2D semBounds)
+        //         {
+        //             // 1) bounds 유사도
+        //             double iou = ComputeIoU(entityBounds, semBounds);
+        //             if (iou >= 0.55)
+        //                 return true;
+        // 
+        //             // 2) 중심점 근접
+        //             var dc = Distance(entityBounds.Center, semBounds.Center);
+        //             double centerTol = Math.Max(8.0, Math.Min(semBounds.Width, semBounds.Height) * 0.35);
+        //             if (dc <= centerTol)
+        //                 return true;
+        // 
+        //             // 3) line/arc/polyline 계열이면 endpoint / sample point 근접
+        //             if (ent is Curve curve)
+        //             {
+        //                 var semCenter = semBounds.Center;
+        //                 int insideOrNear = 0;
+        //                 int total = 0;
+        // 
+        //                 foreach (var p in SampleCurvePoints(curve, 7))
+        //                 {
+        //                     total++;
+        //                     if (IsPointNearBounds(p, semBounds, 6.0))
+        //                         insideOrNear++;
+        //                 }
+        // 
+        //                 if (total > 0 && insideOrNear >= Math.Max(2, total / 2))
+        //                     return true;
+        //             }
+        // 
+        //             return false;
+        //         }
 
         private static double ComputeIoU(Bounds2D a, Bounds2D b)
         {
@@ -5708,12 +5927,12 @@ namespace FluxCAD.BricsCAD.Plugin26
                    p.Y <= b.MaxY + tol;
         }
 
-//         private static double Distance(Point2D a, Point2D b)
-//         {
-//             double dx = a.X - b.X;
-//             double dy = a.Y - b.Y;
-//             return Math.Sqrt(dx * dx + dy * dy);
-//         }
+        //         private static double Distance(Point2D a, Point2D b)
+        //         {
+        //             double dx = a.X - b.X;
+        //             double dy = a.Y - b.Y;
+        //             return Math.Sqrt(dx * dx + dy * dy);
+        //         }
 
         private static ObjectIdCollection CollectAdjacentLooseContourEntities(
     Database db,
@@ -7893,7 +8112,7 @@ namespace FluxCAD.BricsCAD.Plugin26
                             clearLayerFirst: true);
 
 
-                        
+
 
                         tr.Commit();
                     }
