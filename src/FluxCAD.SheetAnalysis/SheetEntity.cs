@@ -42,41 +42,28 @@ namespace FluxCAD.SheetAnalysis
         // Stroke sampling용 최소 기하 정보
         // =========================
 
-        // Line
         public Point2D? StartPoint { get; set; }
         public Point2D? EndPoint { get; set; }
 
-        // Polyline / Spline fallback
         public IReadOnlyList<Point2D> Vertices { get; set; } = Array.Empty<Point2D>();
         public bool IsClosed { get; set; }
 
-        // Circle / Arc / Ellipse
         public Point2D? CenterPoint { get; set; }
         public double? Radius { get; set; }
 
-        // Arc
         public double? StartAngleDeg2D { get; set; }
         public double? EndAngleDeg2D { get; set; }
 
-        // Ellipse
         public double? MajorRadius { get; set; }
         public double? MinorRadius { get; set; }
 
-
-        // Line
-
-
-        // Circle
         public Point2D? Center { get; set; }
 
-        // Arc
         public double StartAngleDeg { get; set; }
         public double EndAngleDeg { get; set; }
 
-
         public double? EllipseRotationDeg2D { get; set; }
 
-        // 호환용 계산 속성
         public string EntityTypeName => EntityType ?? string.Empty;
         public Point2D RepresentativePoint => Anchor;
 
@@ -97,6 +84,29 @@ namespace FluxCAD.SheetAnalysis
         public bool IsOuterContourLikeLayer { get; set; }
 
         public bool IsLikelySemanticNoise { get; set; }
+
+        // =========================
+        // 이번 단계 추가
+        // =========================
+
+
+        public int? ColorIndex { get; set; }
+        public string? ColorName { get; set; }
+        public int? LineWeightValue { get; set; }
+
+        public bool IsFadedLike { get; set; }
+        public bool IsVisualHintCandidate { get; set; }
+        public bool ContainsOrEnclosesHatchLike { get; set; }
+
+        public double VisualHintScore { get; set; }
+        public double GeometryConfidenceScore { get; set; }
+
+        public string? RoleReason { get; set; }
+
+        // 엔티티 transparency 정보가 있으면 alpha/raw 값을 보관
+        public byte? TransparencyAlpha { get; set; }
+
+        public int? LineWeight { get; set; }
 
         public bool HasText =>
             !string.IsNullOrWhiteSpace(TextNormalized) ||

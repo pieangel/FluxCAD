@@ -29,6 +29,9 @@
         BlockContainer = 8,
 
         // 기타 주석성/보조성 엔티티
-        OtherAnnotation = 9
+        OtherAnnotation = 9,
+
+        // 형상처럼 보이지만 실제 형상 경계가 아닌 의도 표현용 곡선/영역
+        VisualHint = 10
     }
 }

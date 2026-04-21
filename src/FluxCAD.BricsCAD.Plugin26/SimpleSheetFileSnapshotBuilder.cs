@@ -245,11 +245,11 @@ namespace FluxCAD.BricsCAD.Plugin26
 
 
         private static SheetEntity? BuildContainerSheetEntity(
-             BlockReference sourceBr,
-             Transaction tr,
-             SnapshotExpansionContext parentContext,
-             string? currentBlockName,
-             IReadOnlyList<string> nextBlockPath)
+            BlockReference sourceBr,
+            Transaction tr,
+            SnapshotExpansionContext parentContext,
+            string? currentBlockName,
+            IReadOnlyList<string> nextBlockPath)
         {
             Entity? wcsEnt = null;
 
@@ -288,16 +288,21 @@ namespace FluxCAD.BricsCAD.Plugin26
                     Depth = parentContext.Depth,
                     SourceKind = ResolveBlockContainerSourceKind(),
                     SnapshotKey = BuildSnapshotKey(
-                    prefix: "C",
-                    handle: sourceBr.Handle.ToString(),
-                    depth: parentContext.Depth,
-                    entityType: sourceBr.GetType().Name,
-                    blockPath: nextBlockPath)
+                        prefix: "C",
+                        handle: sourceBr.Handle.ToString(),
+                        depth: parentContext.Depth,
+                        entityType: sourceBr.GetType().Name,
+                        blockPath: nextBlockPath)
                 };
 
                 PopulateLinetypeFields(entity, sourceBr, wcsEnt, tr);
+
+                // ✅ 기존에 정의되어 있지만 호출되지 않던 visual style 채움
+                FillVisualStyleFlags(sourceBr, entity);
+
                 PopulateSemanticFlags(entity);
                 PopulateGeometryFields(entity, wcsEnt);
+
                 return entity;
             }
             catch
@@ -312,9 +317,9 @@ namespace FluxCAD.BricsCAD.Plugin26
 
 
         private static SheetEntity? BuildLeafSheetEntity(
-    Entity sourceEnt,
-    Transaction tr,
-    SnapshotExpansionContext context)
+            Entity sourceEnt,
+            Transaction tr,
+            SnapshotExpansionContext context)
         {
             Entity? wcsEnt = null;
 
@@ -378,9 +383,20 @@ namespace FluxCAD.BricsCAD.Plugin26
                         blockPath: context.BlockPath)
                 };
 
+                // 기존 linetype / semantic / geometry 정보 채움
                 PopulateLinetypeFields(sheetEntity, sourceEnt, wcsEnt, tr);
+
+                // ✅ 추가: visual style 정보(color, transparency, faded 등) 채움
+                // sourceEnt 기준으로 원본 속성을 우선 반영
+                FillVisualStyleFlags(sourceEnt, sheetEntity); 
+
+                // 필요 시 WCS clone 쪽 정보로 보강하고 싶다면 아래를 유지할 수 있음.
+                // 현재는 sourceEnt 기준만 써도 충분합니다.
+                //FillVisualStyleFlags(wcsEnt, sheetEntity);
+
                 PopulateSemanticFlags(sheetEntity);
                 PopulateGeometryFields(sheetEntity, wcsEnt);
+
                 return sheetEntity;
             }
             catch
@@ -391,6 +407,57 @@ namespace FluxCAD.BricsCAD.Plugin26
             {
                 wcsEnt?.Dispose();
             }
+        }
+
+        private static void FillVisualStyleFlags(Entity ent, SheetEntity se)
+        {
+            try
+            {
+                se.ColorIndex = ent.ColorIndex;
+            }
+            catch
+            {
+                se.ColorIndex = null;
+            }
+
+            try
+            {
+                se.LineWeightValue = (int)ent.LineWeight;
+            }
+            catch
+            {
+                se.LineWeightValue = null;
+            }
+
+            try
+            {
+                se.TransparencyAlpha = ent.Transparency.Alpha;
+            }
+            catch
+            {
+                se.TransparencyAlpha = null;
+            }
+
+            string layer = (se.LayerNormalized ?? se.Layer ?? string.Empty).ToUpperInvariant();
+            string lt = (se.EffectiveLinetypeName ?? se.LinetypeName ?? string.Empty).ToUpperInvariant();
+
+            bool fadedByLayer =
+                layer.Contains("GUIDE") ||
+                layer.Contains("AUX") ||
+                layer.Contains("REFERENCE") ||
+                layer.Contains("REF") ||
+                layer.Contains("MARK") ||
+                layer.Contains("DEFPOINTS");
+
+            bool fadedByType =
+                lt.Contains("PHANTOM") ||
+                lt.Contains("DOT") ||
+                lt.Contains("DASH");
+
+            bool fadedByTransparency =
+                se.TransparencyAlpha.HasValue && se.TransparencyAlpha.Value > 0;
+
+            se.IsFadedLike = fadedByLayer || fadedByType || fadedByTransparency;
         }
 
         private static void PopulateSemanticFlags(SheetEntity target)
@@ -657,7 +724,10 @@ namespace FluxCAD.BricsCAD.Plugin26
         {
             return ent switch
             {
-                Line or Polyline or Arc or Circle or Ellipse or Hatch or Solid or Spline
+                Hatch
+                    => SheetEntityRole.HatchLike,
+
+                Line or Polyline or Arc or Circle or Ellipse or Solid or Spline
                     => SheetEntityRole.Geometry,
 
                 AttributeReference or DBText or MText
@@ -668,9 +738,6 @@ namespace FluxCAD.BricsCAD.Plugin26
 
                 Dimension
                     => SheetEntityRole.Dimension,
-
-//                 BlockReference
-//                     => SheetEntityRole.Unknown,
 
                 _ => SheetEntityRoleClassifier.Classify(ent.GetType().Name)
             };

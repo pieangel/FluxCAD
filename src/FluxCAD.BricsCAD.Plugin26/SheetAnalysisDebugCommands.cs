@@ -918,17 +918,64 @@ namespace FluxCAD.BricsCAD.Plugin26
                         tolerance: dynamicTolerance,
                         ed: ed);
 
-                    var filteredSemanticEntities = semanticEntities
-                        .Where(x => x != null)
-                        .Where(x => x.IsVisible)
-                        .Where(x => x.IsGeometryLike)
-                        .Where(x => !x.IsTextLike)
-                        .Where(x => !x.IsDimensionLike)
-                        .Where(x => !x.IsLikelySemanticNoise)
-                        .Where(x => !x.IsTableLikeLayer)
-                        .Where(x => !x.IsTitleLikeLayer)
-                        .Where(x => !IsSemanticFrameLikeEntity(x, sheetBounds))
-                        .ToList();
+                    var filteredSemanticEntities = new List<SheetEntity>();
+
+                    foreach (var candidate in semanticEntities)
+                    {
+                        if (candidate == null)
+                            continue;
+
+                        ed.WriteMessage(
+                            $"\n[SNAPSHOT-COPY-INPUT] H={candidate.Handle}, Role={candidate.Role}, " +
+                            $"ContainsHatch={candidate.ContainsOrEnclosesHatchLike}, " +
+                            $"HintScore={candidate.VisualHintScore}, Noise={candidate.IsLikelySemanticNoise}, " +
+                            $"Reason={candidate.RoleReason}");
+
+                        if (!candidate.IsVisible)
+                        {
+                            ed.WriteMessage($"\n[SNAPSHOT-COPY-REJECT] H={candidate.Handle}, Why=NotVisible");
+                            continue;
+                        }
+
+                        if (!candidate.IsGeometryLike)
+                        {
+                            ed.WriteMessage($"\n[SNAPSHOT-COPY-REJECT] H={candidate.Handle}, Why=NotGeometryLike");
+                            continue;
+                        }
+
+                        if (candidate.IsTextLike || candidate.IsDimensionLike)
+                        {
+                            ed.WriteMessage($"\n[SNAPSHOT-COPY-REJECT] H={candidate.Handle}, Why=TextOrDimension");
+                            continue;
+                        }
+
+                        if (candidate.IsLikelySemanticNoise)
+                        {
+                            ed.WriteMessage($"\n[SNAPSHOT-COPY-REJECT] H={candidate.Handle}, Why=SemanticNoise");
+                            continue;
+                        }
+
+                        if (candidate.IsTableLikeLayer)
+                        {
+                            ed.WriteMessage($"\n[SNAPSHOT-COPY-REJECT] H={candidate.Handle}, Why=TableLikeLayer");
+                            continue;
+                        }
+
+                        if (candidate.IsTitleLikeLayer)
+                        {
+                            ed.WriteMessage($"\n[SNAPSHOT-COPY-REJECT] H={candidate.Handle}, Why=TitleLikeLayer");
+                            continue;
+                        }
+
+                        if (IsSemanticFrameLikeEntity(candidate, sheetBounds))
+                        {
+                            ed.WriteMessage($"\n[SNAPSHOT-COPY-REJECT] H={candidate.Handle}, Why=SemanticFrameLike");
+                            continue;
+                        }
+
+                        ed.WriteMessage($"\n[SNAPSHOT-COPY-KEEP] H={candidate.Handle}");
+                        filteredSemanticEntities.Add(candidate);
+                    }
 
                     ed.WriteMessage(
                         $"\n[FluxCAD] SnapshotCopySemanticFilter I:{view.IslandId}, " +
@@ -1185,6 +1232,7 @@ namespace FluxCAD.BricsCAD.Plugin26
                 if (candidate == null || candidate.Bounds.IsEmpty)
                 {
                     rejectedNoRecoveredBounds++;
+                    LogSnapshotLeafCandidate(ed, viewId, e, viewBounds, "RejectedNoRecoveredBounds");
                     continue;
                 }
 
@@ -1192,12 +1240,14 @@ namespace FluxCAD.BricsCAD.Plugin26
                 if (!Bounds2DHelper.Intersects(entityBounds, viewBounds, tolerance: 0.0))
                 {
                     rejectedOutside++;
+                    LogSnapshotLeafCandidate(ed, viewId, candidate, viewBounds, "RejectedOutside");
                     continue;
                 }
 
                 if (!IsReasonableLocalEntityForView(viewBounds, entityBounds))
                 {
                     rejectedTooLarge++;
+                    LogSnapshotLeafCandidate(ed, viewId, candidate, viewBounds, "RejectedTooLarge");
                     continue;
                 }
 
@@ -1205,9 +1255,11 @@ namespace FluxCAD.BricsCAD.Plugin26
                 if (!string.IsNullOrWhiteSpace(handle) && !seenHandles.Add(handle))
                 {
                     deduped++;
+                    LogSnapshotLeafCandidate(ed, viewId, candidate, viewBounds, "Deduped");
                     continue;
                 }
 
+                LogSnapshotLeafCandidate(ed, viewId, candidate, viewBounds, "Accepted");
                 result.Add(candidate);
             }
 
@@ -15173,6 +15225,56 @@ namespace FluxCAD.BricsCAD.Plugin26
             return candidateListBeforeResolve;
         }
 
+        private static void FillVisualStyleFlags(Entity ent, SheetEntity se)
+        {
+            try
+            {
+                se.ColorIndex = ent.ColorIndex;
+            }
+            catch
+            {
+                se.ColorIndex = null;
+            }
+
+            try
+            {
+                se.LineWeightValue = (int)ent.LineWeight;
+            }
+            catch
+            {
+                se.LineWeightValue = null;
+            }
+
+            try
+            {
+                se.TransparencyAlpha = ent.Transparency.Alpha;
+            }
+            catch
+            {
+                se.TransparencyAlpha = null;
+            }
+
+            string layer = (se.LayerNormalized ?? se.Layer ?? string.Empty).ToUpperInvariant();
+            string lt = (se.EffectiveLinetypeName ?? se.LinetypeName ?? string.Empty).ToUpperInvariant();
+
+            bool fadedByLayer =
+                layer.Contains("GUIDE") ||
+                layer.Contains("AUX") ||
+                layer.Contains("REFERENCE") ||
+                layer.Contains("REF") ||
+                layer.Contains("MARK") ||
+                layer.Contains("DEFPOINTS");
+
+            bool fadedByType =
+                lt.Contains("PHANTOM") ||
+                lt.Contains("DOT") ||
+                lt.Contains("DASH");
+
+            bool fadedByTransparency =
+                se.TransparencyAlpha.HasValue && se.TransparencyAlpha.Value > 0;
+
+            se.IsFadedLike = fadedByLayer || fadedByType || fadedByTransparency;
+        }
 
         private static List<ViewIslandSemanticResult> RebuildSemanticResultsWithReassignedRoles(
     IReadOnlyList<ViewIslandSemanticResult> semanticResults,
@@ -15203,6 +15305,56 @@ namespace FluxCAD.BricsCAD.Plugin26
                     island,
                     tolerance: dynamicTolerance,
                     ed: ed);
+
+                // ============================================================
+                // [PATCH] VisualHint 분석 단계
+                // - 희미한 타원 + 내부 해치 → VisualHint로 전환
+                // ============================================================
+
+                // 1. 해치 포함 관계 마킹
+                MarkVisualHintEnvelopeRelations(semanticEntities);
+                DumpIslandHatchPolylineDebug(ed, island.Id, semanticEntities, "AfterMarkVisualHintEnvelopeRelations");
+
+                // 2. visual score 계산
+                foreach (var e in semanticEntities)
+                {
+                    ComputeVisualIntentScores(e);
+                }
+                DumpIslandHatchPolylineDebug(ed, island.Id, semanticEntities, "AfterComputeVisualIntentScores");
+
+                // 3. role 재할당
+                foreach (var e in semanticEntities)
+                {
+                    if (e == null)
+                        continue;
+
+                    bool participatesInGeometryLoop = EstimateParticipatesInGeometryLoop(
+                        e,
+                        island.Bounds);
+
+                    var oldRole = e.Role;
+
+                    var newRole = ReassignRoleWithVisualIntent(
+                        e,
+                        island.Bounds,
+                        participatesInGeometryLoop);
+
+                    e.Role = newRole;
+
+                    if (newRole == SheetEntityRole.VisualHint)
+                    {
+                        e.IsLikelySemanticNoise = true;
+                    }
+
+                    ed.WriteMessage(
+                        $"\n[VisualHint] H={e.Handle}, Type={e.EntityType}, " +
+                        $"OldRole={oldRole}, NewRole={newRole}, " +
+                        $"Faded={e.IsFadedLike}, ContainsHatch={e.ContainsOrEnclosesHatchLike}, " +
+                        $"HintScore={e.VisualHintScore:0.##}, GeoScore={e.GeometryConfidenceScore:0.##}, " +
+                        $"Reason={e.RoleReason}");
+                }
+
+                DumpIslandHatchPolylineDebug(ed, island.Id, semanticEntities, "AfterRoleReassign");
 
                 var reassignedRole = DetermineIslandSemanticRoleFromContext(
                     island,
@@ -15245,6 +15397,55 @@ namespace FluxCAD.BricsCAD.Plugin26
 
             return rebuilt;
         }
+
+
+        private static bool IsEllipseLikePolyline(SheetEntity e)
+        {
+            if (e == null)
+                return false;
+
+            if (e.Kind != SheetEntityKind.Polyline)
+                return false;
+
+            if (!e.IsClosed)
+                return false;
+
+            var verts = e.Vertices;
+            if (verts == null || verts.Count < 8)
+                return false; // 너무 적으면 타원 아님
+
+            // bounding box 비율
+            var bounds = e.Bounds;
+            if (bounds.IsEmpty)
+                return false;
+
+            double ratio = bounds.Width / Math.Max(bounds.Height, 1e-6);
+            if (ratio < 0.3 || ratio > 3.0)
+                return false;
+
+            // 중심 근사
+            var center = bounds.Center;
+
+            // 각 점이 center에서 비슷한 거리인지 체크
+            double avgDist = 0.0;
+            foreach (var v in verts)
+                avgDist += Distance(v, center);
+
+            avgDist /= verts.Count;
+
+            double variance = 0.0;
+            foreach (var v in verts)
+            {
+                double d = Distance(v, center);
+                variance += Math.Abs(d - avgDist);
+            }
+
+            variance /= verts.Count;
+
+            // 분산이 작으면 "원형/타원형"
+            return variance < avgDist * 0.15;
+        }
+
 
         private static bool LooksLikeCenterEvidence(SheetEntity entity)
         {
@@ -19334,6 +19535,407 @@ namespace FluxCAD.BricsCAD.Plugin26
                 ed.WriteMessage($"\n{ex.StackTrace}");
             }
         }
+
+        private static void FillVisualStyleFlags_old(Entity ent, SheetEntity se)
+        {
+            try
+            {
+                se.ColorIndex = ent.ColorIndex;
+            }
+            catch
+            {
+                se.ColorIndex = null;
+            }
+
+            try
+            {
+                se.LineWeight = (int)ent.LineWeight;
+            }
+            catch
+            {
+                se.LineWeight = null;
+            }
+
+            try
+            {
+                se.TransparencyAlpha = ent.Transparency.Alpha;
+            }
+            catch
+            {
+                se.TransparencyAlpha = null;
+            }
+
+            string layer = (se.LayerNormalized ?? se.Layer ?? string.Empty).ToUpperInvariant();
+            string lt = (se.EffectiveLinetypeName ?? se.LinetypeName ?? string.Empty).ToUpperInvariant();
+
+            bool fadedByLayer =
+                layer.Contains("GUIDE") ||
+                layer.Contains("AUX") ||
+                layer.Contains("REFERENCE") ||
+                layer.Contains("REF") ||
+                layer.Contains("MARK") ||
+                layer.Contains("DEFPOINTS");
+
+            bool fadedByType =
+                lt.Contains("PHANTOM") ||
+                lt.Contains("DOT") ||
+                lt.Contains("DASH");
+
+            bool fadedByTransparency =
+                se.TransparencyAlpha.HasValue && se.TransparencyAlpha.Value > 0;
+
+            se.IsFadedLike = fadedByLayer || fadedByType || fadedByTransparency;
+        }
+
+        private static bool IsEllipseLike(SheetEntity e)
+        {
+            if (e == null)
+                return false;
+
+            return
+                e.Kind == SheetEntityKind.Ellipse ||
+                e.Kind == SheetEntityKind.Circle ||
+                IsEllipseLikePolyline(e) ||   // 🔥 추가
+                string.Equals(e.EntityType, "ELLIPSE", StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(e.EntityType, "CIRCLE", StringComparison.OrdinalIgnoreCase);
+        }
+
+        private static void DumpIslandHatchPolylineDebug(
+    Bricscad.EditorInput.Editor? ed,
+    int islandId,
+    IReadOnlyList<SheetEntity> entities,
+    string stage)
+        {
+            if (ed == null || entities == null || entities.Count == 0)
+                return;
+
+            ed.WriteMessage($"\n================ HATCH/POLYLINE DEBUG I:{islandId} Stage={stage} ================");
+
+            var hatchLikes = entities
+                .Where(x => x != null && x.Role == SheetEntityRole.HatchLike)
+                .OrderBy(x => x.Handle)
+                .ToList();
+
+            var polylines = entities
+                .Where(x => x != null && x.Kind == SheetEntityKind.Polyline)
+                .OrderBy(x => x.Handle)
+                .ToList();
+
+            ed.WriteMessage($"\n[HATCH/POLYLINE] HatchLikes={hatchLikes.Count}, Polylines={polylines.Count}");
+
+            foreach (var h in hatchLikes)
+            {
+                ed.WriteMessage(
+                    $"\n[HATCH-DEBUG] " +
+                    $"I={islandId}, H={SafeDbg(h.Handle)}, Type={SafeDbg(h.EntityType)}, Role={h.Role}, " +
+                    $"Color={h.ColorIndex}, Faded={h.IsFadedLike}, Layer={SafeDbg(h.Layer)}, Lt={SafeDbg(h.EffectiveLinetypeName ?? h.LinetypeName)}, " +
+                    $"Bounds={h.Bounds}, Visible={h.IsVisible}, GeometryLike={h.IsGeometryLike}, " +
+                    $"TextLike={h.IsTextLike}, DimLike={h.IsDimensionLike}, Noise={h.IsLikelySemanticNoise}");
+            }
+
+            foreach (var p in polylines)
+            {
+                var enclosedHatches = hatchLikes
+                    .Where(h => h != null &&
+                                !p.Bounds.IsEmpty &&
+                                !h.Bounds.IsEmpty &&
+                                Bounds2DHelper.Contains(p.Bounds, h.Bounds, tolerance: 1.0))
+                    .Select(h => h.Handle)
+                    .Where(x => !string.IsNullOrWhiteSpace(x))
+                    .ToList();
+
+                ed.WriteMessage(
+                    $"\n[POLYLINE-DEBUG] " +
+                    $"I={islandId}, H={SafeDbg(p.Handle)}, Type={SafeDbg(p.EntityType)}, Role={p.Role}, " +
+                    $"Color={p.ColorIndex}, Faded={p.IsFadedLike}, Layer={SafeDbg(p.Layer)}, Lt={SafeDbg(p.EffectiveLinetypeName ?? p.LinetypeName)}, " +
+                    $"Bounds={p.Bounds}, IsClosed={p.IsClosed}, Vertices={p.Vertices?.Count ?? 0}, " +
+                    $"EllipseLike={IsEllipseLikePolyline(p)}, " +
+                    $"Faded={p.IsFadedLike}, ContainsHatch={p.ContainsOrEnclosesHatchLike}, " +
+                    $"HintScore={p.VisualHintScore:0.##}, GeoScore={p.GeometryConfidenceScore:0.##}, " +
+                    $"Noise={p.IsLikelySemanticNoise}, " +
+                    $"EnclosedHatches=[{string.Join(",", enclosedHatches)}], " +
+                    $"Reason={SafeDbg(p.RoleReason)}");
+            }
+
+            ed.WriteMessage($"\n==========================================================================");
+        }
+
+        private static void LogSnapshotLeafCandidate(
+            Bricscad.EditorInput.Editor? ed,
+            int? viewId,
+            SheetEntity? e,
+            Bounds2D viewBounds,
+            string stage)
+        {
+            if (ed == null || e == null)
+                return;
+
+            ed.WriteMessage(
+                $"\n[SNAPSHOT-LEAF] " +
+                $"I={viewId}, Stage={stage}, " +
+                $"H={SafeDbg(e.Handle)}, Type={SafeDbg(e.EntityType)}, Kind={e.Kind}, Role={e.Role}, " +
+                $"Color={e.ColorIndex}, Layer={SafeDbg(e.Layer)}, Lt={SafeDbg(e.EffectiveLinetypeName ?? e.LinetypeName)}, " +
+                $"Bounds={e.Bounds}, View={viewBounds}, " +
+                $"IsClosed={e.IsClosed}, Vertices={e.Vertices?.Count ?? 0}, " +
+                $"EllipseLike={IsEllipseLikePolyline(e)}, " +
+                $"Faded={e.IsFadedLike}, ContainsHatch={e.ContainsOrEnclosesHatchLike}, " +
+                $"HintScore={e.VisualHintScore:0.##}, GeoScore={e.GeometryConfidenceScore:0.##}, " +
+                $"Noise={e.IsLikelySemanticNoise}, Reason={SafeDbg(e.RoleReason)}");
+        }
+
+        private static string SafeDbg(string? value)
+        {
+            return string.IsNullOrWhiteSpace(value) ? "-" : value.Trim();
+        }
+
+
+        private static bool EstimateParticipatesInGeometryLoop(
+            SheetEntity e,
+            Bounds2D targetViewBounds)
+        {
+            if (e == null)
+                return false;
+
+            if (e.Role == SheetEntityRole.ReferenceGeometry)
+                return false;
+
+            if (e.IsCenterLine || e.IsHiddenLine)
+                return false;
+
+            if (e.Role == SheetEntityRole.HatchLike)
+                return false;
+
+            if (!e.IsGeometryLike)
+                return false;
+
+            if (e.Bounds.IsEmpty || targetViewBounds.IsEmpty)
+                return false;
+
+            if (!Bounds2DHelper.Intersects(e.Bounds, targetViewBounds, tolerance: 0.0))
+                return false;
+
+            // visual hint 후보는 geometry loop에서 먼저 제외
+            if (e.IsVisualHintCandidate)
+                return false;
+
+            // 해치를 감싼 닫힌 polyline은 geometry loop로 보지 않음
+            if (e.Kind == SheetEntityKind.Polyline &&
+                e.IsClosed &&
+                e.ContainsOrEnclosesHatchLike)
+                return false;
+
+            // 타원/원 전체 윤곽은 신중하게 본다
+            if (IsEllipseLike(e) && e.IsFadedLike)
+                return false;
+
+            return true;
+        }
+
+        private static void MarkVisualHintEnvelopeRelations(
+    IReadOnlyList<SheetEntity> entities)
+        {
+            if (entities == null || entities.Count == 0)
+                return;
+
+            var hatchLikes = entities
+                .Where(x => x != null && x.Role == SheetEntityRole.HatchLike && !x.Bounds.IsEmpty)
+                .ToList();
+
+            if (hatchLikes.Count == 0)
+                return;
+
+            foreach (var e in entities)
+            {
+                if (e == null)
+                    continue;
+
+                bool isEnvelopeCandidate =
+                    IsEllipseLike(e) ||
+                    (e.Kind == SheetEntityKind.Polyline && e.IsClosed);
+
+                if (!isEnvelopeCandidate)
+                    continue;
+
+                if (!e.IsGeometryLike)
+                    continue;
+
+                if (e.Bounds.IsEmpty)
+                    continue;
+
+                bool containsAnyHatch = hatchLikes.Any(h =>
+                    h != null &&
+                    !h.Bounds.IsEmpty &&
+                    Bounds2DHelper.Contains(e.Bounds, h.Bounds, tolerance: 1.0));
+
+                if (containsAnyHatch)
+                {
+                    e.ContainsOrEnclosesHatchLike = true;
+                    e.IsVisualHintCandidate = true;
+
+                    if (string.IsNullOrWhiteSpace(e.RoleReason))
+                        e.RoleReason = "Closed envelope contains hatch-like evidence";
+                }
+            }
+        }
+
+        private static void ComputeVisualIntentScores(SheetEntity e)
+        {
+            double hint = 0.0;
+            double geo = 0.0;
+
+            if (e.IsCenterLine || e.IsHiddenLine)
+                geo += 3.0;
+
+            if (e.IsOuterContourLikeLayer)
+                geo += 2.0;
+
+            if (e.IsFadedLike)
+                hint += 2.5;
+
+            if (e.ContainsOrEnclosesHatchLike)
+                hint += 2.0;
+
+            if (IsEllipseLike(e))
+                hint += 1.0;
+
+            if (e.Role == SheetEntityRole.HatchLike)
+                hint += 1.5;
+
+            if (e.IsCenterLine || e.IsHiddenLine)
+                hint -= 1.0;
+
+            e.VisualHintScore = hint;
+            e.GeometryConfidenceScore = geo;
+            e.IsVisualHintCandidate = hint >= 3.0 && hint > geo;
+        }
+
+
+        private static SheetEntityRole ReassignRoleWithVisualIntent(
+    SheetEntity e,
+    Bounds2D targetViewBounds,
+    bool participatesInGeometryLoop)
+        {
+            if (e == null)
+                return SheetEntityRole.Unknown;
+
+            // 강한 역할은 우선 보존
+            if (e.Role == SheetEntityRole.Text ||
+                e.Role == SheetEntityRole.Dimension ||
+                e.Role == SheetEntityRole.Leader ||
+                e.Role == SheetEntityRole.Symbol ||
+                e.Role == SheetEntityRole.BlockContainer)
+            {
+                e.RoleReason = "Preserve strong non-geometry role";
+                return e.Role;
+            }
+
+            if (e.Role == SheetEntityRole.HatchLike)
+            {
+                e.RoleReason = "Preserve hatch-like role";
+                return SheetEntityRole.HatchLike;
+            }
+
+            if (e.IsCenterLine || e.IsHiddenLine)
+            {
+                e.RoleReason = "Reference geometry due to center/hidden evidence";
+                return SheetEntityRole.ReferenceGeometry;
+            }
+
+            if (participatesInGeometryLoop)
+            {
+                e.RoleReason = "Geometry candidate participates in target view geometry region";
+                return SheetEntityRole.Geometry;
+            }
+
+            bool isClosedEnvelopeCandidate =
+                IsEllipseLike(e) ||
+                (e.Kind == SheetEntityKind.Polyline && e.IsClosed);
+
+            if (e.ContainsOrEnclosesHatchLike &&
+                isClosedEnvelopeCandidate)
+            {
+                e.IsVisualHintCandidate = true;
+                e.RoleReason = "Closed envelope containing hatch-like region";
+                return SheetEntityRole.VisualHint;
+            }
+
+            if (e.IsVisualHintCandidate &&
+                IsEllipseLike(e) &&
+                !targetViewBounds.IsEmpty &&
+                e.Bounds.Area >= targetViewBounds.Area * 0.75)
+            {
+                e.RoleReason = "VisualHint: large faded ellipse-like envelope";
+                return SheetEntityRole.VisualHint;
+            }
+
+            if (e.IsVisualHintCandidate && IsEllipseLike(e))
+            {
+                e.RoleReason = "VisualHint: faded ellipse-like non-loop geometry";
+                return SheetEntityRole.VisualHint;
+            }
+
+            e.RoleReason = "Keep existing role";
+            return e.Role;
+        }
+
+
+        private static void LogVisualHintDecision(
+    Bricscad.EditorInput.Editor? ed,
+    SheetEntity e)
+        {
+            if (ed == null || e == null)
+                return;
+
+            ed.WriteMessage(
+                $"\n[VisualHint] H={e.Handle}, Type={e.EntityType}, Role={e.Role}, " +
+                $"Layer={e.Layer}, Lt={e.EffectiveLinetypeName ?? e.LinetypeName}, " +
+                $"Color={e.ColorIndex}, Alpha={e.TransparencyAlpha}, LW={e.LineWeightValue}, " +
+                $"Faded={e.IsFadedLike}, ContainsHatch={e.ContainsOrEnclosesHatchLike}, " +
+                $"HintScore={e.VisualHintScore:0.##}, GeoScore={e.GeometryConfidenceScore:0.##}, " +
+                $"Reason={e.RoleReason}");
+        }
+
+        private static bool ShouldCopyForGeometryExport(SheetEntity e)
+        {
+            if (e == null)
+                return false;
+
+            switch (e.Role)
+            {
+                case SheetEntityRole.Geometry:
+                case SheetEntityRole.ReferenceGeometry:
+                    return true;
+
+                case SheetEntityRole.VisualHint:
+                case SheetEntityRole.HatchLike:
+                case SheetEntityRole.Text:
+                case SheetEntityRole.Dimension:
+                case SheetEntityRole.Leader:
+                case SheetEntityRole.Symbol:
+                case SheetEntityRole.OtherAnnotation:
+                case SheetEntityRole.BlockContainer:
+                default:
+                    return false;
+            }
+        }
+
+        private static void LogVisualHintDecision_old(
+    Bricscad.EditorInput.Editor? ed,
+    SheetEntity e)
+        {
+            if (ed == null || e == null)
+                return;
+
+            ed.WriteMessage(
+                $"\n[VisualHint] H={e.Handle}, Type={e.EntityType}, Role={e.Role}, " +
+                $"Layer={e.Layer}, Lt={e.EffectiveLinetypeName ?? e.LinetypeName}, " +
+                $"Color={e.ColorIndex}, Alpha={e.TransparencyAlpha}, LW={e.LineWeight}, " +
+                $"Faded={e.IsFadedLike}, ContainsHatch={e.ContainsOrEnclosesHatchLike}, " +
+                $"HintScore={e.VisualHintScore:0.##}, GeoScore={e.GeometryConfidenceScore:0.##}, " +
+                $"Reason={e.RoleReason}");
+        }
+
+
 
         private static string GetEntityTypeName(SheetEntity e)
         {
