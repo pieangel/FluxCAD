@@ -292,6 +292,66 @@ namespace FluxCAD.BricsCAD.Plugin26
         }
 
 
+        private sealed class DetailedViewEntityMembershipResult
+        {
+            public int TotalModelSpaceCount { get; set; }
+            public int CurveLikeCount { get; set; }
+            public int BoundsOkCount { get; set; }
+            public int IntersectAnyViewCount { get; set; }
+
+            public Dictionary<int, List<DetailedViewEntityMembershipHit>> HitsByViewId { get; set; }
+                = new Dictionary<int, List<DetailedViewEntityMembershipHit>>();
+        }
+
+        private sealed class DetailedViewEntityMembershipHit
+        {
+            public int ViewId { get; set; }
+            public ObjectId EntityId { get; set; }
+            public string Handle { get; set; } = "";
+            public string EntityType { get; set; } = "";
+            public string Layer { get; set; } = "";
+            public string Linetype { get; set; } = "";
+            public short ColorIndex { get; set; }
+
+            public Bounds2D EntityBounds { get; set; }
+            public bool IsFullyInside { get; set; }
+            public bool CenterInside { get; set; }
+
+            public double Width => EntityBounds.IsEmpty ? 0.0 : EntityBounds.Width;
+            public double Height => EntityBounds.IsEmpty ? 0.0 : EntityBounds.Height;
+            public double Area => EntityBounds.IsEmpty ? 0.0 : EntityBounds.Area;
+        }
+
+        private sealed class ViewGraphBoundsProbeHit
+        {
+            public int ViewId { get; init; }
+            public ObjectId EntityId { get; init; }
+            public string Handle { get; init; } = string.Empty;
+            public string EntityType { get; init; } = string.Empty;
+            public Bounds2D EntityBounds { get; init; } = Bounds2D.Empty;
+            public bool IsFullyInside { get; init; }
+            public bool CenterInside { get; init; }
+
+            public string? Layer { get; set; }
+            public string? BlockName { get; set; }
+            public IReadOnlyList<string>? BlockPath { get; set; }
+            public int Depth { get; set; }
+            public string? SourceKind { get; set; }
+            public string BlockPathText { get; init; } = string.Empty;
+        }
+
+        private sealed class ViewGraphBoundsProbeResult
+        {
+            public int TotalModelSpaceCount { get; init; }
+            public int CurveLikeCount { get; init; }
+            public int BoundsOkCount { get; init; }
+            public int IntersectAnyViewCount { get; init; }
+
+            public Dictionary<int, List<ViewGraphBoundsProbeHit>> HitsByViewId { get; init; } = new();
+        }
+
+
+
         [CommandMethod("FLUX_COPY_TOPLEVEL_GEOMETRY_VIEWS_OUTSIDE_SNAPSHOT")]
         public void FluxCopyTopLevelGeometryViewsOutsideSnapshot()
         {
@@ -4070,7 +4130,7 @@ namespace FluxCAD.BricsCAD.Plugin26
                    ent is Arc ||
                    ent is Circle ||
                    ent is Ellipse ||
-                   //ent is Polyline ||
+                   ent is Teigha.DatabaseServices.Polyline ||
                    ent is Polyline2d ||
                    ent is Polyline3d;
         }
@@ -7660,8 +7720,8 @@ namespace FluxCAD.BricsCAD.Plugin26
             }
         }
 
-        [CommandMethod("FLUX_DEBUG_VIEW_GRAPH")]
-        public void FluxDebugViewGraph()
+        [CommandMethod("FLUX_DEBUG_VIEW_GRAPH_V2")]
+        public void FluxDebugViewGraphV2()
         {
             var doc = Bricscad.ApplicationServices.Application.DocumentManager.MdiActiveDocument;
             if (doc == null)
@@ -7805,6 +7865,40 @@ namespace FluxCAD.BricsCAD.Plugin26
                     ed.WriteMessage("\n" + FormatNormalizedPlacements(normalizedPlacements));
                 }
 
+                // View bounds vs snapshot curve-like entity probe
+                IEntitySnapshotBuilder snapshotBuilder = new SimpleSheetFileSnapshotBuilder();
+                var fullEntities = snapshotBuilder.Build(sheetFilePath);
+
+                if (fullEntities == null || fullEntities.Count == 0)
+                {
+                    ed.WriteMessage("\n[FluxCAD] snapshot이 비어 있어 view graph probe를 생략합니다.");
+                }
+                else
+                {
+                    var probe = ProbeSnapshotCurveEntitiesAgainstViewBounds(
+                        fullEntities,
+                        geometryPrimaryCandidates,
+                        ed);
+
+                    ed.WriteMessage("\n" + FormatViewGraphBoundsProbe(probe));
+
+                    using (doc.LockDocument())
+                    using (var tr = db.TransactionManager.StartTransaction())
+                    {
+                        DrawViewGraphBoundsProbeOverlays(
+                            db,
+                            tr,
+                            probe,
+                            geometryPrimaryCandidates,
+                            clearLayerFirst: true);
+
+
+                        
+
+                        tr.Commit();
+                    }
+                }
+
                 // 로그
                 ed.WriteMessage("\n");
                 ed.WriteMessage("\n================ VIEW GRAPH DEBUG ================");
@@ -7833,6 +7927,8 @@ namespace FluxCAD.BricsCAD.Plugin26
                     tr.Commit();
                 }
 
+
+
                 ed.WriteMessage(
                     $"\n[FluxCAD] ViewGraph nodes={graph.Nodes.Count}, edges={graph.Edges.Count}, anchor={graph.Anchor.Id}");
             }
@@ -7840,6 +7936,934 @@ namespace FluxCAD.BricsCAD.Plugin26
             {
                 ed.WriteMessage($"\n[FluxCAD] FLUX_DEBUG_VIEW_GRAPH failed: {ex}");
             }
+        }
+
+        private static bool IsReasonableLocalEntityForView(
+            Bounds2D viewBounds,
+            Bounds2D entityBounds,
+            double maxAreaRatio = 1.20,
+            double maxWidthRatio = 1.10,
+            double maxHeightRatio = 1.10)
+        {
+            if (viewBounds.IsEmpty || entityBounds.IsEmpty)
+                return false;
+
+            // 1. view보다 지나치게 큰 엔티티 제거
+            if (entityBounds.Area > viewBounds.Area * maxAreaRatio)
+                return false;
+
+            if (entityBounds.Width > viewBounds.Width * maxWidthRatio)
+                return false;
+
+            if (entityBounds.Height > viewBounds.Height * maxHeightRatio)
+                return false;
+
+            // 2. view 내부 local geometry만 허용
+            //    - 완전 포함
+            //    - 또는 중심점 포함
+            if (ContainsBounds(viewBounds, entityBounds))
+                return true;
+
+            if (ContainsPoint(viewBounds, entityBounds.Center))
+                return true;
+
+            return false;
+        }
+
+        private static string FormatBoundsShort(Bounds2D b)
+        {
+            return $"({b.MinX:0.##},{b.MinY:0.##})-({b.MaxX:0.##},{b.MaxY:0.##})";
+        }
+
+
+        private static ViewGraphBoundsProbeResult ProbeSnapshotCurveEntitiesAgainstViewBounds(
+    IReadOnlyList<SheetEntity> entities,
+    IReadOnlyList<ViewCandidate> views,
+    Bricscad.EditorInput.Editor? ed = null)
+        {
+            var result = new ViewGraphBoundsProbeResult
+            {
+                HitsByViewId = new Dictionary<int, List<ViewGraphBoundsProbeHit>>()
+            };
+
+            if (entities == null || views == null || views.Count == 0)
+                return result;
+
+            foreach (var v in views)
+            {
+                if (v == null)
+                    continue;
+
+                if (!result.HitsByViewId.ContainsKey(v.IslandId))
+                    result.HitsByViewId[v.IslandId] = new List<ViewGraphBoundsProbeHit>();
+            }
+
+            int totalEntities = 0;
+            int curveLikeCount = 0;
+            int boundsOkCount = 0;
+            int intersectAnyViewCount = 0;
+
+            int rejectedTooLarge = 0;
+            int rejectedOutside = 0;
+            int rejectedNoRecoveredBounds = 0;
+
+            foreach (var e in entities)
+            {
+                totalEntities++;
+
+                if (e == null)
+                    continue;
+
+                if (!e.IsVisible)
+                    continue;
+
+                if (!IsProbeCurveLikeSheetEntity(e))
+                    continue;
+
+                curveLikeCount++;
+
+                // 핵심: occupancy와 동일한 fallback bounds 복구 사용
+                var candidate = CloneWithFallbackBounds(e);
+                if (candidate == null)
+                {
+                    rejectedNoRecoveredBounds++;
+                    continue;
+                }
+
+                var entityBounds = candidate.Bounds;
+                if (entityBounds.IsEmpty)
+                {
+                    rejectedNoRecoveredBounds++;
+                    continue;
+                }
+
+                boundsOkCount++;
+
+                bool hitAny = false;
+
+                foreach (var view in views)
+                {
+                    if (view == null || view.Bounds.IsEmpty)
+                        continue;
+
+                    // 1차: 교차 자체가 없으면 제외
+                    if (!Bounds2DHelper.Intersects(view.Bounds, entityBounds, tolerance: 0.0))
+                    {
+                        rejectedOutside++;
+                        continue;
+                    }
+
+                    // 2차: view보다 큰 global/frame-like entity 제거
+                    if (!IsReasonableLocalEntityForView(view.Bounds, entityBounds))
+                    {
+                        rejectedTooLarge++;
+                        continue;
+                    }
+
+                    hitAny = true;
+
+                    result.HitsByViewId[view.IslandId].Add(new ViewGraphBoundsProbeHit
+                    {
+                        ViewId = view.IslandId,
+                        EntityId = ObjectId.Null,
+                        Handle = candidate.Handle ?? string.Empty,
+                        EntityType = !string.IsNullOrWhiteSpace(candidate.EntityType)
+                            ? candidate.EntityType
+                            : candidate.Kind.ToString(),
+                        EntityBounds = entityBounds,
+                        IsFullyInside = ContainsBounds(view.Bounds, entityBounds),
+                        CenterInside = ContainsPoint(view.Bounds, entityBounds.Center),
+
+                        Layer = candidate.Layer,
+                        BlockName = candidate.BlockName,
+                        BlockPath = candidate.BlockPath,
+                        Depth = candidate.Depth,
+                        SourceKind = candidate.SourceKind.ToString(),
+                        BlockPathText = candidate.BlockPath == null
+                            ? string.Empty
+                            : string.Join(">", candidate.BlockPath)
+                    });
+                }
+
+                if (hitAny)
+                    intersectAnyViewCount++;
+            }
+
+            ed?.WriteMessage(
+                $"\n[FluxCAD] SnapshotBoundsProbe Entities={totalEntities}, CurveLike={curveLikeCount}, " +
+                $"BoundsOk={boundsOkCount}, IntersectAnyView={intersectAnyViewCount}, " +
+                $"RejectedTooLarge={rejectedTooLarge}, RejectedOutside={rejectedOutside}, " +
+                $"RejectedNoRecoveredBounds={rejectedNoRecoveredBounds}");
+
+            return new ViewGraphBoundsProbeResult
+            {
+                TotalModelSpaceCount = totalEntities,
+                CurveLikeCount = curveLikeCount,
+                BoundsOkCount = boundsOkCount,
+                IntersectAnyViewCount = intersectAnyViewCount,
+                HitsByViewId = result.HitsByViewId
+            };
+        }
+
+        private static bool IsProbeCurveLikeSheetEntity(SheetEntity e)
+        {
+            if (e == null)
+                return false;
+
+            if (!e.IsGeometryLike)
+                return false;
+
+            return e.Kind == SheetEntityKind.Line
+                || e.Kind == SheetEntityKind.Polyline
+                || e.Kind == SheetEntityKind.Arc
+                || e.Kind == SheetEntityKind.Circle
+                || e.Kind == SheetEntityKind.Ellipse;
+        }
+
+        [CommandMethod("FLUX_DEBUG_VIEW_GRAPH")]
+        public void FluxDebugViewGraph()
+        {
+            var doc = Bricscad.ApplicationServices.Application.DocumentManager.MdiActiveDocument;
+            if (doc == null)
+                return;
+
+            var db = doc.Database;
+            var ed = doc.Editor;
+
+            try
+            {
+                var sheetFilePath = db.Filename;
+                if (string.IsNullOrWhiteSpace(sheetFilePath))
+                {
+                    ed.WriteMessage("\n[FluxCAD] 저장된 DWG 파일이 아닙니다.");
+                    return;
+                }
+
+                var candidates = BuildResolvedViewCandidates(sheetFilePath, ed);
+                if (candidates == null || candidates.Count == 0)
+                {
+                    ed.WriteMessage("\n[FluxCAD] view candidate가 비어 있습니다.");
+                    return;
+                }
+
+                ed.WriteMessage("\n" + FormatAllResolvedViewCandidates(candidates));
+                ed.WriteMessage("\n" + FormatPseudoContainmentSummary(candidates));
+
+                var geometryPrimaryCandidates = candidates
+                    .Where(x => x != null)
+                    .Where(x => x.FinalRole == ViewIslandSemanticRole.GeometryView)
+                    .Where(x => x.IsTopLevelView || x.IsPrimaryView || x.IsRepresentativePrimaryView)
+                    .OrderBy(x => x.IslandId)
+                    .ToList();
+
+                if (geometryPrimaryCandidates.Count == 0)
+                {
+                    ed.WriteMessage("\n[FluxCAD] graph용 GeometryView candidate가 없습니다.");
+                    return;
+                }
+
+                var anchorCandidate = geometryPrimaryCandidates
+                    .FirstOrDefault(x => x.IsRepresentativePrimaryView)
+                    ?? geometryPrimaryCandidates
+                        .Where(x => x.IsPrimaryView)
+                        .OrderByDescending(x => x.RepresentativePrimaryScore)
+                        .ThenByDescending(x => x.PrimaryScore)
+                        .ThenByDescending(x => x.Area)
+                        .FirstOrDefault()
+                    ?? geometryPrimaryCandidates
+                        .OrderByDescending(x => x.Area)
+                        .FirstOrDefault();
+
+                if (anchorCandidate == null)
+                {
+                    ed.WriteMessage("\n[FluxCAD] representative(anchor) 결정 실패.");
+                    return;
+                }
+
+                var viewClusters = BuildViewClustersFromCandidates(
+                    geometryPrimaryCandidates,
+                    anchorCandidate,
+                    ed);
+
+                if (viewClusters.Count == 0)
+                {
+                    ed.WriteMessage("\n[FluxCAD] ViewCluster 생성 결과가 비어 있습니다.");
+                    return;
+                }
+
+                var anchorView = viewClusters.FirstOrDefault(x => x.Id == anchorCandidate.IslandId);
+                if (anchorView == null)
+                {
+                    ed.WriteMessage(
+                        $"\n[FluxCAD] anchor view cluster를 찾지 못했습니다. anchorIsland={anchorCandidate.IslandId}");
+                    return;
+                }
+
+                var policy = new ProjectionLayoutPolicy
+                {
+                    PreferThirdAngleLayout = true,
+                    MinBandOverlapRatio = 0.45,
+                    MaxNormalizedNeighborGap = 1.50,
+                    MinRelationScore = 0.40,
+
+                    AllowTopView = false,
+                    AllowBottomView = false,
+                    AllowLeftView = false,
+                    AllowRightView = false,
+                    AllowSectionView = false,
+                    AllowDetailView = false
+                };
+
+                var analyzer = new ProjectionLayoutAnalyzer();
+                var rawLayout = analyzer.Analyze(viewClusters, policy);
+
+                var filteredRelations = rawLayout.Relations
+                    .Where(x => x != null)
+                    .Where(x => x.Score >= policy.MinRelationScore)
+                    .Where(x => x.Direction != ProjectionDirection.Overlapping)
+                    .OrderByDescending(x => x.Score)
+                    .ToList();
+
+                var layout = new ProjectionLayoutResult
+                {
+                    Relations = filteredRelations
+                };
+
+                var graph = new ViewGraph
+                {
+                    Anchor = anchorView,
+                    Nodes = viewClusters,
+                    Layout = layout
+                };
+
+                var positionMap = BuildRelativePositionMap(graph, minScore: 0.40);
+                var projectionGroups = BuildProjectionGroups(graph, positionMap);
+                var projectionTree = BuildProjectionTree(graph, projectionGroups);
+                var projectionDto = BuildProjectionDto(projectionTree);
+                var projectionRoleSet = BuildProjectionRoleSet(geometryPrimaryCandidates);
+
+                var groupBounds = UnionBounds(geometryPrimaryCandidates.Select(x => x.Bounds));
+
+                if (!groupBounds.IsEmpty)
+                {
+                    var normalizedPlacements = BuildNormalizedProjectionPlacements(
+                        geometryPrimaryCandidates,
+                        projectionRoleSet,
+                        groupBounds,
+                        ed);
+
+                    ed.WriteMessage("\n" + FormatNormalizedPlacements(normalizedPlacements));
+                }
+
+                // View bounds vs raw curve-like entity probe
+                using (doc.LockDocument())
+                using (var tr = db.TransactionManager.StartTransaction())
+                {
+                    var probe = ProbeRawCurveEntitiesAgainstViewBounds(
+                        db,
+                        tr,
+                        geometryPrimaryCandidates);
+
+                    ed.WriteMessage("\n" + FormatViewGraphBoundsProbe(probe));
+
+                    DrawViewGraphBoundsProbeOverlays(
+                        db,
+                        tr,
+                        probe,
+                        geometryPrimaryCandidates,
+                        clearLayerFirst: true);
+
+                    tr.Commit();
+                }
+
+                DetailedViewEntityMembershipResult? detailedProbe = null;
+
+                using (doc.LockDocument())
+                using (var tr = db.TransactionManager.StartTransaction())
+                {
+                    detailedProbe = ProbeDetailedRawEntitiesAgainstViewBounds(
+                        db,
+                        tr,
+                        geometryPrimaryCandidates);
+
+                    tr.Commit();
+                }
+
+                if (detailedProbe != null)
+                    ed.WriteMessage("\n" + FormatDetailedViewEntityMembership(detailedProbe));
+
+                ed.WriteMessage("\n");
+                ed.WriteMessage("\n================ VIEW GRAPH DEBUG ================");
+                ed.WriteMessage("\n" + FormatViewGraph(graph, anchorCandidate, positionMap));
+                ed.WriteMessage("\n" + FormatRelativePositionMap(positionMap));
+                ed.WriteMessage("\n" + FormatProjectionGroups(graph, projectionGroups));
+                ed.WriteMessage("\n" + FormatProjectionTree(projectionTree));
+                ed.WriteMessage("\n" + FormatProjectionDto(projectionDto));
+                ed.WriteMessage("\n" + FormatProjectionRoleSet(projectionRoleSet));
+                ed.WriteMessage("\n================ END VIEW GRAPH DEBUG ================");
+
+                using (doc.LockDocument())
+                using (var tr = db.TransactionManager.StartTransaction())
+                {
+                    DrawViewGraphOverlays(
+                        db,
+                        tr,
+                        graph,
+                        positionMap,
+                        geometryPrimaryCandidates,
+                        clearLayerFirst: true,
+                        drawLabels: true,
+                        drawRelations: true);
+
+                    if (detailedProbe != null)
+                    {
+                        DrawDetailedViewEntityMembershipOverlays(
+                            db,
+                            tr,
+                            detailedProbe,
+                            geometryPrimaryCandidates,
+                            clearLayerFirst: false);
+                    }
+
+                    tr.Commit();
+                }
+
+                ed.WriteMessage(
+                    $"\n[FluxCAD] ViewGraph nodes={graph.Nodes.Count}, edges={graph.Edges.Count}, anchor={graph.Anchor.Id}");
+            }
+            catch (System.Exception ex)
+            {
+                ed.WriteMessage($"\n[FluxCAD] FLUX_DEBUG_VIEW_GRAPH failed: {ex}");
+            }
+        }
+
+        private static void DrawViewGraphBoundsProbeOverlays(
+            Database db,
+            Transaction tr,
+            ViewGraphBoundsProbeResult probe,
+            IReadOnlyList<ViewCandidate> views,
+            bool clearLayerFirst)
+        {
+            if (db == null)
+                throw new ArgumentNullException(nameof(db));
+            if (tr == null)
+                throw new ArgumentNullException(nameof(tr));
+            if (probe == null)
+                throw new ArgumentNullException(nameof(probe));
+
+            const string layerName = "FLUX_VIEW_GRAPH_PROBE";
+            EnsureDebugLayer(db, tr, layerName, colorIndex: 1, clearLayerFirst: clearLayerFirst);
+
+            var viewColorMap = views?
+                .Where(v => v != null)
+                .OrderBy(v => v.IslandId)
+                .Select((v, index) => new { v.IslandId, Color = ResolveProbeColor(index) })
+                .ToDictionary(x => x.IslandId, x => x.Color)
+                ?? new Dictionary<int, short>();
+
+            foreach (var pair in probe.HitsByViewId)
+            {
+                var color = viewColorMap.TryGetValue(pair.Key, out var c) ? c : (short)1;
+
+                foreach (var hit in pair.Value)
+                {
+                    DrawBoundsRectangle(
+                        db,
+                        tr,
+                        layerName,
+                        hit.EntityBounds,
+                        color);
+                }
+            }
+        }
+
+        private static short ResolveProbeColor(int index)
+        {
+            short[] palette = new short[] { 1, 2, 3, 4, 5, 6, 30, 140, 151, 171 };
+            return palette[index % palette.Length];
+        }
+
+        private static string FormatViewGraphBoundsProbe(
+            ViewGraphBoundsProbeResult probe)
+        {
+            var sb = new StringBuilder();
+            sb.AppendLine("================ VIEW GRAPH BOUNDS PROBE ================");
+            sb.AppendLine($"TotalEntities={probe.TotalModelSpaceCount}, CurveLike={probe.CurveLikeCount}, BoundsOk={probe.BoundsOkCount}, IntersectAnyView={probe.IntersectAnyViewCount}");
+
+            foreach (var pair in probe.HitsByViewId.OrderBy(x => x.Key))
+            {
+                var hits = pair.Value ?? new List<ViewGraphBoundsProbeHit>();
+                int fullyInside = hits.Count(x => x.IsFullyInside);
+                int centerInside = hits.Count(x => x.CenterInside);
+
+                sb.AppendLine($"I:{pair.Key} RawCurveHits={hits.Count}, FullyInside={fullyInside}, CenterInside={centerInside}");
+
+                foreach (var hit in hits
+                    .OrderByDescending(x => x.IsFullyInside)
+                    .ThenByDescending(x => x.CenterInside)
+                    .ThenBy(x => x.Handle)
+                    .Take(60))
+                {
+                    sb.AppendLine(
+                        $"  - H:{hit.Handle}, Type={hit.EntityType}, Layer={hit.Layer}, Depth={hit.Depth}, " +
+                        $"Source={hit.SourceKind}, Block={hit.BlockName}, Path={hit.BlockPathText}, " +
+                        $"Inside={(hit.IsFullyInside ? "Y" : "N")}, Center={(hit.CenterInside ? "Y" : "N")}, " +
+                        $"B=({hit.EntityBounds.MinX:0.##},{hit.EntityBounds.MinY:0.##})-({hit.EntityBounds.MaxX:0.##},{hit.EntityBounds.MaxY:0.##})");
+                }
+
+                if (hits.Count > 60)
+                    sb.AppendLine($"  ... truncated {hits.Count - 60} more hits");
+            }
+
+            sb.AppendLine("================ END VIEW GRAPH BOUNDS PROBE ================");
+            return sb.ToString();
+        }
+        private static ViewGraphBoundsProbeResult ProbeRawCurveEntitiesAgainstViewBounds(
+            Database db,
+            Transaction tr,
+            IReadOnlyList<ViewCandidate> views)
+        {
+            if (db == null)
+                throw new ArgumentNullException(nameof(db));
+            if (tr == null)
+                throw new ArgumentNullException(nameof(tr));
+
+            var result = new ViewGraphBoundsProbeResult();
+            if (views == null || views.Count == 0)
+                return result;
+
+            var mutable = new ViewGraphBoundsProbeResult
+            {
+                TotalModelSpaceCount = 0,
+                CurveLikeCount = 0,
+                BoundsOkCount = 0,
+                IntersectAnyViewCount = 0
+            };
+
+            foreach (var v in views)
+            {
+                if (v == null)
+                    continue;
+
+                if (!mutable.HitsByViewId.ContainsKey(v.IslandId))
+                    mutable.HitsByViewId[v.IslandId] = new List<ViewGraphBoundsProbeHit>();
+            }
+
+            var bt = (BlockTable)tr.GetObject(db.BlockTableId, OpenMode.ForRead);
+            var ms = (BlockTableRecord)tr.GetObject(bt[BlockTableRecord.ModelSpace], OpenMode.ForRead);
+
+            int totalModelSpace = 0;
+            int curveLikeCount = 0;
+            int boundsOkCount = 0;
+            int intersectAnyViewCount = 0;
+
+            foreach (ObjectId id in ms)
+            {
+                totalModelSpace++;
+
+                if (!id.IsValid || id.IsErased)
+                    continue;
+
+                var ent = tr.GetObject(id, OpenMode.ForRead, false) as Entity;
+                if (ent == null)
+                    continue;
+
+                if (!IsCurveLikeEntity(ent))
+                    continue;
+
+                curveLikeCount++;
+
+                if (!TryGetEntityBoundsSafe(ent, out var entityBounds) || entityBounds.IsEmpty)
+                    continue;
+
+                boundsOkCount++;
+
+                bool hitAny = false;
+
+                foreach (var view in views)
+                {
+                    if (view == null || view.Bounds.IsEmpty)
+                        continue;
+
+                    if (!Bounds2DHelper.Intersects(view.Bounds, entityBounds, tolerance: 0.0))
+                        continue;
+
+                    hitAny = true;
+
+                    var hit = new ViewGraphBoundsProbeHit
+                    {
+                        ViewId = view.IslandId,
+                        EntityId = id,
+                        Handle = id.Handle.ToString(),
+                        EntityType = ent.GetType().Name,
+                        EntityBounds = entityBounds,
+                        IsFullyInside = ContainsBounds(view.Bounds, entityBounds),
+                        CenterInside = ContainsPoint(view.Bounds, entityBounds.Center)
+                    };
+
+                    mutable.HitsByViewId[view.IslandId].Add(hit);
+                }
+
+                if (hitAny)
+                    intersectAnyViewCount++;
+            }
+
+            return new ViewGraphBoundsProbeResult
+            {
+                TotalModelSpaceCount = totalModelSpace,
+                CurveLikeCount = curveLikeCount,
+                BoundsOkCount = boundsOkCount,
+                IntersectAnyViewCount = intersectAnyViewCount,
+                HitsByViewId = mutable.HitsByViewId
+            };
+        }
+
+        private static bool ContainsBounds(Bounds2D outer, Bounds2D inner, double tolerance = 0.0)
+        {
+            if (outer.IsEmpty || inner.IsEmpty)
+                return false;
+
+            return inner.MinX >= outer.MinX - tolerance &&
+                   inner.MinY >= outer.MinY - tolerance &&
+                   inner.MaxX <= outer.MaxX + tolerance &&
+                   inner.MaxY <= outer.MaxY + tolerance;
+        }
+
+        private static bool ContainsPoint(Bounds2D bounds, Point2D p, double tolerance = 0.0)
+        {
+            if (bounds.IsEmpty)
+                return false;
+
+            return p.X >= bounds.MinX - tolerance &&
+                   p.X <= bounds.MaxX + tolerance &&
+                   p.Y >= bounds.MinY - tolerance &&
+                   p.Y <= bounds.MaxY + tolerance;
+        }
+
+        private static DetailedViewEntityMembershipResult ProbeDetailedRawEntitiesAgainstViewBounds(
+    Database db,
+    Transaction tr,
+    IReadOnlyList<ViewCandidate> views)
+        {
+            if (db == null)
+                throw new ArgumentNullException(nameof(db));
+            if (tr == null)
+                throw new ArgumentNullException(nameof(tr));
+
+            var result = new DetailedViewEntityMembershipResult();
+            if (views == null || views.Count == 0)
+                return result;
+
+            foreach (var v in views)
+            {
+                if (v == null)
+                    continue;
+
+                if (!result.HitsByViewId.ContainsKey(v.IslandId))
+                    result.HitsByViewId[v.IslandId] = new List<DetailedViewEntityMembershipHit>();
+            }
+
+            var bt = (BlockTable)tr.GetObject(db.BlockTableId, OpenMode.ForRead);
+            var ms = (BlockTableRecord)tr.GetObject(bt[BlockTableRecord.ModelSpace], OpenMode.ForRead);
+
+            int totalModelSpace = 0;
+            int curveLikeCount = 0;
+            int boundsOkCount = 0;
+            int intersectAnyViewCount = 0;
+
+            foreach (ObjectId id in ms)
+            {
+                totalModelSpace++;
+
+                if (!id.IsValid || id.IsErased)
+                    continue;
+
+                var ent = tr.GetObject(id, OpenMode.ForRead, false) as Entity;
+                if (ent == null)
+                    continue;
+
+                if (!IsCurveLikeEntity(ent))
+                    continue;
+
+                curveLikeCount++;
+
+                if (!TryGetEntityBoundsSafe(ent, out var entityBounds) || entityBounds.IsEmpty)
+                    continue;
+
+                boundsOkCount++;
+
+                bool hitAny = false;
+
+                foreach (var view in views)
+                {
+                    if (view == null || view.Bounds.IsEmpty)
+                        continue;
+
+                    if (!Bounds2DHelper.Intersects(view.Bounds, entityBounds, tolerance: 0.0))
+                        continue;
+
+                    hitAny = true;
+
+                    var center = entityBounds.Center;
+                    bool centerInside =
+                        center.X >= view.Bounds.MinX && center.X <= view.Bounds.MaxX &&
+                        center.Y >= view.Bounds.MinY && center.Y <= view.Bounds.MaxY;
+
+                    bool fullyInside =
+                        entityBounds.MinX >= view.Bounds.MinX &&
+                        entityBounds.MaxX <= view.Bounds.MaxX &&
+                        entityBounds.MinY >= view.Bounds.MinY &&
+                        entityBounds.MaxY <= view.Bounds.MaxY;
+
+                    var hit = new DetailedViewEntityMembershipHit
+                    {
+                        ViewId = view.IslandId,
+                        EntityId = id,
+                        Handle = id.Handle.ToString(),
+                        EntityType = ent.GetType().Name,
+                        Layer = SafeGetLayer(ent),
+                        Linetype = SafeGetLinetype(ent),
+                        ColorIndex = SafeGetColorIndex(ent),
+                        EntityBounds = entityBounds,
+                        IsFullyInside = fullyInside,
+                        CenterInside = centerInside
+                    };
+
+                    result.HitsByViewId[view.IslandId].Add(hit);
+                }
+
+                if (hitAny)
+                    intersectAnyViewCount++;
+            }
+
+            result.TotalModelSpaceCount = totalModelSpace;
+            result.CurveLikeCount = curveLikeCount;
+            result.BoundsOkCount = boundsOkCount;
+            result.IntersectAnyViewCount = intersectAnyViewCount;
+
+            return result;
+        }
+
+        private static string FormatDetailedViewEntityMembership(
+            DetailedViewEntityMembershipResult probe)
+        {
+            var sb = new StringBuilder();
+            sb.AppendLine("================ DETAILED VIEW ENTITY MEMBERSHIP ================");
+            sb.AppendLine(
+                $"TotalModelSpace={probe.TotalModelSpaceCount}, " +
+                $"CurveLike={probe.CurveLikeCount}, " +
+                $"BoundsOk={probe.BoundsOkCount}, " +
+                $"IntersectAnyView={probe.IntersectAnyViewCount}");
+
+            foreach (var pair in probe.HitsByViewId.OrderBy(x => x.Key))
+            {
+                var hits = pair.Value ?? new List<DetailedViewEntityMembershipHit>();
+
+                int fullyInside = hits.Count(x => x.IsFullyInside);
+                int centerInside = hits.Count(x => x.CenterInside);
+
+                sb.AppendLine(
+                    $"I:{pair.Key} Hits={hits.Count}, FullyInside={fullyInside}, CenterInside={centerInside}");
+
+                foreach (var hit in hits
+                    .OrderByDescending(x => x.IsFullyInside)
+                    .ThenByDescending(x => x.CenterInside)
+                    .ThenBy(x => x.Layer)
+                    .ThenBy(x => x.Handle)
+                    .Take(200))
+                {
+                    sb.AppendLine(
+                        $"  - H:{hit.Handle}, " +
+                        $"Type={hit.EntityType}, " +
+                        $"Layer={hit.Layer}, " +
+                        $"LT={hit.Linetype}, " +
+                        $"Color={hit.ColorIndex}, " +
+                        $"Inside={(hit.IsFullyInside ? "Y" : "N")}, " +
+                        $"Center={(hit.CenterInside ? "Y" : "N")}, " +
+                        $"W={hit.Width:0.##}, H={hit.Height:0.##}, A={hit.Area:0.##}, " +
+                        $"B=({hit.EntityBounds.MinX:0.##},{hit.EntityBounds.MinY:0.##})-({hit.EntityBounds.MaxX:0.##},{hit.EntityBounds.MaxY:0.##})");
+                }
+
+                if (hits.Count > 200)
+                    sb.AppendLine($"  ... truncated {hits.Count - 200} more hits");
+            }
+
+            sb.AppendLine("================ END DETAILED VIEW ENTITY MEMBERSHIP ================");
+            return sb.ToString();
+        }
+
+
+        private static void DrawDetailedViewEntityMembershipOverlays(
+    Database db,
+    Transaction tr,
+    DetailedViewEntityMembershipResult probe,
+    IReadOnlyList<ViewCandidate> views,
+    bool clearLayerFirst)
+        {
+            if (db == null)
+                throw new ArgumentNullException(nameof(db));
+            if (tr == null)
+                throw new ArgumentNullException(nameof(tr));
+            if (probe == null)
+                throw new ArgumentNullException(nameof(probe));
+
+            const string layerName = "FLUX_VIEW_MEMBERSHIP";
+            EnsureDebugLayer(db, tr, layerName, colorIndex: 3, clearLayerFirst: clearLayerFirst);
+
+            short[] palette = { 1, 2, 3, 4, 5, 6 };
+
+            var viewColorMap = new Dictionary<int, short>();
+            if (views != null)
+            {
+                int idx = 0;
+                foreach (var v in views.Where(v => v != null).OrderBy(v => v.IslandId))
+                {
+                    viewColorMap[v.IslandId] = palette[idx % palette.Length];
+                    idx++;
+                }
+            }
+
+            foreach (var pair in probe.HitsByViewId)
+            {
+                short color = viewColorMap.TryGetValue(pair.Key, out var c) ? c : (short)3;
+
+                foreach (var hit in pair.Value)
+                {
+                    DrawBoundsRectangle(
+                        db,
+                        tr,
+                        layerName,
+                        hit.EntityBounds,
+                        color);
+                }
+            }
+        }
+
+        private static string SafeGetLayer(Entity ent)
+        {
+            try
+            {
+                return string.IsNullOrWhiteSpace(ent?.Layer) ? "-" : ent.Layer;
+            }
+            catch
+            {
+                return "-";
+            }
+        }
+
+        private static string SafeGetLinetype(Entity ent)
+        {
+            try
+            {
+                return string.IsNullOrWhiteSpace(ent?.Linetype) ? "-" : ent.Linetype;
+            }
+            catch
+            {
+                return "-";
+            }
+        }
+
+        private static short SafeGetColorIndex(Entity ent)
+        {
+            try
+            {
+                return ent?.Color?.ColorIndex ?? (short)256;
+            }
+            catch
+            {
+                return 256;
+            }
+        }
+
+
+        private static string FormatAllResolvedViewCandidates(
+    IReadOnlyList<ViewCandidate> candidates)
+        {
+            var sb = new StringBuilder();
+            sb.AppendLine("================ ALL RESOLVED VIEW CANDIDATES ================");
+
+            if (candidates == null || candidates.Count == 0)
+            {
+                sb.AppendLine("(none)");
+                sb.AppendLine("================ END ALL RESOLVED VIEW CANDIDATES ================");
+                return sb.ToString();
+            }
+
+            foreach (var c in candidates
+                .Where(x => x != null)
+                .OrderBy(x => x.IslandId))
+            {
+                sb.AppendLine(
+                    $"- Island={c.IslandId}, " +
+                    $"Init={c.InitialRole}, Final={c.FinalRole}, " +
+                    $"TopLevel={c.IsTopLevelView}, Primary={c.IsPrimaryView}, Rep={c.IsRepresentativePrimaryView}, " +
+                    $"Area={c.Area:0.###}, " +
+                    $"Size=({c.Width:0.##}x{c.Height:0.##}), " +
+                    $"Bounds=({c.Bounds.MinX:0.##},{c.Bounds.MinY:0.##})-({c.Bounds.MaxX:0.##},{c.Bounds.MaxY:0.##})");
+            }
+
+            sb.AppendLine("================ END ALL RESOLVED VIEW CANDIDATES ================");
+            return sb.ToString();
+        }
+
+        private static string FormatPseudoContainmentSummary(
+    IReadOnlyList<ViewCandidate> candidates)
+        {
+            var sb = new StringBuilder();
+            sb.AppendLine("================ PSEUDO CONTAINMENT SUMMARY ================");
+
+            if (candidates == null || candidates.Count == 0)
+            {
+                sb.AppendLine("(none)");
+                sb.AppendLine("================ END PSEUDO CONTAINMENT SUMMARY ================");
+                return sb.ToString();
+            }
+
+            var ordered = candidates
+                .Where(x => x != null)
+                .OrderByDescending(x => x.Area)
+                .ThenBy(x => x.IslandId)
+                .ToList();
+
+            foreach (var c in ordered)
+            {
+                var parents = ordered
+                    .Where(x => x.IslandId != c.IslandId)
+                    .Where(x =>
+                        x.Bounds.MinX <= c.Bounds.MinX &&
+                        x.Bounds.MaxX >= c.Bounds.MaxX &&
+                        x.Bounds.MinY <= c.Bounds.MinY &&
+                        x.Bounds.MaxY >= c.Bounds.MaxY)
+                    .OrderBy(x => x.Area)
+                    .ThenBy(x => x.IslandId)
+                    .ToList();
+
+                var children = ordered
+                    .Where(x => x.IslandId != c.IslandId)
+                    .Where(x =>
+                        c.Bounds.MinX <= x.Bounds.MinX &&
+                        c.Bounds.MaxX >= x.Bounds.MaxX &&
+                        c.Bounds.MinY <= x.Bounds.MinY &&
+                        c.Bounds.MaxY >= x.Bounds.MaxY)
+                    .OrderBy(x => x.Area)
+                    .ThenBy(x => x.IslandId)
+                    .ToList();
+
+                var parentText = parents.Count == 0
+                    ? "-"
+                    : string.Join(",", parents.Select(x => $"{x.IslandId}:{x.FinalRole}"));
+
+                var childText = children.Count == 0
+                    ? "(none)"
+                    : string.Join(",", children.Select(x => $"{x.IslandId}:{x.FinalRole}"));
+
+                sb.AppendLine(
+                    $"- Island={c.IslandId}, Role={c.FinalRole}, TopLevel={c.IsTopLevelView}, " +
+                    $"ParentLike={parentText}, ChildrenLike={childText}");
+            }
+
+            sb.AppendLine("================ END PSEUDO CONTAINMENT SUMMARY ================");
+            return sb.ToString();
         }
 
         private List<ProjectionPlacement> BuildNormalizedProjectionPlacements(
