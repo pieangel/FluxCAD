@@ -13,6 +13,7 @@ using FluxCAD.SheetAnalysis.ViewProjection;
 using System;
 using System.Collections.Generic;
 using System.Diagnostics.Metrics;
+using System.Globalization;
 using System.IO;
 using System.Linq;
 using System.Text;
@@ -351,6 +352,461 @@ namespace FluxCAD.BricsCAD.Plugin26
         }
 
 
+        public enum ArcRecoveryKind
+        {
+            OriginalExact,
+            OriginalTransformed,
+            EndpointRecovered,
+            FullCircleBoundsQuadrantRecovered,
+            AngleHeuristicRecovered,
+            Failed
+        }
+
+        public enum ArcSideHint
+        {
+            Unknown = 0,
+            Right,
+            Top,
+            Left,
+            Bottom,
+            TopRight,
+            TopLeft,
+            BottomLeft,
+            BottomRight
+        }
+
+        public sealed class ArcRecoveryDebugInfo
+        {
+            public ArcRecoveryKind RecoveryKind { get; set; } = ArcRecoveryKind.Failed;
+
+            public Point2d Center { get; set; }
+            public double Radius { get; set; }
+
+            public double CandidateStartAngle { get; set; }
+            public double CandidateEndAngle { get; set; }
+
+            public double ChosenStartAngle { get; set; }
+            public double ChosenEndAngle { get; set; }
+
+            public Point2d? ExpectedPointOnArc { get; set; }
+            public Point2d? ExpectedGapPoint { get; set; }
+
+            public double Candidate1Score { get; set; }
+            public double Candidate2Score { get; set; }
+
+            public string Notes { get; set; } = "";
+        }
+
+        public static class ArcRecoveryHelper
+        {
+            private const double TwoPi = Math.PI * 2.0;
+
+            public static bool TryCloneArcPreserveOriginalOrFallback(
+                Arc sourceArc,
+                Matrix3d transform,
+                Bounds2D sourceBounds,
+                ArcSideHint sideHint,
+                StringBuilder? log,
+                out Arc clonedArc,
+                out ArcRecoveryDebugInfo debugInfo)
+            {
+                debugInfo = new ArcRecoveryDebugInfo();
+                clonedArc = null!;
+
+                if (sourceArc == null)
+                    return false;
+
+                // 1) 원본 exact 경로: 원본 start/end angle 그대로 사용
+                // 단, transform이 비균일 스케일이면 Arc가 Ellipse가 될 수 있으므로
+                // 여기서는 일반적으로 copy/translate/uniform transform만 들어온다고 가정
+                // (추측: 현재 사용자의 copy path는 translation 중심)
+                try
+                {
+                    Arc exactClone = sourceArc.Clone() as Arc;
+                    if (exactClone != null)
+                    {
+                        exactClone.TransformBy(transform);
+
+                        clonedArc = exactClone;
+                        debugInfo.RecoveryKind = ArcRecoveryKind.OriginalExact;
+                        debugInfo.Center = new Point2d(exactClone.Center.X, exactClone.Center.Y);
+                        debugInfo.Radius = exactClone.Radius;
+                        debugInfo.ChosenStartAngle = exactClone.StartAngle;
+                        debugInfo.ChosenEndAngle = exactClone.EndAngle;
+                        debugInfo.Notes = "Used original arc parameters without fallback.";
+
+                        AppendArcRecoveryLog(log, sourceArc.Handle.ToString(), debugInfo);
+                        return true;
+                    }
+                }
+                catch
+                {
+                    // exact clone 실패 시에만 fallback으로 내려감
+                }
+
+                // 2) fallback 경로
+                // 원본 중심/반지름은 최대한 신뢰
+                Point3d center3 = sourceArc.Center.TransformBy(transform);
+                var center = new Point2d(center3.X, center3.Y);
+                double radius = sourceArc.Radius;
+
+                debugInfo.Center = center;
+                debugInfo.Radius = radius;
+
+                // endpoint가 살아 있으면 endpoint 우선
+                bool hasStartPoint = TryGetArcPoint(sourceArc, true, transform, out Point2d sp);
+                bool hasEndPoint = TryGetArcPoint(sourceArc, false, transform, out Point2d ep);
+
+                if (hasStartPoint && hasEndPoint)
+                {
+                    double startAngle = AngleOf(center, sp);
+                    double endAngle = AngleOf(center, ep);
+
+                    clonedArc = new Arc(
+                        new Point3d(center.X, center.Y, 0.0),
+                        radius,
+                        startAngle,
+                        endAngle);
+
+                    debugInfo.RecoveryKind = ArcRecoveryKind.EndpointRecovered;
+                    debugInfo.CandidateStartAngle = startAngle;
+                    debugInfo.CandidateEndAngle = endAngle;
+                    debugInfo.ChosenStartAngle = startAngle;
+                    debugInfo.ChosenEndAngle = endAngle;
+                    debugInfo.ExpectedPointOnArc = null;
+                    debugInfo.ExpectedGapPoint = null;
+                    debugInfo.Notes = "Recovered from transformed StartPoint/EndPoint.";
+
+                    AppendArcRecoveryLog(log, sourceArc.Handle.ToString(), debugInfo);
+                    return true;
+                }
+
+                // 3) full-circle bounds fallback
+                if (TryRecoverArcFromFullCircleBounds(
+                    center,
+                    radius,
+                    sourceBounds,
+                    sideHint,
+                    out double chosenStart,
+                    out double chosenEnd,
+                    out Point2d expectedOnArc,
+                    out Point2d expectedGap,
+                    out double score1,
+                    out double score2))
+                {
+                    clonedArc = new Arc(
+                        new Point3d(center.X, center.Y, 0.0),
+                        radius,
+                        chosenStart,
+                        chosenEnd);
+
+                    debugInfo.RecoveryKind = ArcRecoveryKind.FullCircleBoundsQuadrantRecovered;
+                    debugInfo.CandidateStartAngle = 0.0; // 의미 없는 placeholder가 아니라 Notes에 설명
+                    debugInfo.CandidateEndAngle = 0.0;
+                    debugInfo.ChosenStartAngle = chosenStart;
+                    debugInfo.ChosenEndAngle = chosenEnd;
+                    debugInfo.ExpectedPointOnArc = expectedOnArc;
+                    debugInfo.ExpectedGapPoint = expectedGap;
+                    debugInfo.Candidate1Score = score1;
+                    debugInfo.Candidate2Score = score2;
+                    debugInfo.Notes = $"Recovered by full-circle bounds + side hint = {sideHint}";
+
+                    AppendArcRecoveryLog(log, sourceArc.Handle.ToString(), debugInfo);
+                    return true;
+                }
+
+                // 4) 최후의 heuristic: 원본 각도라도 남아 있으면 그걸 사용
+                try
+                {
+                    double fallbackStart = sourceArc.StartAngle;
+                    double fallbackEnd = sourceArc.EndAngle;
+
+                    clonedArc = new Arc(
+                        new Point3d(center.X, center.Y, 0.0),
+                        radius,
+                        fallbackStart,
+                        fallbackEnd);
+
+                    debugInfo.RecoveryKind = ArcRecoveryKind.AngleHeuristicRecovered;
+                    debugInfo.CandidateStartAngle = fallbackStart;
+                    debugInfo.CandidateEndAngle = fallbackEnd;
+                    debugInfo.ChosenStartAngle = fallbackStart;
+                    debugInfo.ChosenEndAngle = fallbackEnd;
+                    debugInfo.Notes = "Fallback to source StartAngle/EndAngle after exact clone failure.";
+
+                    AppendArcRecoveryLog(log, sourceArc.Handle.ToString(), debugInfo);
+                    return true;
+                }
+                catch
+                {
+                    debugInfo.RecoveryKind = ArcRecoveryKind.Failed;
+                    debugInfo.Notes = "All recovery paths failed.";
+                    AppendArcRecoveryLog(log, sourceArc.Handle.ToString(), debugInfo);
+                    return false;
+                }
+            }
+
+            public static bool TryRecoverArcFromFullCircleBounds(
+                Point2d center,
+                double radius,
+                Bounds2D bounds,
+                ArcSideHint sideHint,
+                out double chosenStartAngle,
+                out double chosenEndAngle,
+                out Point2d expectedPointOnArc,
+                out Point2d expectedGapPoint,
+                out double candidate1Score,
+                out double candidate2Score)
+            {
+                chosenStartAngle = 0.0;
+                chosenEndAngle = 0.0;
+                candidate1Score = double.MaxValue;
+                candidate2Score = double.MaxValue;
+                expectedPointOnArc = center;
+                expectedGapPoint = center;
+
+                if (radius <= 0.0)
+                    return false;
+
+                if (!IsNearFullCircleBounds(bounds, Math.Max(0.01, radius * 0.10)))
+                    return false;
+
+                // 핵심 규칙:
+                // 270도 arc의 본질은 "어느 90도 gap가 비어 있는가"
+                // 따라서 먼저 gap 방향을 정하고,
+                // 그 gap를 제외하는 270도 arc를 만든 뒤,
+                // 시작/끝 순서 2개를 비교해서 expectedPointOnArc에 맞는 쪽을 선택한다.
+
+                double gapMidAngle = SideHintToAngle(sideHint);
+                if (double.IsNaN(gapMidAngle))
+                    return false;
+
+                expectedGapPoint = PointOnCircle(center, radius, gapMidAngle);
+                expectedPointOnArc = PointOnCircle(center, radius, NormalizeAngle(gapMidAngle + Math.PI));
+
+                // 90도 gap => gap의 양 끝
+                double gapHalf = Math.PI / 4.0;
+                double gapStart = NormalizeAngle(gapMidAngle - gapHalf);
+                double gapEnd = NormalizeAngle(gapMidAngle + gapHalf);
+
+                // 전체 360도에서 gap를 비우면 270도 arc가 된다.
+                // 후보1: gapEnd -> gapStart (CCW 270도)
+                double cand1Start = gapEnd;
+                double cand1End = gapStart;
+
+                // 후보2: 반대로 주면 CCW 90도가 되므로 안 됨.
+                // 하지만 CAD/엔진 내부에서 start/end 뒤집힘 때문에 반대 sweep가 생길 수 있으므로,
+                // 여기서는 "정상 후보"와 "잘못 뒤집힌 후보"를 동시에 평가한다.
+                // 뒤집힌 후보는 실질적으로 gap 쪽을 그려 버리는 90도 arc + 보수 해석 오류로 이어진다.
+                // 이를 명시적으로 잡기 위해 start/end reversed도 계산해 본다.
+                double cand2Start = gapStart;
+                double cand2End = gapEnd;
+
+                candidate1Score = ScoreArcCandidate(
+                    center,
+                    radius,
+                    cand1Start,
+                    cand1End,
+                    expectedPointOnArc,
+                    expectedGapPoint,
+                    expectMajorArc: true);
+
+                candidate2Score = ScoreArcCandidate(
+                    center,
+                    radius,
+                    cand2Start,
+                    cand2End,
+                    expectedPointOnArc,
+                    expectedGapPoint,
+                    expectMajorArc: true);
+
+                if (candidate1Score <= candidate2Score)
+                {
+                    chosenStartAngle = cand1Start;
+                    chosenEndAngle = cand1End;
+                }
+                else
+                {
+                    chosenStartAngle = cand2Start;
+                    chosenEndAngle = cand2End;
+                }
+
+                return true;
+            }
+
+            private static double ScoreArcCandidate(
+                Point2d center,
+                double radius,
+                double startAngle,
+                double endAngle,
+                Point2d expectedPointOnArc,
+                Point2d expectedGapPoint,
+                bool expectMajorArc)
+            {
+                double score = 0.0;
+
+                double sweep = NormalizePositiveSweep(endAngle - startAngle);
+                double arcMid = MidAngleCcw(startAngle, endAngle);
+                Point2d arcMidPt = PointOnCircle(center, radius, arcMid);
+
+                double gapMid = MidAngleCcw(endAngle, startAngle);
+                Point2d gapMidPt = PointOnCircle(center, radius, gapMid);
+
+                double dArc = DistanceSq(arcMidPt, expectedPointOnArc);
+                double dGap = DistanceSq(gapMidPt, expectedGapPoint);
+
+                score += dArc;
+                score += dGap * 1.5;
+
+                // 270도 major arc 기대인데 90도 minor arc가 나오면 강한 패널티
+                if (expectMajorArc)
+                {
+                    double diffTo270 = Math.Abs(sweep - (Math.PI * 1.5));
+                    double diffTo90 = Math.Abs(sweep - (Math.PI * 0.5));
+
+                    score += diffTo270 * 100.0;
+                    score += diffTo90 * 300.0;
+                }
+
+                return score;
+            }
+
+            private static bool TryGetArcPoint(
+                Arc arc,
+                bool isStart,
+                Matrix3d transform,
+                out Point2d p)
+            {
+                p = default;
+
+                try
+                {
+                    Point3d pt3 = isStart ? arc.StartPoint : arc.EndPoint;
+                    pt3 = pt3.TransformBy(transform);
+                    p = new Point2d(pt3.X, pt3.Y);
+
+                    if (double.IsNaN(p.X) || double.IsNaN(p.Y))
+                        return false;
+
+                    return true;
+                }
+                catch
+                {
+                    return false;
+                }
+            }
+
+            public static bool IsNearFullCircleBounds(Bounds2D b, double tol)
+            {
+                if (b.IsEmpty)
+                    return false;
+
+                return Math.Abs(b.Width - b.Height) <= tol;
+            }
+
+            public static double SideHintToAngle(ArcSideHint sideHint)
+            {
+                switch (sideHint)
+                {
+                    case ArcSideHint.Right: return 0.0;
+                    case ArcSideHint.TopRight: return Math.PI * 0.25;
+                    case ArcSideHint.Top: return Math.PI * 0.5;
+                    case ArcSideHint.TopLeft: return Math.PI * 0.75;
+                    case ArcSideHint.Left: return Math.PI;
+                    case ArcSideHint.BottomLeft: return Math.PI * 1.25;
+                    case ArcSideHint.Bottom: return Math.PI * 1.5;
+                    case ArcSideHint.BottomRight: return Math.PI * 1.75;
+                    default: return double.NaN;
+                }
+            }
+
+            public static double NormalizeAngle(double angle)
+            {
+                angle %= TwoPi;
+                if (angle < 0.0)
+                    angle += TwoPi;
+                return angle;
+            }
+
+            public static double NormalizePositiveSweep(double sweep)
+            {
+                sweep %= TwoPi;
+                if (sweep < 0.0)
+                    sweep += TwoPi;
+                return sweep;
+            }
+
+            public static double AngleOf(Point2d center, Point2d pt)
+            {
+                return NormalizeAngle(Math.Atan2(pt.Y - center.Y, pt.X - center.X));
+            }
+
+            public static double MidAngleCcw(double start, double end)
+            {
+                double sweep = NormalizePositiveSweep(end - start);
+                return NormalizeAngle(start + sweep * 0.5);
+            }
+
+            public static Point2d PointOnCircle(Point2d c, double r, double ang)
+            {
+                return new Point2d(
+                    c.X + r * Math.Cos(ang),
+                    c.Y + r * Math.Sin(ang));
+            }
+
+            public static double DistanceSq(Point2d a, Point2d b)
+            {
+                double dx = a.X - b.X;
+                double dy = a.Y - b.Y;
+                return dx * dx + dy * dy;
+            }
+
+            private static void AppendArcRecoveryLog(
+                StringBuilder? sb,
+                string handle,
+                ArcRecoveryDebugInfo info)
+            {
+                if (sb == null)
+                    return;
+
+                sb.AppendLine(
+                    "ARC_RECOVERY" +
+                    $" | H={handle}" +
+                    $" | Kind={info.RecoveryKind}" +
+                    $" | C=({Fmt(info.Center.X)},{Fmt(info.Center.Y)})" +
+                    $" | R={Fmt(info.Radius)}" +
+                    $" | Chosen=({FmtRad(info.ChosenStartAngle)}->{FmtRad(info.ChosenEndAngle)})" +
+                    $" | Score1={Fmt(info.Candidate1Score)}" +
+                    $" | Score2={Fmt(info.Candidate2Score)}" +
+                    $" | ExpArc={FmtPoint(info.ExpectedPointOnArc)}" +
+                    $" | ExpGap={FmtPoint(info.ExpectedGapPoint)}" +
+                    $" | Notes={info.Notes}");
+            }
+
+            private static string Fmt(double v)
+            {
+                if (double.IsNaN(v) || double.IsInfinity(v))
+                    return "NaN";
+                return v.ToString("0.###", CultureInfo.InvariantCulture);
+            }
+
+            private static string FmtRad(double v)
+            {
+                if (double.IsNaN(v) || double.IsInfinity(v))
+                    return "NaN";
+                return v.ToString("0.000000", CultureInfo.InvariantCulture);
+            }
+
+            private static string FmtPoint(Point2d? p)
+            {
+                if (!p.HasValue)
+                    return "null";
+
+                return $"({Fmt(p.Value.X)},{Fmt(p.Value.Y)})";
+            }
+        }
+
+
 
         [CommandMethod("FLUX_COPY_TOPLEVEL_GEOMETRY_VIEWS_OUTSIDE_SNAPSHOT")]
         public void FluxCopyTopLevelGeometryViewsOutsideSnapshot()
@@ -518,11 +974,20 @@ namespace FluxCAD.BricsCAD.Plugin26
                     return;
                 }
 
-                var groupDx = modelBounds.MaxX - groupBounds.MinX + groupGap;
+                var placementBounds = !pipeline.RobustBounds.IsEmpty
+                    ? pipeline.RobustBounds
+                    : modelBounds;
+
+                // 중요: groupGap을 더 이상 modelBounds/AllBounds 기반으로 만들지 말 것
+                groupGap = Math.Max(200.0, placementBounds.Width * 0.15);
+
+                var groupDx = placementBounds.MaxX - groupBounds.MinX + groupGap;
                 var groupDy = 0.0;
 
                 ed.WriteMessage(
-                    $"\n[FluxCAD] SnapshotCopyGroupBounds={groupBounds}, GroupOffset=({groupDx:0.##},{groupDy:0.##})");
+                    $"\n[FluxCAD] SnapshotCopyGroupBounds={groupBounds}, " +
+                    $"PlacementBounds={placementBounds}, " +
+                    $"GroupOffset=({groupDx:0.##},{groupDy:0.##})");
 
                 int totalSourceCount = 0;
                 int totalCopiedCount = 0;
@@ -609,7 +1074,7 @@ namespace FluxCAD.BricsCAD.Plugin26
 
                             foreach (var leaf in recreateLeaves)
                             {
-                                var ent = CreateCadEntityFromSnapshotLeaf(leaf, outLayer);
+                                var ent = CreateCadEntityFromSnapshotLeaf(leaf, outLayer, ed);
                                 if (ent == null)
                                     continue;
 
@@ -627,7 +1092,7 @@ namespace FluxCAD.BricsCAD.Plugin26
                                 if (string.IsNullOrWhiteSpace(handle) || resolvedHandleSet.Contains(handle))
                                     continue;
 
-                                var ent = CreateCadEntityFromSnapshotLeaf(leaf, outLayer);
+                                var ent = CreateCadEntityFromSnapshotLeaf(leaf, outLayer, ed);
                                 if (ent == null)
                                     continue;
 
@@ -869,9 +1334,504 @@ namespace FluxCAD.BricsCAD.Plugin26
             try { target.Material = source.Material; } catch { }
         }
 
-        private static Entity? CreateCadEntityFromSnapshotLeaf(
+
+        private static Point2D? ResolveEntityCenter(SheetEntity e)
+        {
+            if (e.CenterPoint.HasValue)
+                return e.CenterPoint;
+
+            if (e.Center.HasValue)
+                return e.Center;
+
+            return null;
+        }
+
+        private static bool TryResolveArcAnglesDeg(
+            SheetEntity e,
+            out double startDeg,
+            out double endDeg)
+        {
+            startDeg = 0.0;
+            endDeg = 0.0;
+
+            // 1순위: nullable 2D 각도
+            if (e.StartAngleDeg2D.HasValue && e.EndAngleDeg2D.HasValue)
+            {
+                startDeg = NormalizeAngleDeg(e.StartAngleDeg2D.Value);
+                endDeg = NormalizeAngleDeg(e.EndAngleDeg2D.Value);
+                return true;
+            }
+
+            // 2순위: 기존 각도 (non-nullable)
+            // 주의: 이 값은 기본값 0일 수 있으므로 둘 다 0인데 반지름/bounds가 있으면
+            // 실제 값이 아닐 가능성이 있음. 그래도 fallback으로 사용.
+            startDeg = NormalizeAngleDeg(e.StartAngleDeg);
+            endDeg = NormalizeAngleDeg(e.EndAngleDeg);
+            return true;
+        }
+
+        private static double NormalizeAngleDeg(double deg)
+        {
+            while (deg < 0.0)
+                deg += 360.0;
+
+            while (deg >= 360.0)
+                deg -= 360.0;
+
+            return deg;
+        }
+
+        private static double DegreesToRadiansNormalized(double deg)
+        {
+            return NormalizeAngleDeg(deg) * Math.PI / 180.0;
+        }
+
+
+        private static Entity? CreateArcFromSnapshotLeafRobust(
     SheetEntity e,
-    string outLayer)
+    Bricscad.EditorInput.Editor? ed)
+        {
+            var center = ResolveEntityCenter(e);
+            if (!center.HasValue || !e.Radius.HasValue || e.Radius.Value <= 0.0)
+                return null;
+
+            double radius = e.Radius.Value;
+            var c = center.Value;
+
+            // -------------------------------------------------
+            // 1) StartPoint / EndPoint가 있으면 최우선 사용
+            // -------------------------------------------------
+            if (e.StartPoint.HasValue && e.EndPoint.HasValue)
+            {
+                double startRad = NormalizeAngleRad(Math.Atan2(
+                    e.StartPoint.Value.Y - c.Y,
+                    e.StartPoint.Value.X - c.X));
+
+                double endRad = NormalizeAngleRad(Math.Atan2(
+                    e.EndPoint.Value.Y - c.Y,
+                    e.EndPoint.Value.X - c.X));
+
+                LogArcResolveDebug(
+                    ed,
+                    e,
+                    "Points",
+                    center,
+                    radius,
+                    e.Bounds,
+                    startRad * 180.0 / Math.PI,
+                    endRad * 180.0 / Math.PI);
+
+                return new Arc(
+                    new Point3d(c.X, c.Y, 0.0),
+                    radius,
+                    startRad,
+                    endRad);
+            }
+
+            // -------------------------------------------------
+            // 2) 각도 기반 복원
+            // -------------------------------------------------
+            if (TryResolveArcAnglesDeg(e, out var startDeg, out var endDeg))
+            {
+                double startRad = DegreesToRadiansNormalized(startDeg);
+                double endRad = DegreesToRadiansNormalized(endDeg);
+
+                LogArcResolveDebug(
+                    ed,
+                    e,
+                    "Angles",
+                    center,
+                    radius,
+                    e.Bounds,
+                    startDeg,
+                    endDeg);
+
+                return CreateBestArcCandidate(
+                    e,
+                    c,
+                    radius,
+                    startRad,
+                    endRad,
+                    e.Bounds,
+                    ed);
+            }
+
+            return null;
+        }
+
+
+        private static Arc? CreateBestArcCandidate(
+    SheetEntity source,
+    Point2D center,
+    double radius,
+    double startRad,
+    double endRad,
+    Bounds2D targetBounds,
+    Bricscad.EditorInput.Editor? ed)
+        {
+            try
+            {
+                // -------------------------------------------------
+                // A. full-circle bounds + endpoint 없음
+                //    => gap 기반 major arc 복원
+                // -------------------------------------------------
+                if (!source.StartPoint.HasValue &&
+                    !source.EndPoint.HasValue &&
+                    IsNearFullCircleArcBounds(targetBounds, center, radius))
+                {
+                    if (TryCreateGapBasedMajorArcCandidate(
+                        center,
+                        radius,
+                        startRad,
+                        endRad,
+                        targetBounds,
+                        ed,
+                        source.Handle,
+                        out var recoveredArc))
+                    {
+                        return recoveredArc;
+                    }
+                }
+
+                // -------------------------------------------------
+                // B. 일반 경로
+                //    => 원본 방향 우선, swap은 보조 후보
+                // -------------------------------------------------
+                var candidate1 = new Arc(
+                    new Point3d(center.X, center.Y, 0.0),
+                    radius,
+                    startRad,
+                    endRad);
+
+                var candidate2 = new Arc(
+                    new Point3d(center.X, center.Y, 0.0),
+                    radius,
+                    endRad,
+                    startRad);
+
+                double score1 = ScoreArcCandidate(candidate1, targetBounds, preferOriginalSweep: true);
+                double score2 = ScoreArcCandidate(candidate2, targetBounds, preferOriginalSweep: false);
+
+                if (score1 <= score2)
+                {
+                    candidate2.Dispose();
+                    return candidate1;
+                }
+
+                candidate1.Dispose();
+                return candidate2;
+            }
+            catch
+            {
+                return null;
+            }
+        }
+
+
+        private static double ScoreArcCandidate(
+     Arc arc,
+     Bounds2D targetBounds,
+     bool preferOriginalSweep)
+        {
+            try
+            {
+                var ext = arc.GeometricExtents;
+                var candidateBounds = new Bounds2D(
+                    ext.MinPoint.X,
+                    ext.MinPoint.Y,
+                    ext.MaxPoint.X,
+                    ext.MaxPoint.Y);
+
+                double score = 0.0;
+
+                // bounds 차이
+                score += Math.Abs(candidateBounds.MinX - targetBounds.MinX);
+                score += Math.Abs(candidateBounds.MinY - targetBounds.MinY);
+                score += Math.Abs(candidateBounds.MaxX - targetBounds.MaxX);
+                score += Math.Abs(candidateBounds.MaxY - targetBounds.MaxY);
+
+                // width/height 차이
+                score += Math.Abs(candidateBounds.Width - targetBounds.Width) * 0.5;
+                score += Math.Abs(candidateBounds.Height - targetBounds.Height) * 0.5;
+
+                // full-circle bounds 근처에서는 major arc를 무조건 벌점 주면 안 됨
+                double sweep = NormalizePositiveSweepRad(arc.EndAngle - arc.StartAngle);
+
+                // 너무 작은 sweep는 대체로 오해석일 가능성이 큼
+                if (sweep < DegreesToRadiansNormalized(8.0))
+                    score += 5000.0;
+
+                // 일반 경로에서는 원래 순서를 약간 우대
+                if (!preferOriginalSweep)
+                    score += 5.0;
+
+                return score;
+            }
+            catch
+            {
+                return double.MaxValue;
+            }
+        }
+
+
+        private static bool IsNearFullCircleArcBounds(
+    Bounds2D bounds,
+    Point2D center,
+    double radius)
+        {
+            if (bounds.IsEmpty || radius <= 0.0)
+                return false;
+
+            double tol = Math.Max(0.5, radius * 0.12);
+
+            double expectedMinX = center.X - radius;
+            double expectedMinY = center.Y - radius;
+            double expectedMaxX = center.X + radius;
+            double expectedMaxY = center.Y + radius;
+
+            return
+                Math.Abs(bounds.MinX - expectedMinX) <= tol &&
+                Math.Abs(bounds.MinY - expectedMinY) <= tol &&
+                Math.Abs(bounds.MaxX - expectedMaxX) <= tol &&
+                Math.Abs(bounds.MaxY - expectedMaxY) <= tol;
+        }
+
+        private static bool TryCreateGapBasedMajorArcCandidate(
+            Point2D center,
+            double radius,
+            double startRad,
+            double endRad,
+            Bounds2D targetBounds,
+            Bricscad.EditorInput.Editor? ed,
+            string? handle,
+            out Arc? arc)
+        {
+            arc = null;
+
+            // 원본 각도쌍이 의미하는 "gap"를 먼저 계산
+            // start->end sweep와 end->start sweep 중
+            // 더 짧은 쪽을 gap로 간주하고,
+            // 실제 arc는 그 보수(complement)인 270도 major arc로 본다.
+            double sweepForward = NormalizePositiveSweepRad(endRad - startRad);
+            double sweepReverse = NormalizePositiveSweepRad(startRad - endRad);
+
+            double gapStart;
+            double gapEnd;
+
+            if (sweepForward <= sweepReverse)
+            {
+                // start -> end 가 짧은 gap
+                gapStart = startRad;
+                gapEnd = endRad;
+            }
+            else
+            {
+                // end -> start 가 짧은 gap
+                gapStart = endRad;
+                gapEnd = startRad;
+            }
+
+            // gap를 비운 major arc는 gapEnd -> gapStart
+            double majorStart = gapEnd;
+            double majorEnd = gapStart;
+
+            var candidateMajor = new Arc(
+                new Point3d(center.X, center.Y, 0.0),
+                radius,
+                majorStart,
+                majorEnd);
+
+            var candidateMinor = new Arc(
+                new Point3d(center.X, center.Y, 0.0),
+                radius,
+                gapStart,
+                gapEnd);
+
+            double majorScore = ScoreGapAwareArcCandidate(
+                candidateMajor,
+                center,
+                radius,
+                gapStart,
+                gapEnd,
+                targetBounds,
+                expectMajorArc: true);
+
+            double minorScore = ScoreGapAwareArcCandidate(
+                candidateMinor,
+                center,
+                radius,
+                gapStart,
+                gapEnd,
+                targetBounds,
+                expectMajorArc: false);
+
+            ed?.WriteMessage(
+                $"\n[ArcGapSelect] H:{handle}, " +
+                $"GapStart={RadiansToDegrees(gapStart):0.##}, GapEnd={RadiansToDegrees(gapEnd):0.##}, " +
+                $"MajorSweep={RadiansToDegrees(NormalizePositiveSweepRad(candidateMajor.EndAngle - candidateMajor.StartAngle)):0.##}, " +
+                $"MinorSweep={RadiansToDegrees(NormalizePositiveSweepRad(candidateMinor.EndAngle - candidateMinor.StartAngle)):0.##}, " +
+                $"MajorScore={majorScore:0.###}, MinorScore={minorScore:0.###}");
+
+            if (majorScore <= minorScore)
+            {
+                candidateMinor.Dispose();
+                arc = candidateMajor;
+            }
+            else
+            {
+                candidateMajor.Dispose();
+                arc = candidateMinor;
+            }
+
+            return arc != null;
+        }
+
+        private static double ScoreGapAwareArcCandidate(
+            Arc arc,
+            Point2D center,
+            double radius,
+            double gapStart,
+            double gapEnd,
+            Bounds2D targetBounds,
+            bool expectMajorArc)
+        {
+            double score = ScoreArcCandidate(arc, targetBounds, preferOriginalSweep: true);
+
+            double sweep = NormalizePositiveSweepRad(arc.EndAngle - arc.StartAngle);
+
+            double expectedSweep = expectMajorArc
+                ? (Math.PI * 1.5)
+                : NormalizePositiveSweepRad(gapEnd - gapStart);
+
+            score += Math.Abs(sweep - expectedSweep) * 500.0;
+
+            // gap midpoint가 실제 비어 있는 쪽으로 남는지 확인
+            double gapMid = NormalizeAngleRad(gapStart + NormalizePositiveSweepRad(gapEnd - gapStart) * 0.5);
+            double arcMid = NormalizeAngleRad(arc.StartAngle + NormalizePositiveSweepRad(arc.EndAngle - arc.StartAngle) * 0.5);
+
+            var gapMidPt = new Point2d(
+                center.X + radius * Math.Cos(gapMid),
+                center.Y + radius * Math.Sin(gapMid));
+
+            var arcMidPt = new Point2d(
+                center.X + radius * Math.Cos(arcMid),
+                center.Y + radius * Math.Sin(arcMid));
+
+            // gap midpoint와 arc midpoint가 너무 비슷하면 잘못된 후보
+            double dx = gapMidPt.X - arcMidPt.X;
+            double dy = gapMidPt.Y - arcMidPt.Y;
+            double distSq = dx * dx + dy * dy;
+
+            if (distSq < Math.Max(1.0, radius * radius * 0.10))
+                score += 2000.0;
+
+            if (expectMajorArc && sweep < Math.PI)
+                score += 3000.0;
+
+            if (!expectMajorArc && sweep > Math.PI)
+                score += 3000.0;
+
+            return score;
+        }
+
+        private static double NormalizeAngleRad(double rad)
+        {
+            while (rad < 0.0)
+                rad += Math.PI * 2.0;
+
+            while (rad >= Math.PI * 2.0)
+                rad -= Math.PI * 2.0;
+
+            return rad;
+        }
+
+        private static double NormalizePositiveSweepRad(double sweep)
+        {
+            while (sweep < 0.0)
+                sweep += Math.PI * 2.0;
+
+            while (sweep >= Math.PI * 2.0)
+                sweep -= Math.PI * 2.0;
+
+            return sweep;
+        }
+
+        private static double RadiansToDegrees(double rad)
+        {
+            return rad * 180.0 / Math.PI;
+        }
+
+
+        private static IEnumerable<Arc> BuildQuarterArcCandidates(
+            Point2D center,
+            double radius)
+        {
+            yield return new Arc(
+                new Point3d(center.X, center.Y, 0.0),
+                radius,
+                DegreesToRadiansNormalized(0.0),
+                DegreesToRadiansNormalized(90.0));
+
+            yield return new Arc(
+                new Point3d(center.X, center.Y, 0.0),
+                radius,
+                DegreesToRadiansNormalized(90.0),
+                DegreesToRadiansNormalized(180.0));
+
+            yield return new Arc(
+                new Point3d(center.X, center.Y, 0.0),
+                radius,
+                DegreesToRadiansNormalized(180.0),
+                DegreesToRadiansNormalized(270.0));
+
+            yield return new Arc(
+                new Point3d(center.X, center.Y, 0.0),
+                radius,
+                DegreesToRadiansNormalized(270.0),
+                DegreesToRadiansNormalized(360.0));
+        }
+
+        private static Entity? CreateCircleFromSnapshotLeafRobust(SheetEntity e, Bricscad.EditorInput.Editor? ed)
+        {
+            var center = ResolveEntityCenter(e);
+            if (!center.HasValue || !e.Radius.HasValue || e.Radius.Value <= 0.0)
+                return null;
+
+            return new Circle(
+                new Point3d(center.Value.X, center.Value.Y, 0.0),
+                Vector3d.ZAxis,
+                e.Radius.Value);
+        }
+
+
+        private static void LogArcResolveDebug(
+    Bricscad.EditorInput.Editor? ed,
+    SheetEntity e,
+    string mode,
+    Point2D? center,
+    double? radius,
+    Bounds2D bounds,
+    double? startDeg,
+    double? endDeg)
+        {
+            if (ed == null)
+                return;
+
+            ed.WriteMessage(
+                $"\n[ArcResolve] H:{e.Handle}, " +
+                $"Mode={mode}, " +
+                $"Center={center}, R={radius}, " +
+                $"Bounds={bounds}, " +
+                $"SP={e.StartPoint}, EP={e.EndPoint}, " +
+                $"StartDeg={startDeg}, EndDeg={endDeg}, " +
+                $"StartDeg2D={e.StartAngleDeg2D}, EndDeg2D={e.EndAngleDeg2D}");
+        }
+
+        private static Entity? CreateCadEntityFromSnapshotLeaf(
+            SheetEntity e,
+            string outLayer,
+            Bricscad.EditorInput.Editor? ed
+        )
         {
             if (e == null)
                 return null;
@@ -910,31 +1870,13 @@ namespace FluxCAD.BricsCAD.Plugin26
 
                 case SheetEntityKind.Circle:
                     {
-                        var center = e.CenterPoint ?? e.Center;
-                        if (!center.HasValue || !e.Radius.HasValue || e.Radius.Value <= 0.0)
-                            return null;
-
-                        created = new Circle(
-                            new Point3d(center.Value.X, center.Value.Y, 0.0),
-                            Vector3d.ZAxis,
-                            e.Radius.Value);
+                        created = CreateCircleFromSnapshotLeafRobust(e, ed);
                         break;
                     }
 
                 case SheetEntityKind.Arc:
                     {
-                        var center = e.CenterPoint ?? e.Center;
-                        if (!center.HasValue || !e.Radius.HasValue || e.Radius.Value <= 0.0)
-                            return null;
-
-                        double startDeg = e.StartAngleDeg2D ?? e.StartAngleDeg;
-                        double endDeg = e.EndAngleDeg2D ?? e.EndAngleDeg;
-
-                        created = new Arc(
-                            new Point3d(center.Value.X, center.Value.Y, 0.0),
-                            e.Radius.Value,
-                            DegreesToRadians(startDeg),
-                            DegreesToRadians(endDeg));
+                        created = CreateArcFromSnapshotLeafRobust(e, ed);
                         break;
                     }
 
