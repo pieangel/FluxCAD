@@ -19898,35 +19898,76 @@ namespace FluxCAD.BricsCAD.Plugin26
                 return SheetEntityRole.ReferenceGeometry;
             }
 
-            if (participatesInGeometryLoop)
-            {
-                e.RoleReason = "Geometry candidate participates in target view geometry region";
-                return SheetEntityRole.Geometry;
-            }
-
             bool isClosedEnvelopeCandidate =
                 IsEllipseLike(e) ||
                 (e.Kind == SheetEntityKind.Polyline && e.IsClosed);
 
+            // 1) 해치를 감싸는 닫힌 envelope는 geometry loop보다 먼저 제거
             if (e.ContainsOrEnclosesHatchLike &&
                 isClosedEnvelopeCandidate)
             {
                 e.IsVisualHintCandidate = true;
+                e.IsLikelySemanticNoise = true;
                 e.RoleReason = "Closed envelope containing hatch-like region";
                 return SheetEntityRole.VisualHint;
             }
 
+            // 2) 진짜 외곽선 보호
+            //    - center/hidden 아님
+            //    - hatch envelope 아님
+            //    - view 내부 형상 loop에 참여
+            //    - 특히 긴 직선/호는 외곽선일 가능성이 매우 높음
+            bool hasValidViewBounds = !targetViewBounds.IsEmpty &&
+                                      targetViewBounds.Width > 0.0 &&
+                                      targetViewBounds.Height > 0.0;
+
+            double widthRatio = hasValidViewBounds
+                ? e.Bounds.Width / Math.Max(targetViewBounds.Width, 1e-9)
+                : 0.0;
+
+            double heightRatio = hasValidViewBounds
+                ? e.Bounds.Height / Math.Max(targetViewBounds.Height, 1e-9)
+                : 0.0;
+
+            bool isLongHorizontalBoundary = widthRatio >= 0.60 && heightRatio <= 0.12;
+            bool isLongVerticalBoundary = heightRatio >= 0.60 && widthRatio <= 0.12;
+            bool isStrongOuterBoundaryShape =
+                isLongHorizontalBoundary ||
+                isLongVerticalBoundary ||
+                e.Kind == SheetEntityKind.Arc ||
+                e.Kind == SheetEntityKind.Circle;
+
+            if (participatesInGeometryLoop &&
+                !e.ContainsOrEnclosesHatchLike &&
+                isStrongOuterBoundaryShape)
+            {
+                e.IsLikelySemanticNoise = false;
+                e.RoleReason = "Strong outer boundary candidate in target view geometry region";
+                return SheetEntityRole.Geometry;
+            }
+
+            // 3) 일반 geometry loop 참여 형상은 그대로 geometry
+            if (participatesInGeometryLoop)
+            {
+                e.IsLikelySemanticNoise = false;
+                e.RoleReason = "Geometry candidate participates in target view geometry region";
+                return SheetEntityRole.Geometry;
+            }
+
+            // 4) ellipse-like visual hint는 여전히 제거
             if (e.IsVisualHintCandidate &&
                 IsEllipseLike(e) &&
                 !targetViewBounds.IsEmpty &&
                 e.Bounds.Area >= targetViewBounds.Area * 0.75)
             {
+                e.IsLikelySemanticNoise = true;
                 e.RoleReason = "VisualHint: large faded ellipse-like envelope";
                 return SheetEntityRole.VisualHint;
             }
 
             if (e.IsVisualHintCandidate && IsEllipseLike(e))
             {
+                e.IsLikelySemanticNoise = true;
                 e.RoleReason = "VisualHint: faded ellipse-like non-loop geometry";
                 return SheetEntityRole.VisualHint;
             }
