@@ -864,7 +864,7 @@ namespace FluxCAD.BricsCAD.Plugin26
                 {
                     var msId = SymbolUtilityServices.GetBlockModelSpaceId(db);
                     var ms = (BlockTableRecord)tr.GetObject(msId, OpenMode.ForWrite);
-                    var outLayer = EnsureCopyOutputLayer(db, tr);
+                    var outLayerName = EnsureCopyOutputLayer(db, tr);
 
                     foreach (var view in targetViews)
                     {
@@ -895,7 +895,7 @@ namespace FluxCAD.BricsCAD.Plugin26
                             db,
                             tr,
                             ms,
-                            outLayer,
+                            outLayerName,
                             view,
                             result,
                             labelYOffset: Math.Max(viewBounds.Height * 0.06, 15.0));
@@ -922,13 +922,13 @@ namespace FluxCAD.BricsCAD.Plugin26
         }
 
         private static void DrawOuterContourTraceDebug(
-    Database db,
-    Transaction tr,
-    BlockTableRecord ms,
-    ObjectId outLayer,
-    ViewCandidate view,
-    OuterContourExtractionResult result,
-    double labelYOffset)
+            Database db,
+            Transaction tr,
+            BlockTableRecord ms,
+            string outLayerName,
+            ViewCandidate view,
+            OuterContourExtractionResult result,
+            double labelYOffset)
         {
             if (result == null)
                 return;
@@ -938,7 +938,7 @@ namespace FluxCAD.BricsCAD.Plugin26
                 db,
                 tr,
                 ms,
-                outLayer,
+                outLayerName,
                 result.ViewBounds,
                 colorIndex: 8,
                 closed: true);
@@ -946,7 +946,7 @@ namespace FluxCAD.BricsCAD.Plugin26
             DrawDebugText(
                 db,
                 tr,
-                outLayer,
+                outLayerName,
                 new Point2D(result.ViewBounds.Center.X, result.ViewBounds.MaxY + labelYOffset),
                 $"OUTER TRACE V{view.IslandId}",
                 colorIndex: 8,
@@ -967,7 +967,7 @@ namespace FluxCAD.BricsCAD.Plugin26
                     db,
                     tr,
                     ms,
-                    outLayer,
+                    outLayerName,
                     p,
                     size: Math.Max(2.0, Math.Min(result.ViewBounds.Width, result.ViewBounds.Height) * 0.01),
                     colorIndex: 2);
@@ -975,7 +975,7 @@ namespace FluxCAD.BricsCAD.Plugin26
                 DrawDebugText(
                     db,
                     tr,
-                    outLayer,
+                    outLayerName,
                     new Point2D(p.X, p.Y + Math.Max(3.0, labelYOffset * 0.15)),
                     $"S:{seed.Side} #{seed.EdgeId}",
                     colorIndex: 2,
@@ -995,7 +995,7 @@ namespace FluxCAD.BricsCAD.Plugin26
                         db,
                         tr,
                         ms,
-                        outLayer,
+                        outLayerName,
                         edge,
                         colorIndex: 3);
                 }
@@ -1004,7 +1004,7 @@ namespace FluxCAD.BricsCAD.Plugin26
                     db,
                     tr,
                     ms,
-                    outLayer,
+                    outLayerName,
                     result.BestLoop.Bounds,
                     colorIndex: 3,
                     closed: true);
@@ -1012,7 +1012,7 @@ namespace FluxCAD.BricsCAD.Plugin26
                 DrawDebugText(
                     db,
                     tr,
-                    outLayer,
+                    outLayerName,
                     new Point2D(result.BestLoop.Bounds.Center.X, result.BestLoop.Bounds.MinY - labelYOffset * 0.6),
                     $"BEST LOOP V{view.IslandId} | Edges={result.BestLoop.EdgeIds.Count} | Area={result.BestLoop.EstimatedArea:0.##} | Score={result.BestLoop.OuterScore:0.##}",
                     colorIndex: 3,
@@ -1024,7 +1024,7 @@ namespace FluxCAD.BricsCAD.Plugin26
             Database db,
             Transaction tr,
             BlockTableRecord ms,
-            ObjectId outLayer,
+            string outLayerName,
             ContourEdge edge,
             short colorIndex)
         {
@@ -1039,7 +1039,7 @@ namespace FluxCAD.BricsCAD.Plugin26
                         var ln = new Line(
                             new Point3d(edge.Start.X, edge.Start.Y, 0.0),
                             new Point3d(edge.End.X, edge.End.Y, 0.0));
-                        ln.LayerId = outLayer;
+                        ln.Layer = outLayerName;
                         ln.ColorIndex = colorIndex;
                         ms.AppendEntity(ln);
                         tr.AddNewlyCreatedDBObject(ln, true);
@@ -1058,7 +1058,7 @@ namespace FluxCAD.BricsCAD.Plugin26
                             new Point3d(center.X, center.Y, 0.0),
                             Vector3d.ZAxis,
                             radius);
-                        c.LayerId = outLayer;
+                        c.Layer = outLayerName;
                         c.ColorIndex = colorIndex;
                         ms.AppendEntity(c);
                         tr.AddNewlyCreatedDBObject(c, true);
@@ -1074,7 +1074,7 @@ namespace FluxCAD.BricsCAD.Plugin26
                             var fallback = new Line(
                                 new Point3d(edge.Start.X, edge.Start.Y, 0.0),
                                 new Point3d(edge.End.X, edge.End.Y, 0.0));
-                            fallback.LayerId = outLayer;
+                            fallback.Layer = outLayerName;
                             fallback.ColorIndex = colorIndex;
                             ms.AppendEntity(fallback);
                             tr.AddNewlyCreatedDBObject(fallback, true);
@@ -1095,7 +1095,7 @@ namespace FluxCAD.BricsCAD.Plugin26
                             radius,
                             startRad,
                             endRad);
-                        arc.LayerId = outLayer;
+                        arc.Layer = outLayerName;
                         arc.ColorIndex = colorIndex;
                         ms.AppendEntity(arc);
                         tr.AddNewlyCreatedDBObject(arc, true);
@@ -1104,12 +1104,11 @@ namespace FluxCAD.BricsCAD.Plugin26
 
                 case ContourEdgeKind.Ellipse:
                     {
-                        // 단순 시각화용 fallback: bounds 사각형으로 표시
                         DrawBoundsPolyline(
                             db,
                             tr,
                             ms,
-                            outLayer,
+                            outLayerName,
                             edge.Bounds,
                             colorIndex,
                             closed: true);
@@ -1118,11 +1117,12 @@ namespace FluxCAD.BricsCAD.Plugin26
             }
         }
 
+
         private static void DrawBoundsPolyline(
             Database db,
             Transaction tr,
             BlockTableRecord ms,
-            ObjectId outLayer,
+            string outLayerName,
             Bounds2D bounds,
             short colorIndex,
             bool closed)
@@ -1140,7 +1140,7 @@ namespace FluxCAD.BricsCAD.Plugin26
             pl.AddVertexAt(3, new Point2d(bounds.MinX, bounds.MaxY), 0, 0, 0);
 
             pl.Closed = closed;
-            pl.LayerId = outLayer;
+            pl.Layer = outLayerName;
             pl.ColorIndex = colorIndex;
 
             ms.AppendEntity(pl);
@@ -1151,7 +1151,7 @@ namespace FluxCAD.BricsCAD.Plugin26
             Database db,
             Transaction tr,
             BlockTableRecord ms,
-            ObjectId outLayer,
+            string outLayerName,
             Point2D center,
             double size,
             short colorIndex)
@@ -1161,7 +1161,7 @@ namespace FluxCAD.BricsCAD.Plugin26
             var ln1 = new Line(
                 new Point3d(center.X - s, center.Y, 0.0),
                 new Point3d(center.X + s, center.Y, 0.0));
-            ln1.LayerId = outLayer;
+            ln1.Layer = outLayerName;
             ln1.ColorIndex = colorIndex;
             ms.AppendEntity(ln1);
             tr.AddNewlyCreatedDBObject(ln1, true);
@@ -1169,7 +1169,7 @@ namespace FluxCAD.BricsCAD.Plugin26
             var ln2 = new Line(
                 new Point3d(center.X, center.Y - s, 0.0),
                 new Point3d(center.X, center.Y + s, 0.0));
-            ln2.LayerId = outLayer;
+            ln2.Layer = outLayerName;
             ln2.ColorIndex = colorIndex;
             ms.AppendEntity(ln2);
             tr.AddNewlyCreatedDBObject(ln2, true);
