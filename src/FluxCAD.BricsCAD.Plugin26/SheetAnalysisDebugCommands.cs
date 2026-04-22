@@ -26,6 +26,7 @@ using Teigha.GraphicsSystem;
 using Teigha.Runtime;
 using static System.Formats.Asn1.AsnWriter;
 using TeighaColor = Teigha.Colors.Color;
+using FluxCAD.SheetAnalysis.Contours;
 
 namespace FluxCAD.BricsCAD.Plugin26
 {
@@ -806,7 +807,373 @@ namespace FluxCAD.BricsCAD.Plugin26
             }
         }
 
+        [CommandMethod("FLUX_DEBUG_OUTER_CONTOUR_TRACE")]
+        public void FluxDebugOuterContourTrace()
+        {
+            var doc = Bricscad.ApplicationServices.Application.DocumentManager.MdiActiveDocument;
+            if (doc == null)
+                return;
 
+            var db = doc.Database;
+            var ed = doc.Editor;
+
+            try
+            {
+                var sheetFilePath = db.Filename;
+                if (string.IsNullOrWhiteSpace(sheetFilePath))
+                {
+                    ed.WriteMessage("\n[FluxCAD] 저장된 DWG 파일이 아닙니다.");
+                    return;
+                }
+
+                var candidates = BuildResolvedViewCandidates(sheetFilePath, ed);
+                if (candidates == null || candidates.Count == 0)
+                {
+                    ed.WriteMessage("\n[FluxCAD] view candidate가 비어 있습니다.");
+                    return;
+                }
+
+                var targetViews = candidates
+                    .Where(x => x != null)
+                    .Where(x => x.FinalRole == ViewIslandSemanticRole.GeometryView)
+                    .Where(x => x.IsTopLevelView)
+                    .Where(x => !x.IsSparseBridgeLike)
+                    .OrderBy(x => x.IslandId)
+                    .ToList();
+
+                if (targetViews.Count == 0)
+                {
+                    ed.WriteMessage("\n[FluxCAD] Outer contour trace 대상 TopLevel GeometryView가 없습니다.");
+                    return;
+                }
+
+                IEntitySnapshotBuilder snapshotBuilder = new SimpleSheetFileSnapshotBuilder();
+                var fullEntities = snapshotBuilder.Build(sheetFilePath);
+
+                if (fullEntities == null || fullEntities.Count == 0)
+                {
+                    ed.WriteMessage("\n[FluxCAD] snapshot entity가 비어 있습니다.");
+                    return;
+                }
+
+                ed.WriteMessage($"\n[FluxCAD] OuterContourTrace Start. Views={targetViews.Count}, SnapshotEntities={fullEntities.Count}");
+
+                var extractor = new OuterContourExtractor();
+
+                using (var tr = db.TransactionManager.StartTransaction())
+                {
+                    var msId = SymbolUtilityServices.GetBlockModelSpaceId(db);
+                    var ms = (BlockTableRecord)tr.GetObject(msId, OpenMode.ForWrite);
+                    var outLayer = EnsureCopyOutputLayer(db, tr);
+
+                    foreach (var view in targetViews)
+                    {
+                        var viewBounds = Bounds2DHelper.Normalize(view.Bounds);
+
+                        var result = extractor.Extract(
+                            fullEntities,
+                            viewBounds,
+                            new OuterContourExtractionOptions
+                            {
+                                EndpointToleranceMin = 2.0,
+                                EndpointToleranceRatio = 0.02,
+                                OuterBandRatio = 0.10,
+                                OuterBandMin = 6.0,
+                                MinEdgeLengthRatio = 0.003,
+                                MinLoopPerimeterRatio = 0.12,
+                                MinLoopAreaRatio = 0.005,
+                                RequireContinuousLikeStyle = true,
+                                PreferOuterContourLikeLayer = true,
+                                ExcludeVisualHintCandidates = true,
+                                MaxTraceDepth = 256,
+                                MaxOutgoingLinksPerEdge = 8
+                            });
+
+                        ed.WriteMessage("\n" + OuterContourDebugTextFormatter.Format(result));
+
+                        DrawOuterContourTraceDebug(
+                            db,
+                            tr,
+                            ms,
+                            outLayer,
+                            view,
+                            result,
+                            labelYOffset: Math.Max(viewBounds.Height * 0.06, 15.0));
+
+                        var bestEntities = result.GetBestLoopEntities();
+
+                        ed.WriteMessage(
+                            $"\n[FluxCAD] OuterContourTrace View={view.IslandId}, " +
+                            $"Bounds={viewBounds}, Eligible={result.EligibleEntities.Count}, " +
+                            $"Edges={result.Edges.Count}, Seeds={result.Seeds.Count}, " +
+                            $"Loops={result.Loops.Count}, BestLoopEdges={(result.BestLoop?.EdgeIds.Count ?? 0)}, " +
+                            $"BestLoopEntities={bestEntities.Count}");
+                    }
+
+                    tr.Commit();
+                }
+
+                ed.WriteMessage("\n[FluxCAD] FLUX_DEBUG_OUTER_CONTOUR_TRACE completed.");
+            }
+            catch (System.Exception ex)
+            {
+                ed.WriteMessage($"\n[FluxCAD] FLUX_DEBUG_OUTER_CONTOUR_TRACE failed: {ex}");
+            }
+        }
+
+        private static void DrawOuterContourTraceDebug(
+    Database db,
+    Transaction tr,
+    BlockTableRecord ms,
+    ObjectId outLayer,
+    ViewCandidate view,
+    OuterContourExtractionResult result,
+    double labelYOffset)
+        {
+            if (result == null)
+                return;
+
+            // 1) view bounds
+            DrawBoundsPolyline(
+                db,
+                tr,
+                ms,
+                outLayer,
+                result.ViewBounds,
+                colorIndex: 8,
+                closed: true);
+
+            DrawDebugText(
+                db,
+                tr,
+                outLayer,
+                new Point2D(result.ViewBounds.Center.X, result.ViewBounds.MaxY + labelYOffset),
+                $"OUTER TRACE V{view.IslandId}",
+                colorIndex: 8,
+                textHeight: Math.Max(8.0, Math.Min(result.ViewBounds.Width, result.ViewBounds.Height) * 0.05));
+
+            // 2) seed 표시
+            foreach (var seed in result.Seeds
+                .OrderByDescending(x => x.Score)
+                .Take(16))
+            {
+                if (seed.EdgeId < 0 || seed.EdgeId >= result.Edges.Count)
+                    continue;
+
+                var edge = result.Edges[seed.EdgeId];
+                var p = edge.MidPoint;
+
+                DrawDebugCross(
+                    db,
+                    tr,
+                    ms,
+                    outLayer,
+                    p,
+                    size: Math.Max(2.0, Math.Min(result.ViewBounds.Width, result.ViewBounds.Height) * 0.01),
+                    colorIndex: 2);
+
+                DrawDebugText(
+                    db,
+                    tr,
+                    outLayer,
+                    new Point2D(p.X, p.Y + Math.Max(3.0, labelYOffset * 0.15)),
+                    $"S:{seed.Side} #{seed.EdgeId}",
+                    colorIndex: 2,
+                    textHeight: Math.Max(4.0, Math.Min(result.ViewBounds.Width, result.ViewBounds.Height) * 0.025));
+            }
+
+            // 3) best loop 강조
+            if (result.BestLoop != null)
+            {
+                foreach (var edgeId in result.BestLoop.EdgeIds)
+                {
+                    if (edgeId < 0 || edgeId >= result.Edges.Count)
+                        continue;
+
+                    var edge = result.Edges[edgeId];
+                    DrawContourEdgeOverlay(
+                        db,
+                        tr,
+                        ms,
+                        outLayer,
+                        edge,
+                        colorIndex: 3);
+                }
+
+                DrawBoundsPolyline(
+                    db,
+                    tr,
+                    ms,
+                    outLayer,
+                    result.BestLoop.Bounds,
+                    colorIndex: 3,
+                    closed: true);
+
+                DrawDebugText(
+                    db,
+                    tr,
+                    outLayer,
+                    new Point2D(result.BestLoop.Bounds.Center.X, result.BestLoop.Bounds.MinY - labelYOffset * 0.6),
+                    $"BEST LOOP V{view.IslandId} | Edges={result.BestLoop.EdgeIds.Count} | Area={result.BestLoop.EstimatedArea:0.##} | Score={result.BestLoop.OuterScore:0.##}",
+                    colorIndex: 3,
+                    textHeight: Math.Max(5.0, Math.Min(result.ViewBounds.Width, result.ViewBounds.Height) * 0.03));
+            }
+        }
+
+        private static void DrawContourEdgeOverlay(
+            Database db,
+            Transaction tr,
+            BlockTableRecord ms,
+            ObjectId outLayer,
+            ContourEdge edge,
+            short colorIndex)
+        {
+            if (edge == null)
+                return;
+
+            switch (edge.Kind)
+            {
+                case ContourEdgeKind.Line:
+                case ContourEdgeKind.PolylineSegment:
+                    {
+                        var ln = new Line(
+                            new Point3d(edge.Start.X, edge.Start.Y, 0.0),
+                            new Point3d(edge.End.X, edge.End.Y, 0.0));
+                        ln.LayerId = outLayer;
+                        ln.ColorIndex = colorIndex;
+                        ms.AppendEntity(ln);
+                        tr.AddNewlyCreatedDBObject(ln, true);
+                        break;
+                    }
+
+                case ContourEdgeKind.Circle:
+                    {
+                        var src = edge.Source;
+                        var center = src.Center ?? src.CenterPoint ?? edge.Bounds.Center;
+                        var radius = src.Radius ?? Math.Min(edge.Bounds.Width, edge.Bounds.Height) * 0.5;
+                        if (radius <= 0)
+                            break;
+
+                        var c = new Circle(
+                            new Point3d(center.X, center.Y, 0.0),
+                            Vector3d.ZAxis,
+                            radius);
+                        c.LayerId = outLayer;
+                        c.ColorIndex = colorIndex;
+                        ms.AppendEntity(c);
+                        tr.AddNewlyCreatedDBObject(c, true);
+                        break;
+                    }
+
+                case ContourEdgeKind.Arc:
+                    {
+                        var src = edge.Source;
+                        if (!(src.Center.HasValue || src.CenterPoint.HasValue) ||
+                            !src.Radius.HasValue)
+                        {
+                            var fallback = new Line(
+                                new Point3d(edge.Start.X, edge.Start.Y, 0.0),
+                                new Point3d(edge.End.X, edge.End.Y, 0.0));
+                            fallback.LayerId = outLayer;
+                            fallback.ColorIndex = colorIndex;
+                            ms.AppendEntity(fallback);
+                            tr.AddNewlyCreatedDBObject(fallback, true);
+                            break;
+                        }
+
+                        var center = src.Center ?? src.CenterPoint!.Value;
+                        double radius = src.Radius.Value;
+
+                        double startDeg = src.StartAngleDeg2D ?? src.StartAngleDeg;
+                        double endDeg = src.EndAngleDeg2D ?? src.EndAngleDeg;
+
+                        double startRad = startDeg * Math.PI / 180.0;
+                        double endRad = endDeg * Math.PI / 180.0;
+
+                        var arc = new Arc(
+                            new Point3d(center.X, center.Y, 0.0),
+                            radius,
+                            startRad,
+                            endRad);
+                        arc.LayerId = outLayer;
+                        arc.ColorIndex = colorIndex;
+                        ms.AppendEntity(arc);
+                        tr.AddNewlyCreatedDBObject(arc, true);
+                        break;
+                    }
+
+                case ContourEdgeKind.Ellipse:
+                    {
+                        // 단순 시각화용 fallback: bounds 사각형으로 표시
+                        DrawBoundsPolyline(
+                            db,
+                            tr,
+                            ms,
+                            outLayer,
+                            edge.Bounds,
+                            colorIndex,
+                            closed: true);
+                        break;
+                    }
+            }
+        }
+
+        private static void DrawBoundsPolyline(
+            Database db,
+            Transaction tr,
+            BlockTableRecord ms,
+            ObjectId outLayer,
+            Bounds2D bounds,
+            short colorIndex,
+            bool closed)
+        {
+            bounds = Bounds2DHelper.Normalize(bounds);
+            if (bounds.IsEmpty)
+                return;
+
+            var pl = new Teigha.DatabaseServices.Polyline();
+            pl.SetDatabaseDefaults();
+
+            pl.AddVertexAt(0, new Point2d(bounds.MinX, bounds.MinY), 0, 0, 0);
+            pl.AddVertexAt(1, new Point2d(bounds.MaxX, bounds.MinY), 0, 0, 0);
+            pl.AddVertexAt(2, new Point2d(bounds.MaxX, bounds.MaxY), 0, 0, 0);
+            pl.AddVertexAt(3, new Point2d(bounds.MinX, bounds.MaxY), 0, 0, 0);
+
+            pl.Closed = closed;
+            pl.LayerId = outLayer;
+            pl.ColorIndex = colorIndex;
+
+            ms.AppendEntity(pl);
+            tr.AddNewlyCreatedDBObject(pl, true);
+        }
+
+        private static void DrawDebugCross(
+            Database db,
+            Transaction tr,
+            BlockTableRecord ms,
+            ObjectId outLayer,
+            Point2D center,
+            double size,
+            short colorIndex)
+        {
+            double s = Math.Max(0.5, size);
+
+            var ln1 = new Line(
+                new Point3d(center.X - s, center.Y, 0.0),
+                new Point3d(center.X + s, center.Y, 0.0));
+            ln1.LayerId = outLayer;
+            ln1.ColorIndex = colorIndex;
+            ms.AppendEntity(ln1);
+            tr.AddNewlyCreatedDBObject(ln1, true);
+
+            var ln2 = new Line(
+                new Point3d(center.X, center.Y - s, 0.0),
+                new Point3d(center.X, center.Y + s, 0.0));
+            ln2.LayerId = outLayer;
+            ln2.ColorIndex = colorIndex;
+            ms.AppendEntity(ln2);
+            tr.AddNewlyCreatedDBObject(ln2, true);
+        }
 
         [CommandMethod("FLUX_COPY_TOPLEVEL_GEOMETRY_VIEWS_OUTSIDE_SNAPSHOT")]
         public void FluxCopyTopLevelGeometryViewsOutsideSnapshot()
