@@ -16,7 +16,15 @@ namespace FluxCAD.SheetAnalysis.Contours
 
         public bool RequireContinuousLikeStyle { get; set; } = true;
         public bool PreferOuterContourLikeLayer { get; set; } = true;
-        public bool ExcludeVisualHintCandidates { get; set; } = true;
+        public bool ExcludeVisualHintCandidates { get; set; } = false;
+
+        public bool AllowReferenceGeometry { get; set; } = true;
+        public bool AllowVisualHintFallback { get; set; } = true;
+        public bool UseStyleMajorityFilter { get; set; } = true;
+        public bool FallbackToAllEligibleIfNoLoop { get; set; } = true;
+
+        public double PreferredStyleScoreRatio { get; set; } = 0.55;
+        public int MinPreferredStyleEntityCount { get; set; } = 3;
 
         public int MaxTraceDepth { get; set; } = 256;
         public int MaxOutgoingLinksPerEdge { get; set; } = 8;

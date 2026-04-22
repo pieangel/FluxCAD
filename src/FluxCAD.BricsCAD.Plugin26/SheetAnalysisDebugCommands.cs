@@ -856,7 +856,26 @@ namespace FluxCAD.BricsCAD.Plugin26
                     return;
                 }
 
-                ed.WriteMessage($"\n[FluxCAD] OuterContourTrace Start. Views={targetViews.Count}, SnapshotEntities={fullEntities.Count}");
+                var pipeline = BuildSemanticIslandPipeline(
+                    fullEntities,
+                    ed,
+                    closeSingleCellGaps: false,
+                    targetCellSize: 12.0,
+                    excludeSparseBridgeFromGroups: false);
+
+                if (pipeline == null || pipeline.Islands == null || pipeline.Islands.Count == 0)
+                {
+                    ed.WriteMessage("\n[FluxCAD] semantic island pipeline이 비어 있습니다.");
+                    return;
+                }
+
+                var islandMap = pipeline.Islands
+                    .Where(x => x != null)
+                    .ToDictionary(x => x.Id, x => x);
+
+                ed.WriteMessage(
+                    $"\n[FluxCAD] OuterContourTrace Start. Views={targetViews.Count}, " +
+                    $"SnapshotEntities={fullEntities.Count}, PipelineIslands={pipeline.Islands.Count}");
 
                 var extractor = new OuterContourExtractor();
 
@@ -870,9 +889,46 @@ namespace FluxCAD.BricsCAD.Plugin26
                     {
                         var viewBounds = Bounds2DHelper.Normalize(view.Bounds);
 
-                        var result = extractor.Extract(
+                        if (!islandMap.TryGetValue(view.IslandId, out var island))
+                        {
+                            ed.WriteMessage($"\n[FluxCAD] OuterContourTrace Island={view.IslandId} map lookup 실패");
+                            continue;
+                        }
+
+                        var dynamicTolerance = Math.Max(
+                            3.0,
+                            Math.Min(island.Bounds.Width, island.Bounds.Height) * 0.5);
+
+                        var semanticEntities = CollectIslandSemanticEntitiesFromPool(
                             fullEntities,
-                            viewBounds,
+                            island,
+                            tolerance: dynamicTolerance,
+                            ed: ed);
+
+                        var localEntities = semanticEntities
+                            .Where(x => x != null)
+                            .Where(x => x.IsVisible)
+                            .Where(x => x.IsGeometryLike)
+                            .Where(x => !x.IsTextLike)
+                            .Where(x => !x.IsDimensionLike)
+                            .Where(x => !x.Bounds.IsEmpty)
+                            .ToList();
+
+                        var input = new ViewContourInput
+                        {
+                            ViewId = view.IslandId,
+                            Bounds = viewBounds,
+                            Entities = localEntities,
+                            SourceTag = "SemanticIslandTruth"
+                        };
+
+                        ed.WriteMessage(
+                            $"\n[FluxCAD] ViewLocalContourInput View={input.ViewId}, " +
+                            $"IslandBounds={island.Bounds}, ViewBounds={viewBounds}, " +
+                            $"RawLocalEntities={input.Entities.Count}, Tol={dynamicTolerance:0.##}");
+
+                        var result = extractor.ExtractFromViewLocalEntities(
+                            input,
                             new OuterContourExtractionOptions
                             {
                                 EndpointToleranceMin = 2.0,
@@ -884,7 +940,13 @@ namespace FluxCAD.BricsCAD.Plugin26
                                 MinLoopAreaRatio = 0.005,
                                 RequireContinuousLikeStyle = true,
                                 PreferOuterContourLikeLayer = true,
-                                ExcludeVisualHintCandidates = true,
+                                ExcludeVisualHintCandidates = false,
+                                AllowReferenceGeometry = true,
+                                AllowVisualHintFallback = false,
+                                UseStyleMajorityFilter = true,
+                                FallbackToAllEligibleIfNoLoop = true,
+                                PreferredStyleScoreRatio = 0.55,
+                                MinPreferredStyleEntityCount = 2,
                                 MaxTraceDepth = 256,
                                 MaxOutgoingLinksPerEdge = 8
                             });
@@ -904,7 +966,8 @@ namespace FluxCAD.BricsCAD.Plugin26
 
                         ed.WriteMessage(
                             $"\n[FluxCAD] OuterContourTrace View={view.IslandId}, " +
-                            $"Bounds={viewBounds}, Eligible={result.EligibleEntities.Count}, " +
+                            $"InputMode={result.InputMode}, RawInput={result.RawInputEntityCount}, " +
+                            $"Eligible={result.EligibleEntities.Count}, Preferred={result.PreferredEntities.Count}, " +
                             $"Edges={result.Edges.Count}, Seeds={result.Seeds.Count}, " +
                             $"Loops={result.Loops.Count}, BestLoopEdges={(result.BestLoop?.EdgeIds.Count ?? 0)}, " +
                             $"BestLoopEntities={bestEntities.Count}");
@@ -919,6 +982,40 @@ namespace FluxCAD.BricsCAD.Plugin26
             {
                 ed.WriteMessage($"\n[FluxCAD] FLUX_DEBUG_OUTER_CONTOUR_TRACE failed: {ex}");
             }
+        }
+
+        private static ViewContourInput BuildViewLocalContourInput(
+    ViewCandidate view,
+    OccupancyHitIsland island,
+    IReadOnlyList<SheetEntity> semanticPool,
+    Bricscad.EditorInput.Editor ed)
+        {
+            var dynamicTolerance = Math.Max(
+                3.0,
+                Math.Min(island.Bounds.Width, island.Bounds.Height) * 0.5);
+
+            var semanticEntities = CollectIslandSemanticEntitiesFromPool(
+                semanticPool,
+                island,
+                tolerance: dynamicTolerance,
+                ed: ed);
+
+            var localEntities = semanticEntities
+                .Where(x => x != null)
+                .Where(x => x.IsVisible)
+                .Where(x => x.IsGeometryLike)
+                .Where(x => !x.IsTextLike && !x.IsDimensionLike)
+                .Where(x => !x.IsLikelySemanticNoise)
+                .Where(x => !x.Bounds.IsEmpty)
+                .ToList();
+
+            return new ViewContourInput
+            {
+                ViewId = view.IslandId,
+                Bounds = view.Bounds,
+                Entities = localEntities,
+                SourceTag = "SemanticIslandTruth"
+            };
         }
 
         private static void DrawOuterContourTraceDebug(

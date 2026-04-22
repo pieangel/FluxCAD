@@ -4,6 +4,14 @@ using FluxCAD.SheetAnalysis;
 
 namespace FluxCAD.SheetAnalysis.Contours
 {
+    public sealed class ViewContourInput
+    {
+        public int ViewId { get; init; }
+        public Bounds2D Bounds { get; init; }
+        public IReadOnlyList<SheetEntity> Entities { get; init; } = Array.Empty<SheetEntity>();
+        public string SourceTag { get; init; } = string.Empty;
+    }
+
     public sealed class ContourEdge
     {
         public int EdgeId { get; init; }
@@ -55,6 +63,20 @@ namespace FluxCAD.SheetAnalysis.Contours
             => $"Seed Edge#{EdgeId}, Side={Side}, Score={Score:0.###}, Reason={Reason}";
     }
 
+    public sealed class ContourStyleGroupStats
+    {
+        public ContourStyleSignature Style { get; init; } = new();
+        public int EntityCount { get; init; }
+        public double EstimatedTotalLength { get; init; }
+        public int OuterBandTouchCount { get; init; }
+        public int OuterContourLikeCount { get; init; }
+        public double Score { get; init; }
+        public bool IsSelected { get; set; }
+
+        public override string ToString()
+            => $"Style=[{Style}] Entities={EntityCount}, Len={EstimatedTotalLength:0.###}, BandTouches={OuterBandTouchCount}, OuterLike={OuterContourLikeCount}, Score={Score:0.###}, Selected={IsSelected}";
+    }
+
     public sealed class TracedContourLoop
     {
         public List<int> EdgeIds { get; } = new();
@@ -64,21 +86,39 @@ namespace FluxCAD.SheetAnalysis.Contours
         public double Perimeter { get; set; }
         public double EstimatedArea { get; set; }
         public double OuterScore { get; set; }
+
+        public double AreaRatio { get; set; }
+        public double BoundsCoverageScore { get; set; }
+        public int TouchingSideCount { get; set; }
+        public double StyleConsistencyScore { get; set; }
+        public double TotalGapToView { get; set; }
+
         public string Reason { get; set; } = string.Empty;
 
         public override string ToString()
-            => $"Loop Closed={IsClosed}, Edges={EdgeIds.Count}, Perimeter={Perimeter:0.###}, Area={EstimatedArea:0.###}, Score={OuterScore:0.###}";
+            => $"Loop Closed={IsClosed}, Edges={EdgeIds.Count}, Perimeter={Perimeter:0.###}, Area={EstimatedArea:0.###}, AreaRatio={AreaRatio:0.###}, TouchSides={TouchingSideCount}, Style={StyleConsistencyScore:0.###}, Score={OuterScore:0.###}";
     }
 
     public sealed class OuterContourExtractionResult
     {
+        public int InputViewId { get; set; }
+        public string InputMode { get; set; } = string.Empty;
+        public string InputSourceTag { get; set; } = string.Empty;
+        public int RawInputEntityCount { get; set; }
+
         public Bounds2D ViewBounds { get; init; }
 
         public List<SheetEntity> EligibleEntities { get; } = new();
+        public List<SheetEntity> PreferredEntities { get; } = new();
+
+        public List<ContourStyleGroupStats> StyleGroups { get; } = new();
+
         public List<ContourEdge> Edges { get; } = new();
         public List<OuterSeedCandidate> Seeds { get; } = new();
         public Dictionary<int, List<ContourLink>> LinksByEdgeId { get; } = new();
         public List<TracedContourLoop> Loops { get; } = new();
+
+        public List<string> Diagnostics { get; } = new();
 
         public TracedContourLoop? BestLoop { get; set; }
 
