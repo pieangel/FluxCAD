@@ -15341,6 +15341,12 @@ namespace FluxCAD.BricsCAD.Plugin26
 
                     e.Role = newRole;
 
+                    ApplySemanticStateToMatchingEntities(
+                        fullEntities,
+                        e,
+                        ed,
+                        stage: $"Rebuild:Island{island.Id}");
+
                     if (newRole == SheetEntityRole.VisualHint)
                     {
                         e.IsLikelySemanticNoise = true;
@@ -15353,6 +15359,9 @@ namespace FluxCAD.BricsCAD.Plugin26
                         $"HintScore={e.VisualHintScore:0.##}, GeoScore={e.GeometryConfidenceScore:0.##}, " +
                         $"Reason={e.RoleReason}");
                 }
+
+                
+
 
                 DumpIslandHatchPolylineDebug(ed, island.Id, semanticEntities, "AfterRoleReassign");
 
@@ -15398,6 +15407,47 @@ namespace FluxCAD.BricsCAD.Plugin26
             return rebuilt;
         }
 
+        private static void ApplySemanticStateToMatchingEntities(
+            IEnumerable<SheetEntity> targets,
+            SheetEntity source,
+            Bricscad.EditorInput.Editor? ed = null,
+            string? stage = null)
+        {
+            if (targets == null || source == null)
+                return;
+
+            var sourceHandle = (source.Handle ?? string.Empty).Trim();
+            if (string.IsNullOrWhiteSpace(sourceHandle))
+                return;
+
+            foreach (var target in targets)
+            {
+                if (target == null)
+                    continue;
+
+                var targetHandle = (target.Handle ?? string.Empty).Trim();
+                if (!sourceHandle.Equals(targetHandle, StringComparison.OrdinalIgnoreCase))
+                    continue;
+
+                bool beforeContains = target.ContainsOrEnclosesHatchLike;
+                double beforeHint = target.VisualHintScore;
+                var beforeRole = target.Role;
+
+                target.Role = source.Role;
+                target.IsLikelySemanticNoise = source.IsLikelySemanticNoise;
+                target.IsVisualHintCandidate = source.IsVisualHintCandidate;
+                target.ContainsOrEnclosesHatchLike = source.ContainsOrEnclosesHatchLike;
+                target.VisualHintScore = source.VisualHintScore;
+                target.GeometryConfidenceScore = source.GeometryConfidenceScore;
+                target.RoleReason = source.RoleReason;
+                target.IsFadedLike = source.IsFadedLike;
+
+                ed?.WriteMessage(
+                    $"\n[SEMANTIC-MAP-APPLY] Stage={stage ?? "-"}, H={target.Handle}, " +
+                    $"Before: Role={beforeRole}, ContainsHatch={beforeContains}, HintScore={beforeHint:0.##} | " +
+                    $"After: Role={target.Role}, ContainsHatch={target.ContainsOrEnclosesHatchLike}, HintScore={target.VisualHintScore:0.##}");
+            }
+        }
 
         private static bool IsEllipseLikePolyline(SheetEntity e)
         {
@@ -18289,6 +18339,13 @@ namespace FluxCAD.BricsCAD.Plugin26
                 IsTableLikeLayer = source.IsTableLikeLayer,
                 IsOuterContourLikeLayer = source.IsOuterContourLikeLayer,
                 IsLikelySemanticNoise = source.IsLikelySemanticNoise,
+
+                IsFadedLike = source.IsFadedLike,
+                IsVisualHintCandidate = source.IsVisualHintCandidate,
+                ContainsOrEnclosesHatchLike = source.ContainsOrEnclosesHatchLike,
+                VisualHintScore = source.VisualHintScore,
+                GeometryConfidenceScore = source.GeometryConfidenceScore,
+                RoleReason = source.RoleReason,
             };
         }
 
