@@ -1,7 +1,8 @@
-﻿using System;
+﻿using FluxCAD.SheetAnalysis;
+using FluxCAD.SheetAnalysis.Workspace;
+using System;
 using System.Collections.Generic;
 using System.Linq;
-using FluxCAD.SheetAnalysis;
 
 namespace FluxCAD.SheetAnalysis.Contours
 {
@@ -24,8 +25,34 @@ namespace FluxCAD.SheetAnalysis.Contours
                 ViewBounds = Bounds2DHelper.Normalize(input.Bounds)
             };
 
-            var prepared = PrepareViewLocalEntities(
-                input.Entities ?? Array.Empty<SheetEntity>(),
+//             var prepared = PrepareViewLocalEntities(
+//                 input.Entities ?? Array.Empty<SheetEntity>(),
+//                 result.ViewBounds,
+//                 options,
+//                 result);
+// 
+//             RunCore(result, prepared, options);
+            return result;
+        }
+
+        public OuterContourExtractionResult Extract(
+    GeometryWorkspaceView workspaceView,
+    OuterContourExtractionOptions? options = null)
+        {
+            ArgumentNullException.ThrowIfNull(workspaceView);
+            options ??= new OuterContourExtractionOptions();
+
+            var result = new OuterContourExtractionResult
+            {
+                InputViewId = workspaceView.ViewId,
+                InputMode = "WorkspaceView",
+                InputSourceTag = "GeometryWorkspace",
+                RawInputEntityCount = workspaceView.WorkspaceEntities.Count,
+                ViewBounds = Bounds2DHelper.Normalize(workspaceView.WorkspaceBounds)
+            };
+
+            var prepared = PrepareWorkspaceEntities(
+                workspaceView.WorkspaceEntities,
                 result.ViewBounds,
                 options,
                 result);
@@ -34,7 +61,7 @@ namespace FluxCAD.SheetAnalysis.Contours
             return result;
         }
 
-        public OuterContourExtractionResult Extract(
+        public OuterContourExtractionResult Extract_old(
     IReadOnlyList<SheetEntity> semanticEntities,
     Bounds2D viewBounds,
     OuterContourExtractionOptions? options = null)
@@ -146,7 +173,64 @@ namespace FluxCAD.SheetAnalysis.Contours
             }
         }
 
-        private IReadOnlyList<SheetEntity> PrepareViewLocalEntities(
+        private IReadOnlyList<SheetEntity> PrepareWorkspaceEntities(
+    IReadOnlyList<SheetEntity> entities,
+    Bounds2D viewBounds,
+    OuterContourExtractionOptions options,
+    OuterContourExtractionResult result)
+        {
+            ArgumentNullException.ThrowIfNull(entities);
+            ArgumentNullException.ThrowIfNull(options);
+            ArgumentNullException.ThrowIfNull(result);
+
+            var prepared = new List<SheetEntity>();
+
+            foreach (var e in entities)
+            {
+                if (e == null)
+                    continue;
+
+                if (!e.IsVisible)
+                    continue;
+
+                if (!IsSupportedContourKind(e))
+                    continue;
+
+                if (e.IsTextLike || e.IsDimensionLike)
+                    continue;
+
+                if (e.Role == SheetEntityRole.Text ||
+                    e.Role == SheetEntityRole.Dimension ||
+                    e.Role == SheetEntityRole.Leader ||
+                    e.Role == SheetEntityRole.Symbol ||
+                    e.Role == SheetEntityRole.BlockContainer)
+                    continue;
+
+                if (e.IsCenterLine || e.IsHiddenLine)
+                    continue;
+
+                if (e.ContainsOrEnclosesHatchLike)
+                    continue;
+
+                if (e.IsLikelySemanticNoise)
+                    continue;
+
+                if (e.Bounds.IsEmpty)
+                    continue;
+
+                if (!Bounds2DHelper.Intersects(e.Bounds, viewBounds, tolerance: 0.0))
+                    continue;
+
+                prepared.Add(e);
+            }
+
+            if (prepared.Count == 0)
+                result.Diagnostics.Add("PrepareViewLocalEntities=0");
+
+            return prepared;
+        }
+
+        private IReadOnlyList<SheetEntity> PrepareViewLocalEntities_old(
     IReadOnlyList<SheetEntity> entities,
     Bounds2D viewBounds,
     OuterContourExtractionOptions options,

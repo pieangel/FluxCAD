@@ -20108,17 +20108,25 @@ namespace FluxCAD.BricsCAD.Plugin26
             se.IsFadedLike = fadedByLayer || fadedByType || fadedByTransparency;
         }
 
-        private static bool IsEllipseLike(SheetEntity e)
+        private static bool IsCircleLike(SheetEntity e)
+        {
+            if (e == null)
+                return false;
+
+            return
+                e.Kind == SheetEntityKind.Circle ||
+                string.Equals(e.EntityType, "CIRCLE", StringComparison.OrdinalIgnoreCase);
+        }
+
+        private static bool IsEllipseOnlyLike(SheetEntity e)
         {
             if (e == null)
                 return false;
 
             return
                 e.Kind == SheetEntityKind.Ellipse ||
-                e.Kind == SheetEntityKind.Circle ||
-                IsEllipseLikePolyline(e) ||   // 🔥 추가
-                string.Equals(e.EntityType, "ELLIPSE", StringComparison.OrdinalIgnoreCase) ||
-                string.Equals(e.EntityType, "CIRCLE", StringComparison.OrdinalIgnoreCase);
+                IsEllipseLikePolyline(e) ||
+                string.Equals(e.EntityType, "ELLIPSE", StringComparison.OrdinalIgnoreCase);
         }
 
         private static void DumpIslandHatchPolylineDebug(
@@ -20210,9 +20218,10 @@ namespace FluxCAD.BricsCAD.Plugin26
         }
 
 
+
         private static bool EstimateParticipatesInGeometryLoop(
-            SheetEntity e,
-            Bounds2D targetViewBounds)
+    SheetEntity e,
+    Bounds2D targetViewBounds)
         {
             if (e == null)
                 return false;
@@ -20235,8 +20244,18 @@ namespace FluxCAD.BricsCAD.Plugin26
             if (!Bounds2DHelper.Intersects(e.Bounds, targetViewBounds, tolerance: 0.0))
                 return false;
 
+            bool isCircleLike =
+                e.Kind == SheetEntityKind.Circle ||
+                string.Equals(e.EntityType, "CIRCLE", StringComparison.OrdinalIgnoreCase);
+
+            bool isEllipseOnlyLike =
+                e.Kind == SheetEntityKind.Ellipse ||
+                IsEllipseLikePolyline(e) ||
+                string.Equals(e.EntityType, "ELLIPSE", StringComparison.OrdinalIgnoreCase);
+
             // visual hint 후보는 geometry loop에서 먼저 제외
-            if (e.IsVisualHintCandidate)
+            // 단, Circle은 실제 형상일 가능성이 높으므로 보호
+            if (e.IsVisualHintCandidate && !isCircleLike)
                 return false;
 
             // 해치를 감싼 닫힌 polyline은 geometry loop로 보지 않음
@@ -20245,12 +20264,22 @@ namespace FluxCAD.BricsCAD.Plugin26
                 e.ContainsOrEnclosesHatchLike)
                 return false;
 
-            // 타원/원 전체 윤곽은 신중하게 본다
-            if (IsEllipseLike(e) && e.IsFadedLike)
+            // Ellipse 계열만 조심스럽게 제외
+            // Circle은 제외하지 않음
+            if (isEllipseOnlyLike && e.IsFadedLike)
                 return false;
 
             return true;
         }
+
+        private static bool IsEllipseLike(SheetEntity e)
+        {
+            if (e == null)
+                return false;
+
+            return IsCircleLike(e) || IsEllipseOnlyLike(e);
+        }
+
 
         private static void MarkVisualHintEnvelopeRelations(
     IReadOnlyList<SheetEntity> entities)
@@ -20270,8 +20299,10 @@ namespace FluxCAD.BricsCAD.Plugin26
                 if (e == null)
                     continue;
 
+                // Circle은 실제 hole/형상일 가능성이 높으므로
+                // hatch envelope 후보에서 제외한다.
                 bool isEnvelopeCandidate =
-                    IsEllipseLike(e) ||
+                    IsEllipseOnlyLike(e) ||
                     (e.Kind == SheetEntityKind.Polyline && e.IsClosed);
 
                 if (!isEnvelopeCandidate)
@@ -20299,6 +20330,7 @@ namespace FluxCAD.BricsCAD.Plugin26
             }
         }
 
+
         private static void ComputeVisualIntentScores(SheetEntity e)
         {
             double hint = 0.0;
@@ -20316,7 +20348,9 @@ namespace FluxCAD.BricsCAD.Plugin26
             if (e.ContainsOrEnclosesHatchLike)
                 hint += 2.0;
 
-            if (IsEllipseLike(e))
+            // Circle은 실제 형상일 가능성이 높으므로
+            // ellipse-like visual hint 가점에서 제외
+            if (IsEllipseOnlyLike(e))
                 hint += 1.0;
 
             if (e.Role == SheetEntityRole.HatchLike)
@@ -20332,12 +20366,26 @@ namespace FluxCAD.BricsCAD.Plugin26
 
 
         private static SheetEntityRole ReassignRoleWithVisualIntent(
-    SheetEntity e,
-    Bounds2D targetViewBounds,
-    bool participatesInGeometryLoop)
+            SheetEntity e,
+            Bounds2D targetViewBounds,
+            bool participatesInGeometryLoop)
         {
             if (e == null)
                 return SheetEntityRole.Unknown;
+
+            bool isCircleLike =
+                e.Kind == SheetEntityKind.Circle ||
+                string.Equals(e.EntityType, "CIRCLE", StringComparison.OrdinalIgnoreCase);
+
+            bool isEllipseOnlyLike =
+                e.Kind == SheetEntityKind.Ellipse ||
+                IsEllipseLikePolyline(e) ||
+                string.Equals(e.EntityType, "ELLIPSE", StringComparison.OrdinalIgnoreCase);
+
+            bool isClosedEnvelopeCandidate =
+                isCircleLike ||
+                isEllipseOnlyLike ||
+                (e.Kind == SheetEntityKind.Polyline && e.IsClosed);
 
             // 강한 역할은 우선 보존
             if (e.Role == SheetEntityRole.Text ||
@@ -20362,12 +20410,10 @@ namespace FluxCAD.BricsCAD.Plugin26
                 return SheetEntityRole.ReferenceGeometry;
             }
 
-            bool isClosedEnvelopeCandidate =
-                IsEllipseLike(e) ||
-                (e.Kind == SheetEntityKind.Polyline && e.IsClosed);
-
             // 1) 해치를 감싸는 닫힌 envelope는 geometry loop보다 먼저 제거
-            if (e.ContainsOrEnclosesHatchLike &&
+            //    단, Circle은 실제 hole/형상일 가능성이 높으므로 여기서 바로 제거하지 않음
+            if (!isCircleLike &&
+                e.ContainsOrEnclosesHatchLike &&
                 isClosedEnvelopeCandidate)
             {
                 e.IsVisualHintCandidate = true;
@@ -20376,7 +20422,19 @@ namespace FluxCAD.BricsCAD.Plugin26
                 return SheetEntityRole.VisualHint;
             }
 
-            // 2) 진짜 외곽선 보호
+            // 2) Circle 보호
+            //    Circle은 실제 형상 hole / round feature일 가능성이 높으므로
+            //    hatch envelope가 아니고 reference가 아니면 우선 Geometry로 보존
+            if (isCircleLike &&
+                !e.ContainsOrEnclosesHatchLike)
+            {
+                e.IsVisualHintCandidate = false;
+                e.IsLikelySemanticNoise = false;
+                e.RoleReason = "Preserve circle as geometry inside geometry view";
+                return SheetEntityRole.Geometry;
+            }
+
+            // 3) 진짜 외곽선 보호
             //    - center/hidden 아님
             //    - hatch envelope 아님
             //    - view 내부 형상 loop에 참여
@@ -20399,7 +20457,7 @@ namespace FluxCAD.BricsCAD.Plugin26
                 isLongHorizontalBoundary ||
                 isLongVerticalBoundary ||
                 e.Kind == SheetEntityKind.Arc ||
-                e.Kind == SheetEntityKind.Circle;
+                isCircleLike;
 
             if (participatesInGeometryLoop &&
                 !e.ContainsOrEnclosesHatchLike &&
@@ -20410,7 +20468,7 @@ namespace FluxCAD.BricsCAD.Plugin26
                 return SheetEntityRole.Geometry;
             }
 
-            // 3) 일반 geometry loop 참여 형상은 그대로 geometry
+            // 4) 일반 geometry loop 참여 형상은 그대로 geometry
             if (participatesInGeometryLoop)
             {
                 e.IsLikelySemanticNoise = false;
@@ -20418,9 +20476,10 @@ namespace FluxCAD.BricsCAD.Plugin26
                 return SheetEntityRole.Geometry;
             }
 
-            // 4) ellipse-like visual hint는 여전히 제거
+            // 5) ellipse-like visual hint는 여전히 제거
+            //    단, Circle은 제외
             if (e.IsVisualHintCandidate &&
-                IsEllipseLike(e) &&
+                isEllipseOnlyLike &&
                 !targetViewBounds.IsEmpty &&
                 e.Bounds.Area >= targetViewBounds.Area * 0.75)
             {
@@ -20429,7 +20488,7 @@ namespace FluxCAD.BricsCAD.Plugin26
                 return SheetEntityRole.VisualHint;
             }
 
-            if (e.IsVisualHintCandidate && IsEllipseLike(e))
+            if (e.IsVisualHintCandidate && isEllipseOnlyLike)
             {
                 e.IsLikelySemanticNoise = true;
                 e.RoleReason = "VisualHint: faded ellipse-like non-loop geometry";
