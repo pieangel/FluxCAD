@@ -1672,7 +1672,10 @@ namespace FluxCAD.BricsCAD.Plugin26
             int rejectedOutside = 0;
             int rejectedTooLarge = 0;
             int deduped = 0;
-            var seenHandles = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+            // 기존: handle-only dedupe
+            // 수정: world-space snapshot key dedupe
+            var seenSnapshotKeys = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
             foreach (var e in semanticEntities)
             {
@@ -1715,26 +1718,146 @@ namespace FluxCAD.BricsCAD.Plugin26
                     continue;
                 }
 
-                var handle = (candidate.Handle ?? string.Empty).Trim();
-                if (!string.IsNullOrWhiteSpace(handle) && !seenHandles.Add(handle))
+                var snapshotDedupKey = GetSnapshotLeafDedupKey(candidate);
+
+                if (!seenSnapshotKeys.Add(snapshotDedupKey))
                 {
                     deduped++;
+                    candidate.SnapshotKey = snapshotDedupKey;
                     LogSnapshotLeafCandidate(ed, viewId, candidate, viewBounds, "Deduped");
                     continue;
                 }
+
+                candidate.SnapshotKey = snapshotDedupKey;
 
                 LogSnapshotLeafCandidate(ed, viewId, candidate, viewBounds, "Accepted");
                 result.Add(candidate);
             }
 
             ed?.WriteMessage(
-                $"[FluxCAD] SnapshotLeafCollect I:{ viewId}, " +
+                $"[FluxCAD] SnapshotLeafCollect I:{viewId}, " +
                 $"View={viewBounds}, Accepted={result.Count}, " +
                 $"RejectedNoRecoveredBounds={rejectedNoRecoveredBounds}, " +
                 $"RejectedOutside={rejectedOutside}, RejectedTooLarge={rejectedTooLarge}, " +
                 $"Deduped={deduped}");
 
             return result;
+        }
+
+        private static string GetSnapshotLeafDedupKey(SheetEntity entity)
+        {
+            if (entity == null)
+                return Guid.NewGuid().ToString();
+
+            var type = entity.EntityType ?? entity.Kind.ToString();
+            var layer = entity.Layer ?? "";
+            var blockName = entity.BlockName ?? "";
+            var handle = entity.Handle ?? "";
+            var path = entity.BlockPath == null || entity.BlockPath.Count == 0
+                ? ""
+                : string.Join(">", entity.BlockPath);
+
+            var b = entity.Bounds;
+
+            return string.Join("|",
+                "SNAPSHOT",
+                type,
+                entity.Kind.ToString(),
+                layer,
+                NormalizeToken(entity.LinetypeName),
+                NormalizeToken(entity.EffectiveLinetypeName),
+                NormalizeToken(blockName),
+                NormalizeToken(path),
+                NormalizeToken(handle),
+                entity.Depth.ToString(),
+                Round4(b.MinX),
+                Round4(b.MinY),
+                Round4(b.MaxX),
+                Round4(b.MaxY),
+                BuildGeometryShapeKey(entity));
+        }
+
+        private static string BuildGeometryShapeKey(SheetEntity entity)
+        {
+            if (entity == null)
+                return "NULL";
+
+            switch (entity.Kind)
+            {
+                case SheetEntityKind.Line:
+                    return string.Join("|",
+                        "LINE",
+                        RoundPoint(entity.StartPoint),
+                        RoundPoint(entity.EndPoint));
+
+                case SheetEntityKind.Arc:
+                    return string.Join("|",
+                        "ARC",
+                        RoundPoint(entity.CenterPoint ?? entity.Center),
+                        Round4(entity.Radius),
+                        Round4(entity.StartAngleDeg2D),
+                        Round4(entity.EndAngleDeg2D),
+                        RoundPoint(entity.StartPoint),
+                        RoundPoint(entity.EndPoint));
+
+                case SheetEntityKind.Circle:
+                    return string.Join("|",
+                        "CIRCLE",
+                        RoundPoint(entity.CenterPoint ?? entity.Center),
+                        Round4(entity.Radius));
+
+                case SheetEntityKind.Ellipse:
+                    return string.Join("|",
+                        "ELLIPSE",
+                        RoundPoint(entity.Center),
+                        Round4(entity.MajorRadius),
+                        Round4(entity.MinorRadius),
+                        Round4(entity.EllipseRotationDeg2D),
+                        Round4(entity.StartAngleDeg2D),
+                        Round4(entity.EndAngleDeg2D));
+
+                case SheetEntityKind.Polyline:
+                    return string.Join("|",
+                        "POLY",
+                        entity.IsClosed ? "C" : "O",
+                        entity.Vertices == null || entity.Vertices.Count == 0
+                            ? ""
+                            : string.Join(";", entity.Vertices.Select(p => RoundPoint(p))));
+
+                default:
+                    return string.Join("|",
+                        "BOUNDS",
+                        Round4(entity.Bounds.MinX),
+                        Round4(entity.Bounds.MinY),
+                        Round4(entity.Bounds.MaxX),
+                        Round4(entity.Bounds.MaxY));
+            }
+        }
+
+        private static string RoundPoint(Point2D p)
+        {
+            return $"{Round4(p.X)},{Round4(p.Y)}";
+        }
+
+        private static string RoundPoint(Point2D? p)
+        {
+            if (!p.HasValue)
+                return "";
+
+            return $"{Round4(p.Value.X)},{Round4(p.Value.Y)}";
+        }
+
+        private static string Round4(double? value)
+        {
+            if (!value.HasValue)
+                return "";
+
+            return Math.Round(value.Value, 4).ToString("0.####");
+        }
+
+        private static string NormalizeToken(string? s)
+        {
+            return string.IsNullOrWhiteSpace(s) ? "" : s.Trim();
         }
 
 
@@ -20209,6 +20332,7 @@ namespace FluxCAD.BricsCAD.Plugin26
                 $"EllipseLike={IsEllipseLikePolyline(e)}, " +
                 $"Faded={e.IsFadedLike}, ContainsHatch={e.ContainsOrEnclosesHatchLike}, " +
                 $"HintScore={e.VisualHintScore:0.##}, GeoScore={e.GeometryConfidenceScore:0.##}, " +
+                $"SnapshotKey={e.SnapshotKey}, " +
                 $"Noise={e.IsLikelySemanticNoise}, Reason={SafeDbg(e.RoleReason)}");
         }
 
