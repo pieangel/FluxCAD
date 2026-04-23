@@ -1345,6 +1345,31 @@ namespace FluxCAD.BricsCAD.Plugin26
                 var sheetBounds = Bounds2DHelper.FromEntities(fullEntities);
                 var semanticPool = BuildSemanticEvidencePool(fullEntities, sheetBounds, ed);
 
+                ed.WriteMessage(
+                    $"\n[POOLFACE] Face={semanticPool.Count(x => x.Kind == SheetEntityKind.Face)}");
+
+                ed.WriteMessage(
+                    $"\n[SEMANTIC-POOL-SUMMARY] Total={semanticPool.Count}, " +
+                    $"Face={semanticPool.Count(x => x.Kind == SheetEntityKind.Face)}, " +
+                    $"Line={semanticPool.Count(x => x.Kind == SheetEntityKind.Line)}, " +
+                    $"Arc={semanticPool.Count(x => x.Kind == SheetEntityKind.Arc)}, " +
+                    $"Circle={semanticPool.Count(x => x.Kind == SheetEntityKind.Circle)}, " +
+                    $"Polyline={semanticPool.Count(x => x.Kind == SheetEntityKind.Polyline)}, " +
+                    $"Ellipse={semanticPool.Count(x => x.Kind == SheetEntityKind.Ellipse)}");
+
+                int semanticPoolFaceCount = semanticPool.Count(x => x != null && x.Kind == SheetEntityKind.Face);
+
+                ed.WriteMessage(
+                    $"\n[SEMANTIC-POOL-FACE-COUNT] Total={semanticPoolFaceCount}, PoolCount={semanticPool.Count}");
+
+                foreach (var face in semanticPool.Where(x => x != null && x.Kind == SheetEntityKind.Face))
+                {
+                    ed.WriteMessage(
+                        $"\n[SEMANTIC-POOL-FACE] H={face.Handle}, Role={face.Role}, " +
+                        $"Visible={face.IsVisible}, GeometryLike={face.IsGeometryLike}, " +
+                        $"Bounds={face.Bounds}, Reason={face.RoleReason}");
+                }
+
                 Bounds2D modelBounds;
                 using (doc.LockDocument())
                 using (var tr = db.TransactionManager.StartTransaction())
@@ -1381,6 +1406,19 @@ namespace FluxCAD.BricsCAD.Plugin26
                         island,
                         tolerance: dynamicTolerance,
                         ed: ed);
+
+                    int semanticFaceCount = semanticEntities.Count(x => x != null && x.Kind == SheetEntityKind.Face);
+
+                    ed.WriteMessage(
+                        $"\n[SEMANTIC-FACE-COUNT] I:{view.IslandId}, Count={semanticFaceCount}, Total={semanticEntities.Count}");
+
+                    foreach (var face in semanticEntities.Where(x => x != null && x.Kind == SheetEntityKind.Face))
+                    {
+                        ed.WriteMessage(
+                            $"\n[SEMANTIC-FACE] I:{view.IslandId}, H={face.Handle}, Role={face.Role}, " +
+                            $"Visible={face.IsVisible}, GeometryLike={face.IsGeometryLike}, " +
+                            $"Bounds={face.Bounds}, Reason={face.RoleReason}");
+                    }
 
                     var filteredSemanticEntities = new List<SheetEntity>();
 
@@ -1443,7 +1481,8 @@ namespace FluxCAD.BricsCAD.Plugin26
 
                     ed.WriteMessage(
                         $"\n[FluxCAD] SnapshotCopySemanticFilter I:{view.IslandId}, " +
-                        $"Before={semanticEntities.Count}, After={filteredSemanticEntities.Count}, " +
+                        $"Before={semanticEntities.Count}, BeforeFace={semanticEntities.Count(x => x.Kind == SheetEntityKind.Face)}, " +
+                        $"After={filteredSemanticEntities.Count}, AfterFace={filteredSemanticEntities.Count(x => x.Kind == SheetEntityKind.Face)}, " +
                         $"HiddenOrCenter={filteredSemanticEntities.Count(x => IsHiddenOrCenterEntity(x))}, " +
                         $"Line={filteredSemanticEntities.Count(x => x.Kind == SheetEntityKind.Line)}, " +
                         $"Arc={filteredSemanticEntities.Count(x => x.Kind == SheetEntityKind.Arc)}, " +
@@ -1686,19 +1725,45 @@ namespace FluxCAD.BricsCAD.Plugin26
                     continue;
 
                 if (!e.IsGeometryLike)
+                {
+                    if (e.Kind == SheetEntityKind.Face)
+                    {
+                        ed?.WriteMessage(
+                            $"\n[FACE-REJECT] H={e.Handle}, Why=NotGeometryLike, Role={e.Role}, " +
+                            $"Bounds={e.Bounds}, Layer={e.Layer}, SnapshotKey={e.SnapshotKey}");
+                    }
+
                     continue;
+                }
 
                 if (e.Kind != SheetEntityKind.Line &&
                     e.Kind != SheetEntityKind.Polyline &&
                     e.Kind != SheetEntityKind.Arc &&
                     e.Kind != SheetEntityKind.Circle &&
-                    e.Kind != SheetEntityKind.Ellipse)
+                    e.Kind != SheetEntityKind.Ellipse &&
+                    e.Kind != SheetEntityKind.Face)
+                {
+                    if (e.Kind == SheetEntityKind.Face)
+                    {
+                        ed?.WriteMessage(
+                            $"\n[FACE-REJECT] H={e.Handle}, Why=KindFilterUnexpected, Role={e.Role}, Bounds={e.Bounds}");
+                    }
+
                     continue;
+                }
 
                 var candidate = CloneWithFallbackBounds(e);
                 if (candidate == null || candidate.Bounds.IsEmpty)
                 {
                     rejectedNoRecoveredBounds++;
+
+                    if (e.Kind == SheetEntityKind.Face)
+                    {
+                        ed?.WriteMessage(
+                            $"\n[FACE-REJECT] H={e.Handle}, Why=NoRecoveredBounds, Role={e.Role}, " +
+                            $"OrigBounds={e.Bounds}, Layer={e.Layer}, SnapshotKey={e.SnapshotKey}");
+                    }
+
                     LogSnapshotLeafCandidate(ed, viewId, e, viewBounds, "RejectedNoRecoveredBounds");
                     continue;
                 }
@@ -1707,6 +1772,14 @@ namespace FluxCAD.BricsCAD.Plugin26
                 if (!Bounds2DHelper.Intersects(entityBounds, viewBounds, tolerance: 0.0))
                 {
                     rejectedOutside++;
+
+                    if (candidate.Kind == SheetEntityKind.Face)
+                    {
+                        ed?.WriteMessage(
+                            $"\n[FACE-REJECT] H={candidate.Handle}, Why=OutsideViewBounds, " +
+                            $"EntityBounds={entityBounds}, ViewBounds={viewBounds}, Role={candidate.Role}");
+                    }
+
                     LogSnapshotLeafCandidate(ed, viewId, candidate, viewBounds, "RejectedOutside");
                     continue;
                 }
@@ -1714,6 +1787,14 @@ namespace FluxCAD.BricsCAD.Plugin26
                 if (!IsReasonableLocalEntityForView(viewBounds, entityBounds))
                 {
                     rejectedTooLarge++;
+
+                    if (candidate.Kind == SheetEntityKind.Face)
+                    {
+                        ed?.WriteMessage(
+                            $"\n[FACE-REJECT] H={candidate.Handle}, Why=RejectedTooLarge, " +
+                            $"EntityBounds={entityBounds}, ViewBounds={viewBounds}, Role={candidate.Role}");
+                    }
+
                     LogSnapshotLeafCandidate(ed, viewId, candidate, viewBounds, "RejectedTooLarge");
                     continue;
                 }
@@ -1726,6 +1807,13 @@ namespace FluxCAD.BricsCAD.Plugin26
                     candidate.SnapshotKey = snapshotDedupKey;
                     LogSnapshotLeafCandidate(ed, viewId, candidate, viewBounds, "Deduped");
                     continue;
+                }
+
+                if (candidate.Kind == SheetEntityKind.Face)
+                {
+                    ed?.WriteMessage(
+                        $"\n[FACE-ACCEPTED] H={candidate.Handle}, Bounds={candidate.Bounds}, " +
+                        $"Role={candidate.Role}, VertexCount={candidate.Vertices?.Count ?? 0}, SnapshotKey={candidate.SnapshotKey}");
                 }
 
                 candidate.SnapshotKey = snapshotDedupKey;
@@ -1819,6 +1907,14 @@ namespace FluxCAD.BricsCAD.Plugin26
                 case SheetEntityKind.Polyline:
                     return string.Join("|",
                         "POLY",
+                        entity.IsClosed ? "C" : "O",
+                        entity.Vertices == null || entity.Vertices.Count == 0
+                            ? ""
+                            : string.Join(";", entity.Vertices.Select(p => RoundPoint(p))));
+
+                case SheetEntityKind.Face:
+                    return string.Join("|",
+                        "FACE",
                         entity.IsClosed ? "C" : "O",
                         entity.Vertices == null || entity.Vertices.Count == 0
                             ? ""
@@ -2548,6 +2644,41 @@ namespace FluxCAD.BricsCAD.Plugin26
                             ratio,
                             0.0,
                             Math.PI * 2.0);
+                        break;
+                    }
+                case SheetEntityKind.Face:
+                    {
+                        if (e.Vertices == null || e.Vertices.Count < 3)
+                            return null;
+
+                        try
+                        {
+                            var p1 = e.Vertices[0];
+                            var p2 = e.Vertices[1];
+                            var p3 = e.Vertices[2];
+                            var p4 = e.Vertices.Count >= 4 ? e.Vertices[3] : e.Vertices[2];
+
+                            created = new Face(
+                                new Point3d(p1.X, p1.Y, 0.0),
+                                new Point3d(p2.X, p2.Y, 0.0),
+                                new Point3d(p3.X, p3.Y, 0.0),
+                                new Point3d(p4.X, p4.Y, 0.0),
+                                true, true, true, true);
+                        }
+                        catch
+                        {
+                            // Fallback: 시각 힌트라도 유지
+                            var pl = new Teigha.DatabaseServices.Polyline();
+                            for (int i = 0; i < e.Vertices.Count; i++)
+                            {
+                                var p = e.Vertices[i];
+                                pl.AddVertexAt(i, new Point2d(p.X, p.Y), 0.0, 0.0, 0.0);
+                            }
+
+                            pl.Closed = true;
+                            created = pl;
+                        }
+
                         break;
                     }
 
@@ -5178,7 +5309,8 @@ namespace FluxCAD.BricsCAD.Plugin26
                 || ent is Teigha.DatabaseServices.Polyline
                 || ent is Polyline2d
                 || ent is Polyline3d
-                || ent is Spline;
+                || ent is Spline
+                || ent is Face;   // 최소 수정 추가;
         }
 
         private static Bounds2D ComputeAdaptiveExpandedViewBounds(
@@ -5932,7 +6064,9 @@ namespace FluxCAD.BricsCAD.Plugin26
                    ent is Ellipse ||
                    ent is Teigha.DatabaseServices.Polyline ||
                    ent is Polyline2d ||
-                   ent is Polyline3d;
+                   ent is Polyline3d ||
+                   ent is Spline ||
+                   ent is Face;   // 최소 수정 추가
         }
 
         private static List<Point2D> GetCurveRepresentativeEndpoints(Entity ent)
@@ -9917,7 +10051,8 @@ namespace FluxCAD.BricsCAD.Plugin26
                 || e.Kind == SheetEntityKind.Polyline
                 || e.Kind == SheetEntityKind.Arc
                 || e.Kind == SheetEntityKind.Circle
-                || e.Kind == SheetEntityKind.Ellipse;
+                || e.Kind == SheetEntityKind.Ellipse
+                || e.Kind == SheetEntityKind.Face;   // 최소 수정 추가
         }
 
         [CommandMethod("FLUX_DEBUG_VIEW_GRAPH")]
@@ -20322,18 +20457,18 @@ namespace FluxCAD.BricsCAD.Plugin26
             if (ed == null || e == null)
                 return;
 
-            ed.WriteMessage(
-                $"\n[SNAPSHOT-LEAF] " +
-                $"I={viewId}, Stage={stage}, " +
-                $"H={SafeDbg(e.Handle)}, Type={SafeDbg(e.EntityType)}, Kind={e.Kind}, Role={e.Role}, " +
-                $"Color={e.ColorIndex}, Layer={SafeDbg(e.Layer)}, Lt={SafeDbg(e.EffectiveLinetypeName ?? e.LinetypeName)}, " +
-                $"Bounds={e.Bounds}, View={viewBounds}, " +
-                $"IsClosed={e.IsClosed}, Vertices={e.Vertices?.Count ?? 0}, " +
-                $"EllipseLike={IsEllipseLikePolyline(e)}, " +
-                $"Faded={e.IsFadedLike}, ContainsHatch={e.ContainsOrEnclosesHatchLike}, " +
-                $"HintScore={e.VisualHintScore:0.##}, GeoScore={e.GeometryConfidenceScore:0.##}, " +
-                $"SnapshotKey={e.SnapshotKey}, " +
-                $"Noise={e.IsLikelySemanticNoise}, Reason={SafeDbg(e.RoleReason)}");
+//             ed.WriteMessage(
+//                 $"\n[SNAPSHOT-LEAF] " +
+//                 $"I={viewId}, Stage={stage}, " +
+//                 $"H={SafeDbg(e.Handle)}, Type={SafeDbg(e.EntityType)}, Kind={e.Kind}, Role={e.Role}, " +
+//                 $"Color={e.ColorIndex}, Layer={SafeDbg(e.Layer)}, Lt={SafeDbg(e.EffectiveLinetypeName ?? e.LinetypeName)}, " +
+//                 $"Bounds={e.Bounds}, View={viewBounds}, " +
+//                 $"IsClosed={e.IsClosed}, Vertices={e.Vertices?.Count ?? 0}, " +
+//                 $"EllipseLike={IsEllipseLikePolyline(e)}, " +
+//                 $"Faded={e.IsFadedLike}, ContainsHatch={e.ContainsOrEnclosesHatchLike}, " +
+//                 $"HintScore={e.VisualHintScore:0.##}, GeoScore={e.GeometryConfidenceScore:0.##}, " +
+//                 $"SnapshotKey={e.SnapshotKey}, " +
+//                 $"Noise={e.IsLikelySemanticNoise}, Reason={SafeDbg(e.RoleReason)}");
         }
 
         private static string SafeDbg(string? value)

@@ -131,6 +131,7 @@ namespace FluxCAD.SheetAnalysis
             Kind == SheetEntityKind.Ellipse ||
             Kind == SheetEntityKind.Hatch ||
             Kind == SheetEntityKind.Solid ||
+            Kind == SheetEntityKind.Face ||   // 추가
             Kind == SheetEntityKind.Point ||
             Kind == SheetEntityKind.Spline ||
             Kind == SheetEntityKind.Region;

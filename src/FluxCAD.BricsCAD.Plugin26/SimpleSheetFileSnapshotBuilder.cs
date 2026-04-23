@@ -12,7 +12,7 @@ namespace FluxCAD.BricsCAD.Plugin26
         public IReadOnlyList<SheetEntity> Build(string sheetFilePath)
         {
             var ed = Bricscad.ApplicationServices.Application.DocumentManager.MdiActiveDocument.Editor;
-            ed.WriteMessage("\n[SnapshotBuilder] Build entered");
+            ed.WriteMessage("\n[SnapshotBuilder] BUILD TAG = FACE_DEBUG_V4_20260423_0500");
 
             if (string.IsNullOrWhiteSpace(sheetFilePath))
                 throw new ArgumentException("sheetFilePath is null or empty.", nameof(sheetFilePath));
@@ -39,7 +39,8 @@ namespace FluxCAD.BricsCAD.Plugin26
                         blockPath: Array.Empty<string>(),
                         ownerBlockName: null,
                         depth: 0,
-                        isInsideBlock: false);
+                        isInsideBlock: false,
+                        Editor: ed);
 
                     var blockStack = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
@@ -76,6 +77,15 @@ namespace FluxCAD.BricsCAD.Plugin26
         {
             if (ent == null || ent.IsErased)
                 return;
+
+            context.Editor?.WriteMessage(
+                $"\n[RAW-ENTITY] Type={ent.GetType().FullName}, Handle={ent.Handle}, IsBlockRef={ent is BlockReference}");
+
+            if (ent is Face faceEnt)
+            {
+                context.Editor?.WriteMessage(
+                    $"\n[RAW-FACE-SEEN] Type={faceEnt.GetType().FullName}, Handle={faceEnt.Handle}");
+            }
 
             if (ent is not BlockReference br)
             {
@@ -134,7 +144,8 @@ namespace FluxCAD.BricsCAD.Plugin26
                     blockPath: nextBlockPath,
                     ownerBlockName: currentBlockName,
                     depth: parentContext.Depth + 1,
-                    isInsideBlock: true);
+                    isInsideBlock: true, 
+                    Editor : ed);
 
                 var attrLeaf = BuildLeafSheetEntity(attr, tr, attrContext);
                 if (attrLeaf != null)
@@ -209,7 +220,8 @@ namespace FluxCAD.BricsCAD.Plugin26
                     blockPath: nextBlockPath,
                     ownerBlockName: currentBlockName,
                     depth: parentContext.Depth + 1,
-                    isInsideBlock: true);
+                    isInsideBlock: true, 
+                    Editor : ed);
 
                 foreach (ObjectId childId in btr)
                 {
@@ -220,13 +232,14 @@ namespace FluxCAD.BricsCAD.Plugin26
                     if (child == null || child.IsErased)
                         continue;
 
-                    if (br.Handle.ToString().Equals("10B", StringComparison.OrdinalIgnoreCase))
-                    {
-                        //var ed = Bricscad.ApplicationServices.Application.DocumentManager.MdiActiveDocument.Editor;
-                        ed.WriteMessage(
-                            $"\n[Block10B-Child] type={child.GetType().Name}, handle={child.Handle}");
-                    }
+                    ed.WriteMessage(
+                        $"\n[BLOCK-CHILD] Block={currentBlockName ?? "(null)"}, Type={child.GetType().FullName}, Handle={child.Handle}");
 
+                    if (child is Face)
+                    {
+                        ed.WriteMessage(
+                            $"\n[BLOCK-FACE-SEEN] Block={currentBlockName ?? "(null)"}, Handle={child.Handle}");
+                    }
 
                     ExpandEntityRecursive(
                         child,
@@ -316,21 +329,42 @@ namespace FluxCAD.BricsCAD.Plugin26
         }
 
 
+
         private static SheetEntity? BuildLeafSheetEntity(
-            Entity sourceEnt,
-            Transaction tr,
-            SnapshotExpansionContext context)
+    Entity sourceEnt,
+    Transaction tr,
+    SnapshotExpansionContext context)
         {
             Entity? wcsEnt = null;
 
             try
             {
+                context.Editor?.WriteMessage(
+            $"\n[LEAF-ENTER] SourceType={sourceEnt.GetType().FullName}, Handle={sourceEnt.Handle}");
+
+                if (sourceEnt is Face)
+                {
+                    context.Editor?.WriteMessage(
+                        $"\n[FACE-SOURCE-ENTER] Type={sourceEnt.GetType().FullName}, Handle={sourceEnt.Handle}");
+                }
+
                 wcsEnt = (Entity)sourceEnt.Clone();
                 ApplyTransforms(wcsEnt, context.TransformsToWcs);
 
                 var kind = ResolveKind(wcsEnt);
                 var role = ResolveRole(wcsEnt);
                 var sourceKind = ResolveLeafSourceKind(wcsEnt, context.IsInsideBlock);
+
+                if (kind == SheetEntityKind.Face)
+                {
+                    context.Editor?.WriteMessage(
+                        $"\n[FACE-DETECTED] Type={wcsEnt.GetType().FullName}, Handle={sourceEnt.Handle}, Role={role}");
+                }
+                else
+                {
+                    context.Editor?.WriteMessage(
+                        $"\n[LEAF-KIND] Type={wcsEnt.GetType().FullName}, Kind={kind}, Handle={sourceEnt.Handle}, Role={role}");
+                }
 
                 var bounds = TryGetBounds(wcsEnt, out var b)
                     ? b
@@ -383,24 +417,27 @@ namespace FluxCAD.BricsCAD.Plugin26
                         blockPath: context.BlockPath)
                 };
 
-                // 기존 linetype / semantic / geometry 정보 채움
                 PopulateLinetypeFields(sheetEntity, sourceEnt, wcsEnt, tr);
-
-                // ✅ 추가: visual style 정보(color, transparency, faded 등) 채움
-                // sourceEnt 기준으로 원본 속성을 우선 반영
-                FillVisualStyleFlags(sourceEnt, sheetEntity); 
-
-                // 필요 시 WCS clone 쪽 정보로 보강하고 싶다면 아래를 유지할 수 있음.
-                // 현재는 sourceEnt 기준만 써도 충분합니다.
-                //FillVisualStyleFlags(wcsEnt, sheetEntity);
-
+                FillVisualStyleFlags(sourceEnt, sheetEntity);
                 PopulateSemanticFlags(sheetEntity);
                 PopulateGeometryFields(sheetEntity, wcsEnt);
 
+                if (sheetEntity.Kind == SheetEntityKind.Face)
+                {
+                    context.Editor?.WriteMessage(
+                        $"\n[FACE-GEOM] H={sheetEntity.Handle}, " +
+                        $"BoundsEmpty={sheetEntity.Bounds.IsEmpty}, " +
+                        $"VertexCount={sheetEntity.Vertices?.Count ?? 0}, " +
+                        $"Role={sheetEntity.Role}, GeometryLike={sheetEntity.IsGeometryLike}, " +
+                        $"SourceKind={sheetEntity.SourceKind}, Layer={sheetEntity.Layer}");
+                }
+
                 return sheetEntity;
             }
-            catch
+            catch (System.Exception ex)
             {
+                context.Editor?.WriteMessage(
+                    $"\n[LEAF-BUILD-ERROR] SourceType={sourceEnt.GetType().FullName}, Handle={sourceEnt.Handle}, Error={ex}");
                 return null;
             }
             finally
@@ -408,6 +445,7 @@ namespace FluxCAD.BricsCAD.Plugin26
                 wcsEnt?.Dispose();
             }
         }
+
 
         private static void FillVisualStyleFlags(Entity ent, SheetEntity se)
         {
@@ -641,6 +679,60 @@ namespace FluxCAD.BricsCAD.Plugin26
                             target.EllipseRotationDeg2D = RadToDeg(Math.Atan2(major.Y, major.X));
                             break;
                         }
+                    case Face face:
+                        {
+                            var vertices = TryGetFaceVertices(face);
+
+                            if (vertices.Count > 0)
+                            {
+                                target.Vertices = vertices;
+                                target.IsClosed = true;
+
+                                if (vertices.Count >= 1)
+                                    target.StartPoint = vertices[0];
+
+                                if (vertices.Count >= 2)
+                                    target.EndPoint = vertices[1];
+
+                                double cx = 0.0;
+                                double cy = 0.0;
+                                for (int i = 0; i < vertices.Count; i++)
+                                {
+                                    cx += vertices[i].X;
+                                    cy += vertices[i].Y;
+                                }
+
+                                cx /= vertices.Count;
+                                cy /= vertices.Count;
+
+                                target.Center = new Point2D(cx, cy);
+                                target.CenterPoint = target.Center;
+
+                                // Face는 GeometricExtents가 불안정한 경우가 있어서
+                                // vertex 기반 bounds를 fallback으로 직접 보강
+                                if (target.Bounds.IsEmpty)
+                                {
+                                    double minX = vertices[0].X;
+                                    double minY = vertices[0].Y;
+                                    double maxX = vertices[0].X;
+                                    double maxY = vertices[0].Y;
+
+                                    for (int i = 1; i < vertices.Count; i++)
+                                    {
+                                        var p = vertices[i];
+
+                                        if (p.X < minX) minX = p.X;
+                                        if (p.Y < minY) minY = p.Y;
+                                        if (p.X > maxX) maxX = p.X;
+                                        if (p.Y > maxY) maxY = p.Y;
+                                    }
+
+                                    target.Bounds = new Bounds2D(minX, minY, maxX, maxY);
+                                }
+                            }
+
+                            break;
+                        }
 
                     // Spline은 occupancy seed 확장을 위해 fallback vertex를 남기는 것이 유리하다.
                     case Spline sp:
@@ -659,6 +751,47 @@ namespace FluxCAD.BricsCAD.Plugin26
             {
                 // geometry field 추출 실패는 전체 snapshot 실패로 보지 않음
             }
+        }
+
+        private static IReadOnlyList<Point2D> TryGetFaceVertices(Face face)
+        {
+            var result = new List<Point2D>();
+            if (face == null)
+                return result;
+
+            try
+            {
+                var p0 = face.GetVertexAt(0);
+                var p1 = face.GetVertexAt(1);
+                var p2 = face.GetVertexAt(2);
+                var p3 = face.GetVertexAt(3);
+
+                AddIfDistinct(result, new Point2D(p0.X, p0.Y));
+                AddIfDistinct(result, new Point2D(p1.X, p1.Y));
+                AddIfDistinct(result, new Point2D(p2.X, p2.Y));
+                AddIfDistinct(result, new Point2D(p3.X, p3.Y));
+
+                return result;
+            }
+            catch
+            {
+                return result;
+            }
+        }
+
+        private static void AddIfDistinct(List<Point2D> points, Point2D p, double tol = 1e-6)
+        {
+            if (points == null)
+                return;
+
+            for (int i = 0; i < points.Count; i++)
+            {
+                var q = points[i];
+                if (Math.Abs(q.X - p.X) <= tol && Math.Abs(q.Y - p.Y) <= tol)
+                    return;
+            }
+
+            points.Add(p);
         }
 
         private static IReadOnlyList<Point2D> TrySampleSpline(Spline sp)
@@ -727,6 +860,9 @@ namespace FluxCAD.BricsCAD.Plugin26
                 Hatch
                     => SheetEntityRole.HatchLike,
 
+                Face
+                    => SheetEntityRole.Geometry,
+
                 Line or Polyline or Arc or Circle or Ellipse or Solid or Spline
                     => SheetEntityRole.Geometry,
 
@@ -747,24 +883,23 @@ namespace FluxCAD.BricsCAD.Plugin26
         {
             return ent switch
             {
+                BlockReference => SheetEntityKind.BlockReference,
+                AttributeReference => SheetEntityKind.InsertAttribute,
+                DBText => SheetEntityKind.Text,
+                MText => SheetEntityKind.MText,
+                Dimension => SheetEntityKind.Dimension,
+                Leader => SheetEntityKind.Leader,
                 Line => SheetEntityKind.Line,
-                Polyline => SheetEntityKind.Polyline,
+                Teigha.DatabaseServices.Polyline => SheetEntityKind.Polyline,
                 Arc => SheetEntityKind.Arc,
                 Circle => SheetEntityKind.Circle,
                 Ellipse => SheetEntityKind.Ellipse,
                 Hatch => SheetEntityKind.Hatch,
                 Solid => SheetEntityKind.Solid,
+                Face => SheetEntityKind.Face,   // 추가
+                DBPoint => SheetEntityKind.Point,
                 Spline => SheetEntityKind.Spline,
-
-                AttributeReference => SheetEntityKind.InsertAttribute,
-                DBText => SheetEntityKind.Text,
-                MText => SheetEntityKind.MText,
-
-                Dimension => SheetEntityKind.Dimension,
-                Leader => SheetEntityKind.Leader,
-
-                BlockReference => SheetEntityKind.BlockReference,
-
+                Region => SheetEntityKind.Region,
                 _ => SheetEntityKind.Unknown
             };
         }
@@ -1038,7 +1173,8 @@ namespace FluxCAD.BricsCAD.Plugin26
                 IReadOnlyList<string> blockPath,
                 string? ownerBlockName,
                 int depth,
-                bool isInsideBlock)
+                bool isInsideBlock,
+                Bricscad.EditorInput.Editor Editor)
             {
                 TransformsToWcs = transformsToWcs ?? Array.Empty<Matrix3d>();
                 BlockPath = blockPath ?? Array.Empty<string>();
@@ -1052,6 +1188,8 @@ namespace FluxCAD.BricsCAD.Plugin26
             public string? OwnerBlockName { get; }
             public int Depth { get; }
             public bool IsInsideBlock { get; }
+
+            public Bricscad.EditorInput.Editor Editor;
         }
 
 

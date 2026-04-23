@@ -22,6 +22,7 @@ namespace FluxCAD.SheetAnalysis
         Ellipse,
         Hatch,
         Solid,
+        Face,   // 추가
         Point,
         InsertAttribute,
 
