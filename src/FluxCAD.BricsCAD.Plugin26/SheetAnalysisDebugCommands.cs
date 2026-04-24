@@ -1092,7 +1092,10 @@ namespace FluxCAD.BricsCAD.Plugin26
                 }
             }
 
-            profile.ConnectedBoundaryEntities.AddRange(profile.OuterMostEntities);
+            ExpandConnectedBoundaryFromOuterSeeds(
+                profile,
+                visibleEntities,
+                ComputeConnectionTolerance(viewBounds));
 
             profile.Complexity =
                 profile.OuterMostEntities.Count <= 2
@@ -1104,6 +1107,315 @@ namespace FluxCAD.BricsCAD.Plugin26
 
             return profile;
         }
+
+        private static void ExpandConnectedBoundaryFromOuterSeeds(
+    DirectionalEdgeProfile profile,
+    IReadOnlyList<SheetEntity> visibleEntities,
+    double tolerance)
+        {
+            if (profile.OuterMostEntities.Count == 0)
+                return;
+
+            var accepted = new HashSet<string>(
+                profile.OuterMostEntities
+                    .Where(x => x != null)
+                    .Select(x => x.Handle));
+
+            var queue = new Queue<SheetEntity>(profile.OuterMostEntities);
+
+            while (queue.Count > 0)
+            {
+                var current = queue.Dequeue();
+                if (current == null || current.Bounds.IsEmpty)
+                    continue;
+
+                foreach (var candidate in visibleEntities)
+                {
+                    if (candidate == null || candidate.Bounds.IsEmpty)
+                        continue;
+
+                    if (accepted.Contains(candidate.Handle))
+                        continue;
+
+                    if (!IsBoundaryConnectable(profile, current, candidate, tolerance))
+                        continue;
+
+                    accepted.Add(candidate.Handle);
+                    queue.Enqueue(candidate);
+                }
+            }
+
+            profile.ConnectedBoundaryEntities.Clear();
+
+            foreach (var e in visibleEntities)
+            {
+                if (e == null)
+                    continue;
+
+                if (!accepted.Contains(e.Handle))
+                    continue;
+
+                profile.ConnectedBoundaryEntities.Add(e);
+
+                var hit = profile.Hits.FirstOrDefault(x => x.Entity.Handle == e.Handle);
+                if (hit != null)
+                {
+                    hit.IsConnectedToSeed = true;
+
+                    if (hit.Role != DirectionalEdgeEntityRole.OuterMostBoundary)
+                        hit.Role = DirectionalEdgeEntityRole.ConnectedBoundary;
+
+                    hit.Reason = "Connected from outer seed";
+                }
+            }
+
+            foreach (var hit in profile.Hits)
+            {
+                if (accepted.Contains(hit.Entity.Handle))
+                    continue;
+
+                if (hit.Role == DirectionalEdgeEntityRole.Unknown)
+                    hit.Role = DirectionalEdgeEntityRole.DisconnectedNoise;
+
+                profile.DisconnectedEntities.Add(hit.Entity);
+            }
+
+            DetectSimpleProtrusionCandidates(profile, tolerance);
+
+            profile.Reason +=
+                $", Connected={profile.ConnectedBoundaryEntities.Count}, " +
+                $"Disconnected={profile.DisconnectedEntities.Count}, " +
+                $"Protrusion={profile.ProtrusionEntities.Count}";
+        }
+
+        private static void ExpandConnectedBoundaryFromOuterSeeds_old(
+    DirectionalEdgeProfile profile,
+    IReadOnlyList<SheetEntity> visibleEntities,
+    double tolerance)
+        {
+            if (profile.OuterMostEntities.Count == 0)
+                return;
+
+            var accepted = new HashSet<string>(
+                profile.OuterMostEntities
+                    .Where(x => x != null)
+                    .Select(x => x.Handle));
+
+            var queue = new Queue<SheetEntity>(profile.OuterMostEntities);
+
+            while (queue.Count > 0)
+            {
+                var current = queue.Dequeue();
+                if (current == null || current.Bounds.IsEmpty)
+                    continue;
+
+                foreach (var candidate in visibleEntities)
+                {
+                    if (candidate == null || candidate.Bounds.IsEmpty)
+                        continue;
+
+                    if (accepted.Contains(candidate.Handle))
+                        continue;
+
+                    if (!IsBoundaryConnectable(profile, current, candidate, tolerance))
+                        continue;
+
+                    accepted.Add(candidate.Handle);
+                    queue.Enqueue(candidate);
+                }
+            }
+
+            profile.ConnectedBoundaryEntities.Clear();
+
+            foreach (var e in visibleEntities)
+            {
+                if (e == null)
+                    continue;
+
+                if (!accepted.Contains(e.Handle))
+                    continue;
+
+                profile.ConnectedBoundaryEntities.Add(e);
+
+                var hit = profile.Hits.FirstOrDefault(x => x.Entity.Handle == e.Handle);
+                if (hit != null)
+                {
+                    hit.IsConnectedToSeed = true;
+
+                    if (hit.Role != DirectionalEdgeEntityRole.OuterMostBoundary)
+                        hit.Role = DirectionalEdgeEntityRole.ConnectedBoundary;
+
+                    hit.Reason = "Connected from outer seed";
+                }
+            }
+
+            foreach (var hit in profile.Hits)
+            {
+                if (accepted.Contains(hit.Entity.Handle))
+                    continue;
+
+                if (hit.Role == DirectionalEdgeEntityRole.Unknown)
+                    hit.Role = DirectionalEdgeEntityRole.DisconnectedNoise;
+
+                profile.DisconnectedEntities.Add(hit.Entity);
+            }
+
+            DetectSimpleProtrusionCandidates(profile, tolerance);
+
+            profile.Reason +=
+                $", Connected={profile.ConnectedBoundaryEntities.Count}, " +
+                $"Disconnected={profile.DisconnectedEntities.Count}, " +
+                $"Protrusion={profile.ProtrusionEntities.Count}";
+        }
+
+        private static bool IsBoundaryConnectable(
+    DirectionalEdgeProfile profile,
+    SheetEntity a,
+    SheetEntity b,
+    double tolerance)
+        {
+            if (a == null || b == null)
+                return false;
+
+            if (a.Handle == b.Handle)
+                return false;
+
+            if (!Bounds2DHelper.Intersects(a.Bounds, b.Bounds, tolerance))
+                return false;
+
+            if (HasEndpointConnection(a, b, tolerance))
+                return true;
+
+            if (HasVertexConnection(a, b, tolerance))
+                return true;
+
+            // Arc / Circle / Polyline 등에서 endpoint 정보가 부족할 때의 보조 기준
+            double distance = Bounds2DHelper.Distance(a.Bounds, b.Bounds);
+            if (distance <= tolerance)
+                return true;
+
+            return false;
+        }
+
+        private static bool HasEndpointConnection(
+    SheetEntity a,
+    SheetEntity b,
+    double tolerance)
+        {
+            var aps = GetConnectionPoints(a);
+            var bps = GetConnectionPoints(b);
+
+            if (aps.Count == 0 || bps.Count == 0)
+                return false;
+
+            foreach (var p1 in aps)
+            {
+                foreach (var p2 in bps)
+                {
+                    if (Bounds2DHelper.Distance(p1, p2) <= tolerance)
+                        return true;
+                }
+            }
+
+            return false;
+        }
+
+        private static bool HasVertexConnection(
+            SheetEntity a,
+            SheetEntity b,
+            double tolerance)
+        {
+            if (a.Vertices == null || b.Vertices == null)
+                return false;
+
+            if (a.Vertices.Count == 0 || b.Vertices.Count == 0)
+                return false;
+
+            foreach (var p1 in a.Vertices)
+            {
+                foreach (var p2 in b.Vertices)
+                {
+                    if (Bounds2DHelper.Distance(p1, p2) <= tolerance)
+                        return true;
+                }
+            }
+
+            return false;
+        }
+
+        private static List<Point2D> GetConnectionPoints(SheetEntity e)
+        {
+            var result = new List<Point2D>();
+
+            if (e == null)
+                return result;
+
+            if (e.StartPoint.HasValue)
+                result.Add(e.StartPoint.Value);
+
+            if (e.EndPoint.HasValue)
+                result.Add(e.EndPoint.Value);
+
+            if (e.Vertices != null && e.Vertices.Count > 0)
+            {
+                result.Add(e.Vertices.First());
+                result.Add(e.Vertices.Last());
+            }
+
+            return result;
+        }
+
+        private static double ComputeConnectionTolerance(Bounds2D viewBounds)
+        {
+            if (viewBounds.IsEmpty)
+                return 1.0;
+
+            double shortSide = Math.Min(viewBounds.Width, viewBounds.Height);
+
+            return Math.Max(1.0, shortSide * 0.005);
+        }
+
+        private static void DetectSimpleProtrusionCandidates(
+    DirectionalEdgeProfile profile,
+    double tolerance)
+        {
+            if (profile.ConnectedBoundaryEntities.Count == 0)
+                return;
+
+            foreach (var e in profile.ConnectedBoundaryEntities)
+            {
+                double sideCoord = GetEntitySideCoordinate(e.Bounds, profile.Side);
+                double dist = Math.Abs(profile.OuterCoordinate - sideCoord);
+
+                bool isOuterExtreme = dist <= tolerance * 2.0;
+
+                if (!isOuterExtreme)
+                    continue;
+
+                bool smallComparedToView =
+                    e.Bounds.Width < profile.ViewBounds.Width * 0.35 &&
+                    e.Bounds.Height < profile.ViewBounds.Height * 0.35;
+
+                if (!smallComparedToView)
+                    continue;
+
+                if (!profile.ProtrusionEntities.Contains(e))
+                    profile.ProtrusionEntities.Add(e);
+
+                var hit = profile.Hits.FirstOrDefault(x => x.Entity.Handle == e.Handle);
+                if (hit != null)
+                {
+                    hit.Role = DirectionalEdgeEntityRole.ProtrusionBoundary;
+                    hit.IsLikelyProtrusionPart = true;
+                    hit.Reason = "Connected outer extreme and small local boundary";
+                }
+            }
+
+            if (profile.ProtrusionEntities.Count > 0)
+                profile.Complexity = DirectionalEdgeComplexity.Protruded;
+        }
+
+
 
         private static double ComputeDirectionalAccessBandSize(Bounds2D bounds)
         {
