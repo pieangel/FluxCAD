@@ -1,6 +1,7 @@
 ﻿using Bricscad.ApplicationServices;
 using Bricscad.ApplicationServices.Core;
 using FluxCAD.SheetAnalysis;
+using FluxCAD.SheetAnalysis.Contours;
 using FluxCAD.SheetAnalysis.Structure.Analysis;
 using FluxCAD.SheetAnalysis.Structure.Builders;
 using FluxCAD.SheetAnalysis.Structure.Classifiers;
@@ -10,6 +11,7 @@ using FluxCAD.SheetAnalysis.ViewIsolation;
 using FluxCAD.SheetAnalysis.ViewIsolation.Analysis;
 using FluxCAD.SheetAnalysis.ViewIsolation.Loops;
 using FluxCAD.SheetAnalysis.ViewProjection;
+using FluxCAD.SheetAnalysis.Workspace;
 using System;
 using System.Collections.Generic;
 using System.Diagnostics.Metrics;
@@ -26,7 +28,6 @@ using Teigha.GraphicsSystem;
 using Teigha.Runtime;
 using static System.Formats.Asn1.AsnWriter;
 using TeighaColor = Teigha.Colors.Color;
-using FluxCAD.SheetAnalysis.Contours;
 
 namespace FluxCAD.BricsCAD.Plugin26
 {
@@ -198,6 +199,16 @@ namespace FluxCAD.BricsCAD.Plugin26
             public Bounds2D SourceBounds { get; init; } = Bounds2D.Empty;
             public List<ViewCandidate> MemberViews { get; init; } = new();
             public List<int> MemberIslandIds { get; init; } = new();
+        }
+
+        private sealed class CopiedWorkspaceViewBuildResult
+        {
+            public GeometryWorkspaceView WorkspaceView { get; init; } = null!;
+            public IReadOnlyList<SheetEntity> SnapshotLeaves { get; init; } = Array.Empty<SheetEntity>();
+
+            public int CopiedCount { get; init; }
+            public int DeepClonedCount { get; init; }
+            public int RecreatedCount { get; init; }
         }
 
         private sealed class ProjectionPlacement
@@ -826,56 +837,23 @@ namespace FluxCAD.BricsCAD.Plugin26
                     return;
                 }
 
-                var candidates = BuildResolvedViewCandidates(sheetFilePath, ed);
-                if (candidates == null || candidates.Count == 0)
+                var workspace = BuildSnapshotGeometryWorkspaceForOuterContour(
+                    sheetFilePath,
+                    ed);
+
+                if (workspace == null || workspace.Views.Count == 0)
                 {
-                    ed.WriteMessage("\n[FluxCAD] view candidate가 비어 있습니다.");
+                    ed.WriteMessage(
+                        "\n[FluxCAD] Outer contour trace 대상 snapshot workspace view가 없습니다." +
+                        (workspace != null && workspace.Diagnostics.Count > 0
+                            ? $" Diagnostics=[{string.Join(", ", workspace.Diagnostics)}]"
+                            : string.Empty));
                     return;
                 }
-
-                var targetViews = candidates
-                    .Where(x => x != null)
-                    .Where(x => x.FinalRole == ViewIslandSemanticRole.GeometryView)
-                    .Where(x => x.IsTopLevelView)
-                    .Where(x => !x.IsSparseBridgeLike)
-                    .OrderBy(x => x.IslandId)
-                    .ToList();
-
-                if (targetViews.Count == 0)
-                {
-                    ed.WriteMessage("\n[FluxCAD] Outer contour trace 대상 TopLevel GeometryView가 없습니다.");
-                    return;
-                }
-
-                IEntitySnapshotBuilder snapshotBuilder = new SimpleSheetFileSnapshotBuilder();
-                var fullEntities = snapshotBuilder.Build(sheetFilePath);
-
-                if (fullEntities == null || fullEntities.Count == 0)
-                {
-                    ed.WriteMessage("\n[FluxCAD] snapshot entity가 비어 있습니다.");
-                    return;
-                }
-
-                var pipeline = BuildSemanticIslandPipeline(
-                    fullEntities,
-                    ed,
-                    closeSingleCellGaps: false,
-                    targetCellSize: 12.0,
-                    excludeSparseBridgeFromGroups: false);
-
-                if (pipeline == null || pipeline.Islands == null || pipeline.Islands.Count == 0)
-                {
-                    ed.WriteMessage("\n[FluxCAD] semantic island pipeline이 비어 있습니다.");
-                    return;
-                }
-
-                var islandMap = pipeline.Islands
-                    .Where(x => x != null)
-                    .ToDictionary(x => x.Id, x => x);
 
                 ed.WriteMessage(
-                    $"\n[FluxCAD] OuterContourTrace Start. Views={targetViews.Count}, " +
-                    $"SnapshotEntities={fullEntities.Count}, PipelineIslands={pipeline.Islands.Count}");
+                    $"\n[FluxCAD] OuterContourTrace Start. WorkspaceViews={workspace.Views.Count}, " +
+                    $"WorkspaceId={workspace.WorkspaceId}");
 
                 var extractor = new OuterContourExtractor();
 
@@ -885,50 +863,12 @@ namespace FluxCAD.BricsCAD.Plugin26
                     var ms = (BlockTableRecord)tr.GetObject(msId, OpenMode.ForWrite);
                     var outLayerName = EnsureCopyOutputLayer(db, tr);
 
-                    foreach (var view in targetViews)
+                    foreach (var workspaceView in workspace.Views
+                        .Where(x => x != null)
+                        .OrderBy(x => x.ViewId))
                     {
-                        var viewBounds = Bounds2DHelper.Normalize(view.Bounds);
-
-                        if (!islandMap.TryGetValue(view.IslandId, out var island))
-                        {
-                            ed.WriteMessage($"\n[FluxCAD] OuterContourTrace Island={view.IslandId} map lookup 실패");
-                            continue;
-                        }
-
-                        var dynamicTolerance = Math.Max(
-                            3.0,
-                            Math.Min(island.Bounds.Width, island.Bounds.Height) * 0.5);
-
-                        var semanticEntities = CollectIslandSemanticEntitiesFromPool(
-                            fullEntities,
-                            island,
-                            tolerance: dynamicTolerance,
-                            ed: ed);
-
-                        var localEntities = semanticEntities
-                            .Where(x => x != null)
-                            .Where(x => x.IsVisible)
-                            .Where(x => x.IsGeometryLike)
-                            .Where(x => !x.IsTextLike)
-                            .Where(x => !x.IsDimensionLike)
-                            .Where(x => !x.Bounds.IsEmpty)
-                            .ToList();
-
-                        var input = new ViewContourInput
-                        {
-                            ViewId = view.IslandId,
-                            Bounds = viewBounds,
-                            Entities = localEntities,
-                            SourceTag = "SemanticIslandTruth"
-                        };
-
-                        ed.WriteMessage(
-                            $"\n[FluxCAD] ViewLocalContourInput View={input.ViewId}, " +
-                            $"IslandBounds={island.Bounds}, ViewBounds={viewBounds}, " +
-                            $"RawLocalEntities={input.Entities.Count}, Tol={dynamicTolerance:0.##}");
-
-                        var result = extractor.ExtractFromViewLocalEntities(
-                            input,
+                        var result = extractor.Extract(
+                            workspaceView,
                             new OuterContourExtractionOptions
                             {
                                 EndpointToleranceMin = 2.0,
@@ -953,24 +893,32 @@ namespace FluxCAD.BricsCAD.Plugin26
 
                         ed.WriteMessage("\n" + OuterContourDebugTextFormatter.Format(result));
 
+                        var debugBounds = !workspaceView.SourceBounds.IsEmpty
+                            ? workspaceView.SourceBounds
+                            : workspaceView.WorkspaceBounds;
+
                         DrawOuterContourTraceDebug(
                             db,
                             tr,
                             ms,
                             outLayerName,
-                            view,
+                            workspaceView.ViewId,
+                            debugBounds,
                             result,
-                            labelYOffset: Math.Max(viewBounds.Height * 0.06, 15.0));
+                            labelYOffset: Math.Max(result.ViewBounds.Height * 0.06, 15.0));
 
                         var bestEntities = result.GetBestLoopEntities();
 
                         ed.WriteMessage(
-                            $"\n[FluxCAD] OuterContourTrace View={view.IslandId}, " +
-                            $"InputMode={result.InputMode}, RawInput={result.RawInputEntityCount}, " +
+                            $"\n[FluxCAD] OuterContourTrace View={workspaceView.ViewId}, " +
+                            $"InputMode={result.InputMode}, SourceTag={result.InputSourceTag}, " +
+                            $"RawInput={result.RawInputEntityCount}, " +
                             $"Eligible={result.EligibleEntities.Count}, Preferred={result.PreferredEntities.Count}, " +
                             $"Edges={result.Edges.Count}, Seeds={result.Seeds.Count}, " +
                             $"Loops={result.Loops.Count}, BestLoopEdges={(result.BestLoop?.EdgeIds.Count ?? 0)}, " +
-                            $"BestLoopEntities={bestEntities.Count}");
+                            $"BestLoopEntities={bestEntities.Count}, " +
+                            $"SourceEntities={workspaceView.SourceEntities.Count}, " +
+                            $"WorkspaceEntities={workspaceView.WorkspaceEntities.Count}");
                     }
 
                     tr.Commit();
@@ -982,6 +930,272 @@ namespace FluxCAD.BricsCAD.Plugin26
             {
                 ed.WriteMessage($"\n[FluxCAD] FLUX_DEBUG_OUTER_CONTOUR_TRACE failed: {ex}");
             }
+        }
+
+        private GeometryWorkspace BuildSnapshotGeometryWorkspaceForOuterContour(
+    string sheetFilePath,
+    Bricscad.EditorInput.Editor ed)
+        {
+            var workspace = new GeometryWorkspace
+            {
+                SourceDocumentPath = sheetFilePath
+            };
+
+            var candidates = BuildResolvedViewCandidates(sheetFilePath, ed);
+            if (candidates == null || candidates.Count == 0)
+            {
+                workspace.Diagnostics.Add("NoViewCandidates");
+                return workspace;
+            }
+
+            var targetViews = candidates
+                .Where(x => x != null)
+                .Where(x => x.FinalRole == ViewIslandSemanticRole.GeometryView)
+                .Where(x => x.IsTopLevelView)
+                .Where(x => !x.IsSparseBridgeLike)
+                .OrderBy(x => x.IslandId)
+                .ToList();
+
+            if (targetViews.Count == 0)
+            {
+                workspace.Diagnostics.Add("NoTopLevelGeometryViews");
+                return workspace;
+            }
+
+            IEntitySnapshotBuilder snapshotBuilder = new SimpleSheetFileSnapshotBuilder();
+            var fullEntities = snapshotBuilder.Build(sheetFilePath);
+
+            if (fullEntities == null || fullEntities.Count == 0)
+            {
+                workspace.Diagnostics.Add("NoSnapshotEntities");
+                return workspace;
+            }
+
+            var pipeline = BuildSemanticIslandPipeline(
+                fullEntities,
+                ed,
+                closeSingleCellGaps: false,
+                targetCellSize: 12.0,
+                excludeSparseBridgeFromGroups: false);
+
+            if (pipeline == null || pipeline.Islands == null || pipeline.Islands.Count == 0)
+            {
+                workspace.Diagnostics.Add("NoSemanticPipeline");
+                return workspace;
+            }
+
+            var islandMap = pipeline.Islands
+                .Where(x => x != null)
+                .ToDictionary(x => x.Id, x => x);
+
+            foreach (var view in targetViews)
+            {
+                if (!islandMap.TryGetValue(view.IslandId, out var island))
+                {
+                    workspace.Diagnostics.Add($"IslandMapMiss:{view.IslandId}");
+                    continue;
+                }
+
+                var dynamicTolerance = Math.Max(
+                    3.0,
+                    Math.Min(island.Bounds.Width, island.Bounds.Height) * 0.5);
+
+                var semanticEntities = CollectIslandSemanticEntitiesFromPool(
+                    fullEntities,
+                    island,
+                    tolerance: dynamicTolerance,
+                    ed: ed);
+
+                var filteredSemanticEntities = semanticEntities
+                    .Where(x => x != null)
+                    .Where(x => x.IsVisible)
+                    .Where(x => x.IsGeometryLike)
+                    .Where(x => !x.IsTextLike)
+                    .Where(x => !x.IsDimensionLike)
+                    .Where(x => !x.IsLikelySemanticNoise)
+                    .Where(x => !x.Bounds.IsEmpty)
+                    .ToList();
+
+                if (filteredSemanticEntities.Count == 0)
+                {
+                    workspace.Diagnostics.Add($"NoFilteredSemanticEntities:{view.IslandId}");
+                    continue;
+                }
+
+                var snapshotLeaves = CollectSnapshotLeafGeometryForCopy(
+                    filteredSemanticEntities,
+                    view.Bounds,
+                    pipeline.RobustBounds.IsEmpty ? pipeline.AllBounds : pipeline.RobustBounds,
+                    ed,
+                    view.IslandId);
+
+                if (snapshotLeaves == null || snapshotLeaves.Count == 0)
+                {
+                    workspace.Diagnostics.Add($"NoSnapshotLeaves:{view.IslandId}");
+                    continue;
+                }
+
+                var wsView = new GeometryWorkspaceView
+                {
+                    ViewId = view.IslandId,
+                    SourceIslandId = view.IslandId,
+                    SourceBounds = Bounds2DHelper.Normalize(view.Bounds),
+                    WorkspaceBounds = Bounds2DHelper.Normalize(view.Bounds),
+                    Displacement = new Point2D(0, 0),
+                    Label = BuildCopiedViewLabel(view)
+                };
+
+                wsView.MemberIslandIds.Add(view.IslandId);
+
+                foreach (var e in snapshotLeaves)
+                {
+                    if (e == null)
+                        continue;
+
+                    wsView.SourceEntities.Add(e);
+                    wsView.WorkspaceEntities.Add(e);
+
+                    if (!string.IsNullOrWhiteSpace(e.Handle))
+                        wsView.SourceHandles.Add(e.Handle);
+                }
+
+                wsView.Diagnostics.Add($"SemanticEntities={filteredSemanticEntities.Count}");
+                wsView.Diagnostics.Add($"SnapshotLeaves={snapshotLeaves.Count}");
+
+                workspace.Views.Add(wsView);
+            }
+
+            return workspace;
+        }
+
+        private static CopiedWorkspaceViewBuildResult CopySnapshotLeavesAndBuildCopiedWorkspaceView(
+    Database db,
+    Transaction tr,
+    BlockTableRecord ms,
+    ObjectId modelSpaceId,
+    string outLayer,
+    CopyViewWorkItem work,
+    Bounds2D sheetBounds,
+    double dx,
+    double dy,
+    Bricscad.EditorInput.Editor? ed)
+        {
+            var snapshotLeaves = CollectSnapshotLeafGeometryForCopy(
+                work.SemanticEntities,
+                work.SourceBounds,
+                sheetBounds,
+                ed,
+                work.View.IslandId);
+
+            int copiedCount = 0;
+            int deepClonedCount = 0;
+            int recreatedCount = 0;
+
+            var displacement = Matrix3d.Displacement(new Vector3d(dx, dy, 0.0));
+
+            var deepCloneLeaves = snapshotLeaves
+                .Where(x => x != null && CanDeepCloneSnapshotLeafAsWorldEntity(x))
+                .ToList();
+
+            var recreateLeaves = snapshotLeaves
+                .Where(x => x == null || !CanDeepCloneSnapshotLeafAsWorldEntity(x))
+                .ToList();
+
+            var sourceHandles = deepCloneLeaves
+                .Select(x => x?.Handle)
+                .Where(x => !string.IsNullOrWhiteSpace(x))
+                .Cast<string>()
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .ToList();
+
+            var sourceIds = ResolveObjectIdsFromDirectHandles(db, tr, sourceHandles);
+
+            var resolvedHandleSet = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+            foreach (ObjectId sourceId in sourceIds)
+            {
+                if (!sourceId.IsValid || sourceId.IsErased)
+                    continue;
+
+                try
+                {
+                    var obj = tr.GetObject(sourceId, OpenMode.ForRead, false) as DBObject;
+                    if (obj != null)
+                        resolvedHandleSet.Add(obj.Handle.ToString());
+                }
+                catch
+                {
+                }
+            }
+
+            if (sourceIds.Count > 0)
+            {
+                var mapping = new IdMapping();
+                db.DeepCloneObjects(sourceIds, modelSpaceId, mapping, false);
+
+                var clonedTopLevelIds = CollectDirectClonedIds(sourceIds, mapping);
+
+                foreach (var clonedId in clonedTopLevelIds)
+                {
+                    var cloned = tr.GetObject(clonedId, OpenMode.ForWrite, false) as Entity;
+                    if (cloned == null)
+                        continue;
+
+                    cloned.TransformBy(displacement);
+                    deepClonedCount++;
+                    copiedCount++;
+                }
+            }
+
+            foreach (var leaf in recreateLeaves)
+            {
+                var ent = CreateCadEntityFromSnapshotLeaf(leaf, outLayer, ed);
+                if (ent == null)
+                    continue;
+
+                ApplySnapshotVisualPropertiesFromSource(db, tr, ent, leaf, outLayer);
+                ent.TransformBy(displacement);
+                ms.AppendEntity(ent);
+                tr.AddNewlyCreatedDBObject(ent, true);
+
+                recreatedCount++;
+                copiedCount++;
+            }
+
+            foreach (var leaf in deepCloneLeaves)
+            {
+                var handle = (leaf.Handle ?? string.Empty).Trim();
+
+                if (string.IsNullOrWhiteSpace(handle) || resolvedHandleSet.Contains(handle))
+                    continue;
+
+                var ent = CreateCadEntityFromSnapshotLeaf(leaf, outLayer, ed);
+                if (ent == null)
+                    continue;
+
+                ApplySnapshotVisualPropertiesFromSource(db, tr, ent, leaf, outLayer);
+                ent.TransformBy(displacement);
+                ms.AppendEntity(ent);
+                tr.AddNewlyCreatedDBObject(ent, true);
+
+                recreatedCount++;
+                copiedCount++;
+            }
+
+            var workspaceView = BuildCopiedWorkspaceView(
+                work,
+                snapshotLeaves,
+                dx,
+                dy);
+
+            return new CopiedWorkspaceViewBuildResult
+            {
+                WorkspaceView = workspaceView,
+                SnapshotLeaves = snapshotLeaves,
+                CopiedCount = copiedCount,
+                DeepClonedCount = deepClonedCount,
+                RecreatedCount = recreatedCount
+            };
         }
 
         private static ViewContourInput BuildViewLocalContourInput(
@@ -1115,6 +1329,124 @@ namespace FluxCAD.BricsCAD.Plugin26
                     colorIndex: 3,
                     textHeight: Math.Max(5.0, Math.Min(result.ViewBounds.Width, result.ViewBounds.Height) * 0.03));
             }
+        }
+
+        private static void DrawOuterContourTraceDebug(
+    Database db,
+    Transaction tr,
+    BlockTableRecord ms,
+    string outLayerName,
+    int viewId,
+    Bounds2D viewBounds,
+    OuterContourExtractionResult result,
+    double labelYOffset)
+        {
+            if (result == null)
+                return;
+
+            // 1) view bounds
+            DrawBoundsPolyline(
+                db,
+                tr,
+                ms,
+                outLayerName,
+                Bounds2DHelper.Normalize(viewBounds),
+                colorIndex: 8,
+                closed: true);
+
+            DrawDebugText(
+                db,
+                tr,
+                outLayerName,
+                new Point2D(result.ViewBounds.Center.X, result.ViewBounds.MaxY + labelYOffset),
+                $"OuterContour View={viewId}, Input={result.InputMode}, Source={result.InputSourceTag}",
+                colorIndex: 8,
+                textHeight: Math.Max(10.0, Math.Min(result.ViewBounds.Width, result.ViewBounds.Height) * 0.05));
+
+            // 2) eligible entities bounds (optional lightweight overlay)
+            foreach (var e in result.EligibleEntities.Where(x => x != null && !x.Bounds.IsEmpty))
+            {
+                DrawBoundsPolyline(
+                    db,
+                    tr,
+                    ms,
+                    outLayerName,
+                    e.Bounds,
+                    colorIndex: 253,
+                    closed: true);
+            }
+
+            // 3) seed edge 강조
+            var edgeMap = result.Edges.ToDictionary(x => x.EdgeId, x => x);
+            foreach (var seed in result.Seeds)
+            {
+                if (!edgeMap.TryGetValue(seed.EdgeId, out var edge))
+                    continue;
+
+                DrawLineLikeDebug(
+                    db,
+                    tr,
+                    ms,
+                    outLayerName,
+                    edge.Start,
+                    edge.End,
+                    colorIndex: 30);
+            }
+
+            // 4) best loop 강조
+            if (result.BestLoop != null)
+            {
+                foreach (var edgeId in result.BestLoop.EdgeIds)
+                {
+                    if (!edgeMap.TryGetValue(edgeId, out var edge))
+                        continue;
+
+                    DrawLineLikeDebug(
+                        db,
+                        tr,
+                        ms,
+                        outLayerName,
+                        edge.Start,
+                        edge.End,
+                        colorIndex: 3);
+                }
+
+                DrawDebugText(
+                    db,
+                    tr,
+                    outLayerName,
+                    new Point2D(
+                        result.ViewBounds.Center.X,
+                        result.ViewBounds.MinY - labelYOffset * 0.6),
+                    $"BestLoop Edges={result.BestLoop.EdgeIds.Count}, " +
+                    $"Perimeter={result.BestLoop.Perimeter:0.##}, " +
+                    $"Area={result.BestLoop.EstimatedArea:0.##}, " +
+                    $"Score={result.BestLoop.OuterScore:0.##}",
+                    colorIndex: 3,
+                    textHeight: Math.Max(
+                        8.0,
+                        Math.Min(result.ViewBounds.Width, result.ViewBounds.Height) * 0.04));
+            }
+        }
+
+        private static void DrawLineLikeDebug(
+    Database db,
+    Transaction tr,
+    BlockTableRecord ms,
+    string layerName,
+    Point2D a,
+    Point2D b,
+    short colorIndex)
+        {
+            var line = new Line(
+                new Point3d(a.X, a.Y, 0.0),
+                new Point3d(b.X, b.Y, 0.0));
+
+            line.Layer = layerName;
+            line.ColorIndex = colorIndex;
+
+            ms.AppendEntity(line);
+            tr.AddNewlyCreatedDBObject(line, true);
         }
 
         private static void DrawContourEdgeOverlay(
@@ -1667,6 +1999,39 @@ namespace FluxCAD.BricsCAD.Plugin26
                                 ResolveCopiedViewColor(view),
                                 Math.Max(10.0, Math.Min(view.Bounds.Width, view.Bounds.Height) * 0.08));
 
+                            var copiedWorkspaceView = BuildCopiedWorkspaceView(
+                                work,
+                                snapshotLeaves,
+                                groupDx,
+                                groupDy);
+
+                            var contourResult = RunOuterContourOnCopiedView(copiedWorkspaceView);
+
+                            ed.WriteMessage("\n" + OuterContourDebugTextFormatter.Format(contourResult));
+
+                            DrawCopiedContourDebug(
+                                db,
+                                tr,
+                                ms,
+                                outLayer,
+                                copiedWorkspaceView,
+                                contourResult);
+
+                            ed.WriteMessage(
+                                $"\n[FluxCAD] CopiedOuterContour View={copiedWorkspaceView.ViewId}, " +
+                                $"SourceEntities={copiedWorkspaceView.SourceEntities.Count}, " +
+                                $"WorkspaceEntities={copiedWorkspaceView.WorkspaceEntities.Count}, " +
+                                $"SourceBounds={copiedWorkspaceView.SourceBounds}, " +
+                                $"WorkspaceBounds={copiedWorkspaceView.WorkspaceBounds}, " +
+                                $"Displacement=({copiedWorkspaceView.Displacement.X:0.##},{copiedWorkspaceView.Displacement.Y:0.##}), " +
+                                $"RawInput={contourResult.RawInputEntityCount}, " +
+                                $"Eligible={contourResult.EligibleEntities.Count}, " +
+                                $"Preferred={contourResult.PreferredEntities.Count}, " +
+                                $"Edges={contourResult.Edges.Count}, " +
+                                $"Seeds={contourResult.Seeds.Count}, " +
+                                $"Loops={contourResult.Loops.Count}, " +
+                                $"BestLoopEdges={(contourResult.BestLoop?.EdgeIds.Count ?? 0)}");
+
                             totalSourceCount += snapshotLeaves.Count;
                             totalCopiedCount += copiedCount;
 
@@ -1694,6 +2059,223 @@ namespace FluxCAD.BricsCAD.Plugin26
             }
         }
 
+        private static GeometryWorkspaceView BuildCopiedWorkspaceView(
+    CopyViewWorkItem work,
+    IReadOnlyList<SheetEntity> snapshotLeaves,
+    double dx,
+    double dy)
+        {
+            var sourceBounds = Bounds2DHelper.Normalize(work.SourceBounds);
+            var workspaceBounds = MoveBounds(sourceBounds, dx, dy);
+
+            var wsView = new GeometryWorkspaceView
+            {
+                ViewId = work.View.IslandId,
+                SourceIslandId = work.View.IslandId,
+                SourceBounds = sourceBounds,
+                WorkspaceBounds = workspaceBounds,
+                Displacement = new Point2D(dx, dy),
+                Label = BuildCopiedViewLabel(work.View)
+            };
+
+            foreach (var id in work.MemberIslandIds.Distinct().OrderBy(x => x))
+                wsView.MemberIslandIds.Add(id);
+
+            foreach (var leaf in snapshotLeaves.Where(x => x != null))
+            {
+                wsView.SourceEntities.Add(leaf);
+                wsView.WorkspaceEntities.Add(CreateMovedSheetEntity(leaf, dx, dy));
+
+                if (!string.IsNullOrWhiteSpace(leaf.Handle))
+                    wsView.SourceHandles.Add(leaf.Handle);
+            }
+
+            wsView.Diagnostics.Add($"CopiedWorkspace.SourceEntities={wsView.SourceEntities.Count}");
+            wsView.Diagnostics.Add($"CopiedWorkspace.WorkspaceEntities={wsView.WorkspaceEntities.Count}");
+            wsView.Diagnostics.Add($"CopiedWorkspace.Displacement=({dx:0.###},{dy:0.###})");
+
+            return wsView;
+        }
+
+        private static SheetEntity CreateMovedSheetEntity(
+    SheetEntity source,
+    double dx,
+    double dy)
+        {
+            if (source == null)
+                throw new ArgumentNullException(nameof(source));
+
+            return new SheetEntity
+            {
+                Handle = source.Handle,
+                Kind = source.Kind,
+
+                Layer = source.Layer,
+                BlockName = source.BlockName,
+
+                Bounds = MoveBounds(source.Bounds, dx, dy),
+                Anchor = MovePoint(source.Anchor, dx, dy),
+
+                Text = source.Text,
+                TextNormalized = source.TextNormalized,
+
+                RotationDeg = source.RotationDeg,
+                TextHeight = source.TextHeight,
+                ScaleX = source.ScaleX,
+                ScaleY = source.ScaleY,
+
+                EntityType = source.EntityType,
+                BlockPath = source.BlockPath,
+                Depth = source.Depth,
+                SourceKind = source.SourceKind,
+                Role = source.Role,
+
+                SnapshotKey = source.SnapshotKey,
+
+                OwnerStructureNodeId = source.OwnerStructureNodeId,
+                OwnerDirectChildCount = source.OwnerDirectChildCount,
+                OwnerDirectGeometryChildCount = source.OwnerDirectGeometryChildCount,
+                OwnerDirectTextChildCount = source.OwnerDirectTextChildCount,
+                OwnerDescendantLeafCount = source.OwnerDescendantLeafCount,
+
+                IsVisible = source.IsVisible,
+
+                StartPoint = source.StartPoint.HasValue ? MovePoint(source.StartPoint.Value, dx, dy) : null,
+                EndPoint = source.EndPoint.HasValue ? MovePoint(source.EndPoint.Value, dx, dy) : null,
+
+                Vertices = source.Vertices != null
+                    ? source.Vertices.Select(p => MovePoint(p, dx, dy)).ToList()
+                    : Array.Empty<Point2D>(),
+
+                IsClosed = source.IsClosed,
+
+                CenterPoint = source.CenterPoint.HasValue ? MovePoint(source.CenterPoint.Value, dx, dy) : null,
+                Center = source.Center.HasValue ? MovePoint(source.Center.Value, dx, dy) : null,
+
+                Radius = source.Radius,
+                StartAngleDeg2D = source.StartAngleDeg2D,
+                EndAngleDeg2D = source.EndAngleDeg2D,
+
+                MajorRadius = source.MajorRadius,
+                MinorRadius = source.MinorRadius,
+
+                StartAngleDeg = source.StartAngleDeg,
+                EndAngleDeg = source.EndAngleDeg,
+
+                EllipseRotationDeg2D = source.EllipseRotationDeg2D,
+
+                StrokeSemantic = source.StrokeSemantic,
+
+                LinetypeName = source.LinetypeName,
+                EffectiveLinetypeName = source.EffectiveLinetypeName,
+                IsByLayerLinetype = source.IsByLayerLinetype,
+                IsByBlockLinetype = source.IsByBlockLinetype,
+
+                LayerNormalized = source.LayerNormalized,
+
+                IsCenterLine = source.IsCenterLine,
+                IsHiddenLine = source.IsHiddenLine,
+
+                IsTitleLikeLayer = source.IsTitleLikeLayer,
+                IsTableLikeLayer = source.IsTableLikeLayer,
+                IsOuterContourLikeLayer = source.IsOuterContourLikeLayer,
+
+                IsLikelySemanticNoise = source.IsLikelySemanticNoise,
+
+                ColorIndex = source.ColorIndex,
+                ColorName = source.ColorName,
+                LineWeightValue = source.LineWeightValue,
+
+                IsFadedLike = source.IsFadedLike,
+                IsVisualHintCandidate = source.IsVisualHintCandidate,
+                ContainsOrEnclosesHatchLike = source.ContainsOrEnclosesHatchLike,
+
+                VisualHintScore = source.VisualHintScore,
+                GeometryConfidenceScore = source.GeometryConfidenceScore,
+
+                RoleReason = source.RoleReason,
+
+                TransparencyAlpha = source.TransparencyAlpha,
+                LineWeight = source.LineWeight
+            };
+        }
+
+        private static OuterContourExtractionResult RunOuterContourOnCopiedView(
+    GeometryWorkspaceView workspaceView)
+        {
+            var extractor = new OuterContourExtractor();
+
+            return extractor.Extract(
+                workspaceView,
+                CreateDefaultOuterContourExtractionOptions());
+        }
+
+        private static OuterContourExtractionOptions CreateDefaultOuterContourExtractionOptions()
+        {
+            return new OuterContourExtractionOptions
+            {
+                EndpointToleranceMin = 2.0,
+                EndpointToleranceRatio = 0.02,
+                OuterBandRatio = 0.10,
+                OuterBandMin = 6.0,
+                MinEdgeLengthRatio = 0.003,
+                MinLoopPerimeterRatio = 0.12,
+                MinLoopAreaRatio = 0.005,
+                RequireContinuousLikeStyle = true,
+                PreferOuterContourLikeLayer = true,
+                ExcludeVisualHintCandidates = false,
+                AllowReferenceGeometry = true,
+                AllowVisualHintFallback = false,
+                UseStyleMajorityFilter = true,
+                FallbackToAllEligibleIfNoLoop = true,
+                PreferredStyleScoreRatio = 0.55,
+                MinPreferredStyleEntityCount = 2,
+                MaxTraceDepth = 256,
+                MaxOutgoingLinksPerEdge = 8
+            };
+        }
+
+
+        private static void DrawCopiedContourDebug(
+    Database db,
+    Transaction tr,
+    BlockTableRecord ms,
+    string outLayerName,
+    GeometryWorkspaceView workspaceView,
+    OuterContourExtractionResult result)
+        {
+            if (workspaceView == null || result == null)
+                return;
+
+            var labelOffset = Math.Max(result.ViewBounds.Height * 0.06, 15.0);
+
+            DrawOuterContourTraceDebug(
+                db,
+                tr,
+                ms,
+                outLayerName,
+                workspaceView.ViewId,
+                workspaceView.WorkspaceBounds,
+                result,
+                labelOffset);
+        }
+
+        private static Bounds2D MoveBounds(Bounds2D bounds, double dx, double dy)
+        {
+            if (bounds.IsEmpty)
+                return bounds;
+
+            return new Bounds2D(
+                bounds.MinX + dx,
+                bounds.MinY + dy,
+                bounds.MaxX + dx,
+                bounds.MaxY + dy);
+        }
+
+        private static Point2D MovePoint(Point2D p, double dx, double dy)
+        {
+            return new Point2D(p.X + dx, p.Y + dy);
+        }
 
         private static List<SheetEntity> CollectSnapshotLeafGeometryForCopy(
     IReadOnlyList<SheetEntity> semanticEntities,

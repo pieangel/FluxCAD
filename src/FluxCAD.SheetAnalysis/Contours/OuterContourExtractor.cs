@@ -8,6 +8,8 @@ namespace FluxCAD.SheetAnalysis.Contours
 {
     public sealed class OuterContourExtractor
     {
+        private readonly OuterContourInputBuilder _inputBuilder = new();
+
         public OuterContourExtractionResult ExtractFromViewLocalEntities(
     ViewContourInput input,
     OuterContourExtractionOptions? options = null)
@@ -25,34 +27,8 @@ namespace FluxCAD.SheetAnalysis.Contours
                 ViewBounds = Bounds2DHelper.Normalize(input.Bounds)
             };
 
-//             var prepared = PrepareViewLocalEntities(
-//                 input.Entities ?? Array.Empty<SheetEntity>(),
-//                 result.ViewBounds,
-//                 options,
-//                 result);
-// 
-//             RunCore(result, prepared, options);
-            return result;
-        }
-
-        public OuterContourExtractionResult Extract(
-    GeometryWorkspaceView workspaceView,
-    OuterContourExtractionOptions? options = null)
-        {
-            ArgumentNullException.ThrowIfNull(workspaceView);
-            options ??= new OuterContourExtractionOptions();
-
-            var result = new OuterContourExtractionResult
-            {
-                InputViewId = workspaceView.ViewId,
-                InputMode = "WorkspaceView",
-                InputSourceTag = "GeometryWorkspace",
-                RawInputEntityCount = workspaceView.WorkspaceEntities.Count,
-                ViewBounds = Bounds2DHelper.Normalize(workspaceView.WorkspaceBounds)
-            };
-
             var prepared = PrepareWorkspaceEntities(
-                workspaceView.WorkspaceEntities,
+                input.Entities ?? Array.Empty<SheetEntity>(),
                 result.ViewBounds,
                 options,
                 result);
@@ -61,31 +37,53 @@ namespace FluxCAD.SheetAnalysis.Contours
             return result;
         }
 
-        public OuterContourExtractionResult Extract_old(
-    IReadOnlyList<SheetEntity> semanticEntities,
-    Bounds2D viewBounds,
-    OuterContourExtractionOptions? options = null)
+        public OuterContourExtractionResult Extract(
+            GeometryWorkspaceView workspaceView,
+            OuterContourExtractionOptions? options = null)
         {
-            ArgumentNullException.ThrowIfNull(semanticEntities);
-
+            ArgumentNullException.ThrowIfNull(workspaceView);
             options ??= new OuterContourExtractionOptions();
+
+            var input = _inputBuilder.Build(workspaceView, options);
 
             var result = new OuterContourExtractionResult
             {
-                InputViewId = -1,
-                InputMode = "LegacyGlobal",
-                InputSourceTag = "GlobalSemanticPool",
-                RawInputEntityCount = semanticEntities.Count,
-                ViewBounds = Bounds2DHelper.Normalize(viewBounds)
+                InputViewId = input.ViewId,
+                InputMode = "WorkspaceView",
+                InputSourceTag = input.SourceTag,
+                RawInputEntityCount = input.Entities?.Count ?? 0,
+                ViewBounds = Bounds2DHelper.Normalize(input.Bounds)
             };
 
-            var eligible = CollectEligibleEntitiesFromGlobal(
-                semanticEntities,
+            var prepared = PrepareWorkspaceEntities(
+                input.Entities ?? Array.Empty<SheetEntity>(),
                 result.ViewBounds,
-                options);
+                options,
+                result);
 
-            RunCore(result, eligible, options);
+            RunCore(result, prepared, options);
             return result;
+        }
+
+
+        public IReadOnlyList<OuterContourExtractionResult> ExtractAll(
+    GeometryWorkspace workspace,
+    OuterContourExtractionOptions? options = null)
+        {
+            ArgumentNullException.ThrowIfNull(workspace);
+            options ??= new OuterContourExtractionOptions();
+
+            var results = new List<OuterContourExtractionResult>();
+
+            foreach (var view in workspace.Views
+                .Where(v => v != null)
+                .OrderBy(v => v.ViewId))
+            {
+                var one = Extract(view, options);
+                results.Add(one);
+            }
+
+            return results;
         }
 
         private void RunCore(
