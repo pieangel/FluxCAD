@@ -827,6 +827,119 @@ namespace FluxCAD.BricsCAD.Plugin26
             }
         }
 
+        private enum EdgeSide
+        {
+            Top,
+            Bottom,
+            Left,
+            Right
+        }
+
+        private enum DirectionalEdgeEntityRole
+        {
+            Unknown = 0,
+
+            OuterMostBoundary,      // 해당 방향에서 가장 먼저 만나는 최외곽
+            ConnectedBoundary,      // 최외곽과 연결된 같은 경계
+            ProtrusionBoundary,     // 튀어나온 돌출부
+            RecessBoundary,         // 들어간 오목부
+            NearFeature,            // 구멍, 슬롯 등 근처 feature
+            ReferenceHint,          // 두께/숨은선/중심선 등 참고 정보
+            DisconnectedNoise       // 연결되지 않은 노이즈
+        }
+
+        private enum DirectionalEdgeComplexity
+        {
+            Unknown = 0,
+            StraightLike,
+            Stepped,
+            Curved,
+            Protruded,
+            Recessed,
+            Complex
+        }
+
+        private sealed class DirectionalEdgeEntityHit
+        {
+            public SheetEntity Entity { get; init; } = null!;
+
+            public DirectionalEdgeEntityRole Role { get; set; } =
+                DirectionalEdgeEntityRole.Unknown;
+
+            public double SideCoordinate { get; set; }
+
+            public double DistanceFromOuter { get; set; }
+
+            public bool TouchesAccessBand { get; set; }
+
+            public bool IsConnectedToSeed { get; set; }
+
+            public bool IsLikelyProtrusionPart { get; set; }
+
+            public string Reason { get; set; } = string.Empty;
+        }
+
+        private sealed class DirectionalEdgeProfile
+        {
+            public int ViewIslandId { get; init; }
+
+            public EdgeSide Side { get; init; }
+
+            public Bounds2D ViewBounds { get; init; } = Bounds2D.Empty;
+
+            public Bounds2D AccessBand { get; init; } = Bounds2D.Empty;
+
+            public double OuterCoordinate { get; set; }
+
+            public DirectionalEdgeComplexity Complexity { get; set; } =
+                DirectionalEdgeComplexity.Unknown;
+
+            public List<DirectionalEdgeEntityHit> Hits { get; } = new();
+
+            public List<SheetEntity> OuterMostEntities { get; } = new();
+
+            public List<SheetEntity> ConnectedBoundaryEntities { get; } = new();
+
+            public List<SheetEntity> ProtrusionEntities { get; } = new();
+
+            public List<SheetEntity> RecessEntities { get; } = new();
+
+            public List<SheetEntity> NearFeatureEntities { get; } = new();
+
+            public List<SheetEntity> ReferenceHintEntities { get; } = new();
+
+            public List<SheetEntity> DisconnectedEntities { get; } = new();
+
+            public bool HasProtrusion => ProtrusionEntities.Count > 0;
+
+            public bool HasRecess => RecessEntities.Count > 0;
+
+            public string Reason { get; set; } = string.Empty;
+        }
+
+        private sealed class ViewDirectionalEdgeProfileSet
+        {
+            public int ViewIslandId { get; init; }
+
+            public Bounds2D ViewBounds { get; init; } = Bounds2D.Empty;
+
+            public List<DirectionalEdgeProfile> Profiles { get; } = new();
+
+            public DirectionalEdgeProfile? Top =>
+                Profiles.FirstOrDefault(x => x.Side == EdgeSide.Top);
+
+            public DirectionalEdgeProfile? Bottom =>
+                Profiles.FirstOrDefault(x => x.Side == EdgeSide.Bottom);
+
+            public DirectionalEdgeProfile? Left =>
+                Profiles.FirstOrDefault(x => x.Side == EdgeSide.Left);
+
+            public DirectionalEdgeProfile? Right =>
+                Profiles.FirstOrDefault(x => x.Side == EdgeSide.Right);
+        }
+
+
+
 
         [CommandMethod("FLUX_COPY_VISIBLE_OUTLINE_WORKSPACE_V2")]
         public static void CopyVisibleOutlineWorkspaceV2()
@@ -884,6 +997,172 @@ namespace FluxCAD.BricsCAD.Plugin26
                 tr.Commit();
             }
         }
+
+
+        private static ViewDirectionalEdgeProfileSet BuildDirectionalEdgeProfiles(
+    int viewIslandId,
+    Bounds2D viewBounds,
+    IReadOnlyList<SheetEntity> visibleEntities)
+        {
+            var result = new ViewDirectionalEdgeProfileSet
+            {
+                ViewIslandId = viewIslandId,
+                ViewBounds = viewBounds
+            };
+
+            result.Profiles.Add(BuildDirectionalEdgeProfile(
+                viewIslandId, viewBounds, visibleEntities, EdgeSide.Top));
+
+            result.Profiles.Add(BuildDirectionalEdgeProfile(
+                viewIslandId, viewBounds, visibleEntities, EdgeSide.Bottom));
+
+            result.Profiles.Add(BuildDirectionalEdgeProfile(
+                viewIslandId, viewBounds, visibleEntities, EdgeSide.Left));
+
+            result.Profiles.Add(BuildDirectionalEdgeProfile(
+                viewIslandId, viewBounds, visibleEntities, EdgeSide.Right));
+
+            return result;
+        }
+
+        private static DirectionalEdgeProfile BuildDirectionalEdgeProfile(
+    int viewIslandId,
+    Bounds2D viewBounds,
+    IReadOnlyList<SheetEntity> visibleEntities,
+    EdgeSide side)
+        {
+            double band = ComputeDirectionalAccessBandSize(viewBounds);
+            Bounds2D accessBand = BuildAccessBand(viewBounds, side, band);
+
+            var profile = new DirectionalEdgeProfile
+            {
+                ViewIslandId = viewIslandId,
+                Side = side,
+                ViewBounds = viewBounds,
+                AccessBand = accessBand,
+                OuterCoordinate = GetOuterCoordinate(viewBounds, side)
+            };
+
+            foreach (var e in visibleEntities)
+            {
+                if (e == null || e.Bounds.IsEmpty)
+                    continue;
+
+                if (!Bounds2DHelper.Intersects(e.Bounds, accessBand, tolerance: 0.0))
+                    continue;
+
+                double sideCoord = GetEntitySideCoordinate(e.Bounds, side);
+                double dist = Math.Abs(profile.OuterCoordinate - sideCoord);
+
+                var hit = new DirectionalEdgeEntityHit
+                {
+                    Entity = e,
+                    SideCoordinate = sideCoord,
+                    DistanceFromOuter = dist,
+                    TouchesAccessBand = true,
+                    Role = DirectionalEdgeEntityRole.Unknown,
+                    Reason = "Touches directional access band"
+                };
+
+                profile.Hits.Add(hit);
+            }
+
+            if (profile.Hits.Count == 0)
+            {
+                profile.Reason = "No entity touches access band";
+                return profile;
+            }
+
+            double minDist = profile.Hits.Min(x => x.DistanceFromOuter);
+            double tol = Math.Max(1.0, Math.Min(viewBounds.Width, viewBounds.Height) * 0.01);
+
+            foreach (var hit in profile.Hits)
+            {
+                if (hit.DistanceFromOuter <= minDist + tol)
+                {
+                    hit.Role = DirectionalEdgeEntityRole.OuterMostBoundary;
+                    hit.Reason = "Closest entity from this side";
+                    profile.OuterMostEntities.Add(hit.Entity);
+                }
+                else
+                {
+                    hit.Role = DirectionalEdgeEntityRole.NearFeature;
+                    hit.Reason = "Near side, but not outer-most";
+                    profile.NearFeatureEntities.Add(hit.Entity);
+                }
+            }
+
+            profile.ConnectedBoundaryEntities.AddRange(profile.OuterMostEntities);
+
+            profile.Complexity =
+                profile.OuterMostEntities.Count <= 2
+                    ? DirectionalEdgeComplexity.StraightLike
+                    : DirectionalEdgeComplexity.Complex;
+
+            profile.Reason =
+                $"Side={side}, Hits={profile.Hits.Count}, OuterMost={profile.OuterMostEntities.Count}";
+
+            return profile;
+        }
+
+        private static double ComputeDirectionalAccessBandSize(Bounds2D bounds)
+        {
+            if (bounds.IsEmpty)
+                return 1.0;
+
+            double shortSide = Math.Min(bounds.Width, bounds.Height);
+
+            return Math.Max(3.0, shortSide * 0.08);
+        }
+
+        private static Bounds2D BuildAccessBand(
+            Bounds2D bounds,
+            EdgeSide side,
+            double band)
+        {
+            return side switch
+            {
+                EdgeSide.Top =>
+                    new Bounds2D(bounds.MinX, bounds.MaxY - band, bounds.MaxX, bounds.MaxY),
+
+                EdgeSide.Bottom =>
+                    new Bounds2D(bounds.MinX, bounds.MinY, bounds.MaxX, bounds.MinY + band),
+
+                EdgeSide.Left =>
+                    new Bounds2D(bounds.MinX, bounds.MinY, bounds.MinX + band, bounds.MaxY),
+
+                EdgeSide.Right =>
+                    new Bounds2D(bounds.MaxX - band, bounds.MinY, bounds.MaxX, bounds.MaxY),
+
+                _ => bounds
+            };
+        }
+
+        private static double GetOuterCoordinate(Bounds2D bounds, EdgeSide side)
+        {
+            return side switch
+            {
+                EdgeSide.Top => bounds.MaxY,
+                EdgeSide.Bottom => bounds.MinY,
+                EdgeSide.Left => bounds.MinX,
+                EdgeSide.Right => bounds.MaxX,
+                _ => 0.0
+            };
+        }
+
+        private static double GetEntitySideCoordinate(Bounds2D bounds, EdgeSide side)
+        {
+            return side switch
+            {
+                EdgeSide.Top => bounds.MaxY,
+                EdgeSide.Bottom => bounds.MinY,
+                EdgeSide.Left => bounds.MinX,
+                EdgeSide.Right => bounds.MaxX,
+                _ => 0.0
+            };
+        }
+
+
 
 
         private static List<ObjectId> CollectFluxViewCopyEntities(
