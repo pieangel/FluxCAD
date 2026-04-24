@@ -1131,6 +1131,668 @@ namespace FluxCAD.BricsCAD.Plugin26
         }
 
 
+        [CommandMethod("FLUX_COPY_TOPLEVEL_GEOMETRY_VIEWS_OUTSIDE_SNAPSHOT_V2")]
+        public void FluxCopyTopLevelGeometryViewsOutsideSnapshotV2()
+        {
+            var doc = Bricscad.ApplicationServices.Application.DocumentManager.MdiActiveDocument;
+            if (doc == null)
+                return;
+
+            var db = doc.Database;
+            var ed = doc.Editor;
+
+            try
+            {
+                var sheetFilePath = db.Filename;
+                if (string.IsNullOrWhiteSpace(sheetFilePath))
+                {
+                    ed.WriteMessage("\n[FluxCAD] 저장된 DWG 파일이 아닙니다.");
+                    return;
+                }
+
+                var candidates = BuildResolvedViewCandidates(sheetFilePath, ed);
+                if (candidates == null || candidates.Count == 0)
+                {
+                    ed.WriteMessage("\n[FluxCAD] view candidate가 비어 있습니다.");
+                    return;
+                }
+
+                var topLevelGeometryViews = candidates
+                    .Where(x => x != null)
+                    .Where(x => x.FinalRole == ViewIslandSemanticRole.GeometryView)
+                    .Where(x => x.IsTopLevelView)
+                    .Where(x => !x.IsSparseBridgeLike)
+                    .ToList();
+
+                if (topLevelGeometryViews.Count == 0)
+                {
+                    ed.WriteMessage("\n[FluxCAD] 복사할 TopLevel GeometryView가 없습니다.");
+                    return;
+                }
+
+                IEntitySnapshotBuilder snapshotBuilder = new SimpleSheetFileSnapshotBuilder();
+                var fullEntities = snapshotBuilder.Build(sheetFilePath);
+
+                if (fullEntities == null || fullEntities.Count == 0)
+                {
+                    ed.WriteMessage("\n[FluxCAD] snapshot이 비어 있습니다.");
+                    return;
+                }
+
+                var pipeline = BuildSemanticIslandPipeline(
+                    fullEntities,
+                    ed,
+                    closeSingleCellGaps: false,
+                    targetCellSize: 12.0,
+                    excludeSparseBridgeFromGroups: false);
+
+                if (pipeline == null || pipeline.SemanticResults == null || pipeline.SemanticResults.Count == 0)
+                {
+                    ed.WriteMessage("\n[FluxCAD] semantic pipeline 결과가 비어 있습니다.");
+                    return;
+                }
+
+                var rebuiltSemanticResults = RebuildSemanticResultsWithReassignedRoles(
+                    pipeline.SemanticResults,
+                    fullEntities,
+                    ed);
+
+                var islandMap = rebuiltSemanticResults
+                    .Where(x => x != null && x.Island != null)
+                    .ToDictionary(x => x.Island.Id, x => x.Island);
+
+                var sheetBounds = Bounds2DHelper.FromEntities(fullEntities);
+                var semanticPool = BuildSemanticEvidencePool(fullEntities, sheetBounds, ed);
+
+                ed.WriteMessage(
+                    $"\n[POOLFACE] Face={semanticPool.Count(x => x.Kind == SheetEntityKind.Face)}");
+
+                ed.WriteMessage(
+                    $"\n[SEMANTIC-POOL-SUMMARY] Total={semanticPool.Count}, " +
+                    $"Face={semanticPool.Count(x => x.Kind == SheetEntityKind.Face)}, " +
+                    $"Line={semanticPool.Count(x => x.Kind == SheetEntityKind.Line)}, " +
+                    $"Arc={semanticPool.Count(x => x.Kind == SheetEntityKind.Arc)}, " +
+                    $"Circle={semanticPool.Count(x => x.Kind == SheetEntityKind.Circle)}, " +
+                    $"Polyline={semanticPool.Count(x => x.Kind == SheetEntityKind.Polyline)}, " +
+                    $"Ellipse={semanticPool.Count(x => x.Kind == SheetEntityKind.Ellipse)}");
+
+                int semanticPoolFaceCount = semanticPool.Count(x => x != null && x.Kind == SheetEntityKind.Face);
+
+                ed.WriteMessage(
+                    $"\n[SEMANTIC-POOL-FACE-COUNT] Total={semanticPoolFaceCount}, PoolCount={semanticPool.Count}");
+
+                foreach (var face in semanticPool.Where(x => x != null && x.Kind == SheetEntityKind.Face))
+                {
+                    ed.WriteMessage(
+                        $"\n[SEMANTIC-POOL-FACE] H={face.Handle}, Role={face.Role}, " +
+                        $"Visible={face.IsVisible}, GeometryLike={face.IsGeometryLike}, " +
+                        $"Bounds={face.Bounds}, Reason={face.RoleReason}");
+                }
+
+                Bounds2D modelBounds;
+                using (doc.LockDocument())
+                using (var tr = db.TransactionManager.StartTransaction())
+                {
+                    var msId = SymbolUtilityServices.GetBlockModelSpaceId(db);
+                    var ms = (BlockTableRecord)tr.GetObject(msId, OpenMode.ForRead);
+                    modelBounds = GetModelSpaceBounds(ms, tr);
+                    tr.Commit();
+                }
+
+                if (modelBounds.IsEmpty)
+                {
+                    ed.WriteMessage("\n[FluxCAD] model bounds가 비어 있습니다.");
+                    return;
+                }
+
+                var groupGap = Math.Max(modelBounds.Width * 0.12, 220.0);
+                var workItems = new List<CopyViewWorkItem>();
+
+                foreach (var view in topLevelGeometryViews)
+                {
+                    if (!islandMap.TryGetValue(view.IslandId, out var island))
+                    {
+                        ed.WriteMessage($"\n[FluxCAD] Island={view.IslandId} semantic island를 찾지 못했습니다.");
+                        continue;
+                    }
+
+                    var dynamicTolerance = Math.Max(
+                        3.0,
+                        Math.Min(island.Bounds.Width, island.Bounds.Height) * 0.5);
+
+                    var semanticEntities = CollectIslandSemanticEntitiesFromPool(
+                        semanticPool,
+                        island,
+                        tolerance: dynamicTolerance,
+                        ed: ed);
+
+                    int semanticFaceCount = semanticEntities.Count(x => x != null && x.Kind == SheetEntityKind.Face);
+
+                    ed.WriteMessage(
+                        $"\n[SEMANTIC-FACE-COUNT] I:{view.IslandId}, Count={semanticFaceCount}, Total={semanticEntities.Count}");
+
+                    foreach (var face in semanticEntities.Where(x => x != null && x.Kind == SheetEntityKind.Face))
+                    {
+                        ed.WriteMessage(
+                            $"\n[SEMANTIC-FACE] I:{view.IslandId}, H={face.Handle}, Role={face.Role}, " +
+                            $"Visible={face.IsVisible}, GeometryLike={face.IsGeometryLike}, " +
+                            $"Bounds={face.Bounds}, Reason={face.RoleReason}");
+                    }
+
+                    var filteredSemanticEntities = new List<SheetEntity>();
+
+                    foreach (var candidate in semanticEntities)
+                    {
+                        if (candidate == null)
+                            continue;
+
+                        ed.WriteMessage(
+                            $"\n[SNAPSHOT-COPY-INPUT] H={candidate.Handle}, Role={candidate.Role}, " +
+                            $"ContainsHatch={candidate.ContainsOrEnclosesHatchLike}, " +
+                            $"HintScore={candidate.VisualHintScore}, Noise={candidate.IsLikelySemanticNoise}, " +
+                            $"Reason={candidate.RoleReason}");
+
+                        if (!candidate.IsVisible)
+                        {
+                            ed.WriteMessage($"\n[SNAPSHOT-COPY-REJECT] H={candidate.Handle}, Why=NotVisible");
+                            continue;
+                        }
+
+                        if (!candidate.IsGeometryLike)
+                        {
+                            ed.WriteMessage($"\n[SNAPSHOT-COPY-REJECT] H={candidate.Handle}, Why=NotGeometryLike");
+                            continue;
+                        }
+
+                        if (candidate.IsTextLike || candidate.IsDimensionLike)
+                        {
+                            ed.WriteMessage($"\n[SNAPSHOT-COPY-REJECT] H={candidate.Handle}, Why=TextOrDimension");
+                            continue;
+                        }
+
+                        if (candidate.IsLikelySemanticNoise)
+                        {
+                            ed.WriteMessage($"\n[SNAPSHOT-COPY-REJECT] H={candidate.Handle}, Why=SemanticNoise");
+                            continue;
+                        }
+
+                        if (candidate.IsTableLikeLayer)
+                        {
+                            ed.WriteMessage($"\n[SNAPSHOT-COPY-REJECT] H={candidate.Handle}, Why=TableLikeLayer");
+                            continue;
+                        }
+
+                        if (candidate.IsTitleLikeLayer)
+                        {
+                            ed.WriteMessage($"\n[SNAPSHOT-COPY-REJECT] H={candidate.Handle}, Why=TitleLikeLayer");
+                            continue;
+                        }
+
+                        if (IsSemanticFrameLikeEntity(candidate, sheetBounds))
+                        {
+                            ed.WriteMessage($"\n[SNAPSHOT-COPY-REJECT] H={candidate.Handle}, Why=SemanticFrameLike");
+                            continue;
+                        }
+
+                        ed.WriteMessage($"\n[SNAPSHOT-COPY-KEEP] H={candidate.Handle}");
+                        filteredSemanticEntities.Add(candidate);
+                    }
+
+                    ed.WriteMessage(
+                        $"\n[FluxCAD] SnapshotCopySemanticFilter I:{view.IslandId}, " +
+                        $"Before={semanticEntities.Count}, BeforeFace={semanticEntities.Count(x => x.Kind == SheetEntityKind.Face)}, " +
+                        $"After={filteredSemanticEntities.Count}, AfterFace={filteredSemanticEntities.Count(x => x.Kind == SheetEntityKind.Face)}, " +
+                        $"HiddenOrCenter={filteredSemanticEntities.Count(x => IsHiddenOrCenterEntity(x))}, " +
+                        $"Line={filteredSemanticEntities.Count(x => x.Kind == SheetEntityKind.Line)}, " +
+                        $"Arc={filteredSemanticEntities.Count(x => x.Kind == SheetEntityKind.Arc)}, " +
+                        $"Circle={filteredSemanticEntities.Count(x => x.Kind == SheetEntityKind.Circle)}, " +
+                        $"Polyline={filteredSemanticEntities.Count(x => x.Kind == SheetEntityKind.Polyline)}, " +
+                        $"Ellipse={filteredSemanticEntities.Count(x => x.Kind == SheetEntityKind.Ellipse)}");
+
+                    if (filteredSemanticEntities.Count == 0)
+                    {
+                        ed.WriteMessage($"\n[FluxCAD] Island={view.IslandId} 복사할 snapshot semantic entity가 없습니다.");
+                        continue;
+                    }
+
+                    workItems.Add(new CopyViewWorkItem
+                    {
+                        View = view,
+                        Island = island,
+                        SemanticEntities = filteredSemanticEntities,
+                        SourceBounds = view.Bounds,
+                        MemberViews = new List<ViewCandidate> { view },
+                        MemberIslandIds = new List<int> { view.IslandId }
+                    });
+                }
+
+                if (workItems.Count == 0)
+                {
+                    ed.WriteMessage("\n[FluxCAD] 최종 복사 가능한 snapshot work item이 없습니다.");
+                    return;
+                }
+
+                var mergedWorkItems = MergeStripLikeCopyWorkItems(workItems, ed);
+                if (mergedWorkItems != null && mergedWorkItems.Count > 0)
+                    workItems = mergedWorkItems;
+
+                var groupBounds = UnionBounds(workItems.Select(x => x.SourceBounds));
+                if (groupBounds.IsEmpty)
+                {
+                    ed.WriteMessage("\n[FluxCAD] groupBounds가 비어 있습니다.");
+                    return;
+                }
+
+                var placementBounds = !pipeline.RobustBounds.IsEmpty
+                    ? pipeline.RobustBounds
+                    : modelBounds;
+
+                // 중요: groupGap을 더 이상 modelBounds/AllBounds 기반으로 만들지 말 것
+                groupGap = Math.Max(200.0, placementBounds.Width * 0.15);
+
+                var groupDx = placementBounds.MaxX - groupBounds.MinX + groupGap;
+                var groupDy = 0.0;
+
+                ed.WriteMessage(
+                    $"\n[FluxCAD] SnapshotCopyGroupBounds={groupBounds}, " +
+                    $"PlacementBounds={placementBounds}, " +
+                    $"GroupOffset=({groupDx:0.##},{groupDy:0.##})");
+
+                int totalSourceCount = 0;
+                int totalCopiedCount = 0;
+
+                using (doc.LockDocument())
+                {
+                    foreach (var work in workItems.OrderByDescending(x => x.View.IsRepresentativePrimaryView)
+                                                  .ThenByDescending(x => x.View.IsPrimaryView)
+                                                  .ThenBy(x => x.View.IslandId))
+                    {
+                        var view = work.View;
+                        if (view == null)
+                            continue;
+
+                        using (var tr = db.TransactionManager.StartTransaction())
+                        {
+                            var msId = SymbolUtilityServices.GetBlockModelSpaceId(db);
+                            var ms = (BlockTableRecord)tr.GetObject(msId, OpenMode.ForWrite);
+                            var rootOutLayer = EnsureCopyOutputLayer(db, tr);
+                            var islandOutLayer = EnsureCopyOutputIslandLayer(
+                                db,
+                                tr,
+                                work.View.IslandId);
+
+                            var snapshotLeaves = CollectSnapshotLeafGeometryForCopy(
+                                work.SemanticEntities,
+                                work.SourceBounds,
+                                sheetBounds,
+                                ed,
+                                work.View.IslandId);
+                            int copiedCount = 0;
+                            int deepClonedCount = 0;
+                            int recreatedCount = 0;
+                            var displacement = Matrix3d.Displacement(new Vector3d(groupDx, groupDy, 0.0));
+
+                            var deepCloneLeaves = snapshotLeaves
+                                .Where(x => x != null && CanDeepCloneSnapshotLeafAsWorldEntity(x))
+                                .ToList();
+
+                            var recreateLeaves = snapshotLeaves
+                                .Where(x => x == null || !CanDeepCloneSnapshotLeafAsWorldEntity(x))
+                                .ToList();
+
+                            var sourceHandles = deepCloneLeaves
+                                .Select(x => x?.Handle)
+                                .Where(x => !string.IsNullOrWhiteSpace(x))
+                                .Cast<string>()
+                                .Distinct(StringComparer.OrdinalIgnoreCase)
+                                .ToList();
+
+                            var sourceIds = ResolveObjectIdsFromDirectHandles(db, tr, sourceHandles);
+                            var resolvedHandleSet = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                            foreach (ObjectId sourceId in sourceIds)
+                            {
+                                if (!sourceId.IsValid || sourceId.IsErased)
+                                    continue;
+
+                                try
+                                {
+                                    var obj = tr.GetObject(sourceId, OpenMode.ForRead, false) as DBObject;
+                                    if (obj == null)
+                                        continue;
+
+                                    resolvedHandleSet.Add(obj.Handle.ToString());
+                                }
+                                catch
+                                {
+                                }
+                            }
+
+                            if (sourceIds.Count > 0)
+                            {
+                                var mapping = new IdMapping();
+                                db.DeepCloneObjects(sourceIds, msId, mapping, false);
+
+                                var clonedTopLevelIds = CollectDirectClonedIds(sourceIds, mapping);
+                                foreach (var clonedId in clonedTopLevelIds)
+                                {
+                                    var cloned = tr.GetObject(clonedId, OpenMode.ForWrite, false) as Entity;
+                                    if (cloned == null)
+                                        continue;
+
+                                    // 반드시 Layer 변경 전에 호출
+                                    ApplyEffectiveVisualPropertiesBeforeLayerMove(db, tr, cloned);
+
+                                    cloned.Layer = islandOutLayer;
+                                    cloned.TransformBy(displacement);
+
+                                    deepClonedCount++;
+                                    copiedCount++;
+                                }
+                            }
+
+                            foreach (var leaf in recreateLeaves)
+                            {
+                                var ent = CreateCadEntityFromSnapshotLeaf(leaf, islandOutLayer, ed);
+                                if (ent == null)
+                                    continue;
+
+                                ApplySnapshotVisualPropertiesFromSource(db, tr, ent, leaf, islandOutLayer);
+                                ent.Layer = islandOutLayer;
+                                ent.TransformBy(displacement);
+                                ms.AppendEntity(ent);
+                                tr.AddNewlyCreatedDBObject(ent, true);
+
+                                ed.WriteMessage(
+                                    $"\n[COPY-MAP-V2] I:{work.View.IslandId}, " +
+                                    $"SrcH={leaf?.Handle}, CopyH={ent.Handle}, " +
+                                    $"SrcLayer={leaf?.Layer}, CopyLayer={ent.Layer}, " +
+                                    $"Kind={leaf?.Kind}, Role={leaf?.Role}");
+
+                                recreatedCount++;
+                                copiedCount++;
+                            }
+
+                            foreach (var leaf in deepCloneLeaves)
+                            {
+                                var handle = (leaf.Handle ?? string.Empty).Trim();
+                                if (string.IsNullOrWhiteSpace(handle) || resolvedHandleSet.Contains(handle))
+                                    continue;
+
+                                var ent = CreateCadEntityFromSnapshotLeaf(leaf, islandOutLayer, ed);
+                                if (ent == null)
+                                    continue;
+
+                                ApplySnapshotVisualPropertiesFromSource(db, tr, ent, leaf, islandOutLayer);
+                                ent.Layer = islandOutLayer;
+                                ent.TransformBy(displacement);
+                                ms.AppendEntity(ent);
+                                tr.AddNewlyCreatedDBObject(ent, true);
+
+                                ed.WriteMessage(
+                                    $"\n[COPY-MAP-V2] I:{work.View.IslandId}, " +
+                                    $"SrcH={leaf?.Handle}, CopyH={ent.Handle}, " +
+                                    $"SrcLayer={leaf?.Layer}, CopyLayer={ent.Layer}, " +
+                                    $"Kind={leaf?.Kind}, Role={leaf?.Role}");
+
+                                recreatedCount++;
+                                copiedCount++;
+                            }
+
+                            var labelPos = new Point2D(
+                                work.SourceBounds.Center.X + groupDx,
+                                work.SourceBounds.MaxY + groupDy + Math.Max(work.SourceBounds.Height * 0.08, 20.0));
+
+                            DrawDebugText(
+                                db,
+                                tr,
+                                rootOutLayer,
+                                labelPos,
+                                BuildCopiedViewLabel(view),
+                                ResolveCopiedViewColor(view),
+                                Math.Max(10.0, Math.Min(view.Bounds.Width, view.Bounds.Height) * 0.08));
+
+                            totalSourceCount += snapshotLeaves.Count;
+                            totalCopiedCount += copiedCount;
+
+                            tr.Commit();
+
+                            ed.WriteMessage(
+                                $"\n[FluxCAD] SnapshotCopied View Island={view.IslandId}, " +
+                                $"Members=[{string.Join(",", work.MemberIslandIds)}], " +
+                                $"SnapshotLeaves={snapshotLeaves.Count}, Copied={copiedCount}, " +
+                                $"DeepCloned={deepClonedCount}, Recreated={recreatedCount}, " +
+                                $"SourceBounds={work.SourceBounds}, " +
+                                $"GroupOffset=({groupDx:0.##},{groupDy:0.##})");
+                        }
+                    }
+                }
+
+                ed.WriteMessage(
+                    $"\n[FluxCAD] Snapshot Geometry Views copied outside. Views={workItems.Count}, " +
+                    $"TotalSource={totalSourceCount}, TotalCopied={totalCopiedCount}, " +
+                    $"GroupOffset=({groupDx:0.##},{groupDy:0.##})");
+            }
+            catch (System.Exception ex)
+            {
+                ed.WriteMessage($"\n[FluxCAD] FLUX_COPY_TOPLEVEL_GEOMETRY_VIEWS_OUTSIDE_SNAPSHOT_V2 failed: {ex}");
+            }
+        }
+
+
+
+        private static void ApplyEffectiveVisualPropertiesBeforeLayerMove(
+    Database db,
+    Transaction tr,
+    Entity ent)
+        {
+            if (ent == null)
+                return;
+
+            LayerTableRecord? sourceLayer = null;
+
+            try
+            {
+                var lt = (LayerTable)tr.GetObject(db.LayerTableId, OpenMode.ForRead);
+
+                if (!string.IsNullOrWhiteSpace(ent.Layer) && lt.Has(ent.Layer))
+                {
+                    var layerId = lt[ent.Layer];
+                    sourceLayer = (LayerTableRecord)tr.GetObject(layerId, OpenMode.ForRead);
+                }
+            }
+            catch
+            {
+            }
+
+            try
+            {
+                if (ent.Color == null || ent.Color.IsByLayer)
+                {
+                    if (sourceLayer != null)
+                        ent.Color = sourceLayer.Color;
+                }
+            }
+            catch
+            {
+            }
+
+            try
+            {
+                if (ent.LineWeight == LineWeight.ByLayer)
+                {
+                    if (sourceLayer != null)
+                        ent.LineWeight = sourceLayer.LineWeight;
+                }
+            }
+            catch
+            {
+            }
+
+            try
+            {
+                if (ent.LinetypeId.IsNull ||
+                    string.Equals(ent.Linetype, "ByLayer", StringComparison.OrdinalIgnoreCase))
+                {
+                    if (sourceLayer != null && !sourceLayer.LinetypeObjectId.IsNull)
+                        ent.LinetypeId = sourceLayer.LinetypeObjectId;
+                }
+            }
+            catch
+            {
+            }
+
+            try
+            {
+                ent.LinetypeScale = ent.LinetypeScale;
+            }
+            catch
+            {
+            }
+        }
+
+
+
+        private static void PreserveExplicitVisualPropertiesForLayerMove(Entity ent)
+        {
+            if (ent == null)
+                return;
+
+            try
+            {
+                if (ent.Color == null || ent.Color.IsByLayer)
+                    ent.Color = Teigha.Colors.Color.FromColorIndex(
+                        Teigha.Colors.ColorMethod.ByAci,
+                        7);
+            }
+            catch
+            {
+            }
+
+            try
+            {
+                if (string.IsNullOrWhiteSpace(ent.Linetype) ||
+                    ent.Linetype.Equals("ByLayer", StringComparison.OrdinalIgnoreCase))
+                {
+                    ent.Linetype = "Continuous";
+                }
+            }
+            catch
+            {
+            }
+
+            try
+            {
+                if (ent.LineWeight == LineWeight.ByLayer)
+                    ent.LineWeight = LineWeight.LineWeight000;
+            }
+            catch
+            {
+            }
+        }
+
+        private static void PreserveVisualPropertiesBeforeLayerChange(
+    Entity source,
+    Entity target)
+        {
+            if (source == null || target == null)
+                return;
+
+            try
+            {
+                target.Color = source.Color;
+            }
+            catch
+            {
+            }
+
+            try
+            {
+                target.Linetype = source.Linetype;
+            }
+            catch
+            {
+            }
+
+            try
+            {
+                target.LineWeight = source.LineWeight;
+            }
+            catch
+            {
+            }
+
+            try
+            {
+                target.LinetypeScale = source.LinetypeScale;
+            }
+            catch
+            {
+            }
+
+            try
+            {
+                target.Transparency = source.Transparency;
+            }
+            catch
+            {
+            }
+        }
+
+
+        private static string EnsureCopyOutputIslandLayer(
+    Database db,
+    Transaction tr,
+    int islandId)
+        {
+            const string parentLayerName = "FLUX_VIEW_COPY_OUT";
+            string islandLayerName = $"{parentLayerName}_I{islandId:000}";
+
+            var lt = (LayerTable)tr.GetObject(db.LayerTableId, OpenMode.ForRead);
+
+            if (!lt.Has(parentLayerName))
+            {
+                lt.UpgradeOpen();
+
+                var parent = new LayerTableRecord
+                {
+                    Name = parentLayerName,
+                    Color = Teigha.Colors.Color.FromColorIndex(
+                        Teigha.Colors.ColorMethod.ByAci,
+                        2)
+                };
+
+                lt.Add(parent);
+                tr.AddNewlyCreatedDBObject(parent, true);
+            }
+
+            if (!lt.Has(islandLayerName))
+            {
+                if (!lt.IsWriteEnabled)
+                    lt.UpgradeOpen();
+
+                var child = new LayerTableRecord
+                {
+                    Name = islandLayerName,
+                    Color = Teigha.Colors.Color.FromColorIndex(
+                        Teigha.Colors.ColorMethod.ByAci,
+                        ResolveIslandLayerColorIndex(islandId))
+                };
+
+                lt.Add(child);
+                tr.AddNewlyCreatedDBObject(child, true);
+            }
+
+            return islandLayerName;
+        }
+
+        private static short ResolveIslandLayerColorIndex(int islandId)
+        {
+            short[] colors = { 1, 3, 4, 5, 6, 30, 92, 140, 200 };
+            var idx = Math.Abs(islandId) % colors.Length;
+            return colors[idx];
+        }
+
+
         [CommandMethod("FLUX_DEBUG_OUTER_CONTOUR_TRACE")]
         public void FluxDebugOuterContourTrace()
         {
