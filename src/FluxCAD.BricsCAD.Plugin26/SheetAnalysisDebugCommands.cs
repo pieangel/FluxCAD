@@ -1172,7 +1172,16 @@ namespace FluxCAD.BricsCAD.Plugin26
                     return;
                 }
 
-                var displacement = Matrix3d.Displacement(new Vector3d(3000, 0, 0));
+                if (!TryGetSheetBoundsFromOriginalEntities(tr, ms, out var sheetBounds))
+                {
+                    ed.WriteMessage("\n[VISIBLE-OUTLINE] Failed to calculate original sheet bounds.");
+                    return;
+                }
+
+                double margin = Math.Max(50.0, sheetBounds.Width * 0.08);
+                double dx = sheetBounds.Width + margin;
+
+                var displacement = Matrix3d.Displacement(new Vector3d(dx, 0, 0));
 
                 int kept = 0;
                 int removed = 0;
@@ -1219,10 +1228,68 @@ namespace FluxCAD.BricsCAD.Plugin26
                     kept++;
                 }
 
-                ed.WriteMessage($"\n[VISIBLE-OUTLINE] Kept={kept}, Removed={removed}");
+                ed.WriteMessage(
+                    $"\n[VISIBLE-OUTLINE] Kept={kept}, Removed={removed}, " +
+                    $"Dx={dx:0.###}, SheetWidth={sheetBounds.Width:0.###}");
 
                 tr.Commit();
             }
+        }
+
+        private static bool TryGetSheetBoundsFromOriginalEntities(
+    Transaction tr,
+    BlockTableRecord ms,
+    out Bounds2D sheetBounds)
+        {
+            sheetBounds = Bounds2D.Empty;
+
+            if (tr == null || ms == null)
+                return false;
+
+            bool hasAny = false;
+
+            double minX = double.MaxValue;
+            double minY = double.MaxValue;
+            double maxX = double.MinValue;
+            double maxY = double.MinValue;
+
+            foreach (ObjectId id in ms)
+            {
+                if (!id.IsValid || id.IsErased)
+                    continue;
+
+                var ent = tr.GetObject(id, OpenMode.ForRead, false) as Entity;
+                if (ent == null)
+                    continue;
+
+                // 이미 생성된 FLUX 작업 레이어는 제외
+                if (IsFluxWorkspaceLayer(ent.Layer))
+                    continue;
+
+                if (!TryGetEntityBoundsSafe(ent, out var b) || b.IsEmpty)
+                    continue;
+
+                minX = Math.Min(minX, b.MinX);
+                minY = Math.Min(minY, b.MinY);
+                maxX = Math.Max(maxX, b.MaxX);
+                maxY = Math.Max(maxY, b.MaxY);
+
+                hasAny = true;
+            }
+
+            if (!hasAny)
+                return false;
+
+            sheetBounds = new Bounds2D(minX, minY, maxX, maxY);
+            return !sheetBounds.IsEmpty;
+        }
+
+        private static bool IsFluxWorkspaceLayer(string? layerName)
+        {
+            if (string.IsNullOrWhiteSpace(layerName))
+                return false;
+
+            return layerName.StartsWith("FLUX_", StringComparison.OrdinalIgnoreCase);
         }
 
         private static string EnsureVisibleOutlineWorkspaceIslandLayer(
@@ -2015,8 +2082,8 @@ namespace FluxCAD.BricsCAD.Plugin26
             if (IsHiddenLine(ent))
                 return false;
 
-            if (!IsContinuousLike(ent))
-                return false;
+            //if (!IsContinuousLike(ent))
+            //    return false;
 
             return true;
         }
@@ -2716,8 +2783,8 @@ namespace FluxCAD.BricsCAD.Plugin26
                                 if (ent == null)
                                     continue;
 
-                                ApplySnapshotVisualPropertiesFromSource(db, tr, ent, leaf, islandOutLayer);
-                                ent.Layer = islandOutLayer;
+                                ApplySnapshotVisualPropertiesForIslandLayerMove(db, tr, ent, leaf, islandOutLayer);
+                                //ent.Layer = islandOutLayer;
                                 ent.TransformBy(displacement);
                                 ms.AppendEntity(ent);
                                 tr.AddNewlyCreatedDBObject(ent, true);
@@ -2742,8 +2809,8 @@ namespace FluxCAD.BricsCAD.Plugin26
                                 if (ent == null)
                                     continue;
 
-                                ApplySnapshotVisualPropertiesFromSource(db, tr, ent, leaf, islandOutLayer);
-                                ent.Layer = islandOutLayer;
+                                ApplySnapshotVisualPropertiesForIslandLayerMove(db, tr, ent, leaf, islandOutLayer);
+                                // ent.Layer = islandOutLayer;
                                 ent.TransformBy(displacement);
                                 ms.AppendEntity(ent);
                                 tr.AddNewlyCreatedDBObject(ent, true);
@@ -2795,6 +2862,173 @@ namespace FluxCAD.BricsCAD.Plugin26
             catch (System.Exception ex)
             {
                 ed.WriteMessage($"\n[FluxCAD] FLUX_COPY_TOPLEVEL_GEOMETRY_VIEWS_OUTSIDE_SNAPSHOT_V2 failed: {ex}");
+            }
+        }
+
+        private static void ApplySnapshotVisualPropertiesForIslandLayerMove(
+    Database db,
+    Transaction tr,
+    Entity target,
+    SheetEntity source,
+    string islandOutLayer)
+        {
+            if (target == null || source == null)
+                return;
+
+            Entity? original = null;
+
+            try
+            {
+                var handleText = (source.Handle ?? string.Empty).Trim();
+
+                if (!string.IsNullOrWhiteSpace(handleText) &&
+                    TryGetObjectIdFromHandle(db, handleText, out var sourceId) &&
+                    sourceId.IsValid &&
+                    !sourceId.IsErased)
+                {
+                    original = tr.GetObject(sourceId, OpenMode.ForRead, false) as Entity;
+                }
+            }
+            catch
+            {
+                original = null;
+            }
+
+            if (original != null)
+            {
+                CopyEntityVisualProperties(original, target, islandOutLayer);
+                ApplyEffectiveVisualPropertiesBeforeLayerMove(db, tr, target);
+            }
+            else
+            {
+                ApplySnapshotFallbackVisualProperties(db, tr, target, source);
+            }
+
+            if (!string.IsNullOrWhiteSpace(islandOutLayer))
+                target.Layer = islandOutLayer;
+        }
+
+
+        private static void ApplySnapshotFallbackVisualProperties(
+    Database db,
+    Transaction tr,
+    Entity target,
+    SheetEntity source)
+        {
+            if (target == null || source == null)
+                return;
+
+            try
+            {
+                if (source.ColorIndex.HasValue &&
+                    source.ColorIndex.Value > 0 &&
+                    source.ColorIndex.Value < 256)
+                {
+                    target.Color = Teigha.Colors.Color.FromColorIndex(
+                        Teigha.Colors.ColorMethod.ByAci,
+                        (short)source.ColorIndex.Value);
+                }
+                else
+                {
+                    target.Color = Teigha.Colors.Color.FromColorIndex(
+                        Teigha.Colors.ColorMethod.ByAci,
+                        7);
+                }
+            }
+            catch
+            {
+            }
+
+            try
+            {
+                var ltName =
+                    !string.IsNullOrWhiteSpace(source.EffectiveLinetypeName)
+                        ? source.EffectiveLinetypeName
+                        : source.LinetypeName;
+
+                if (string.IsNullOrWhiteSpace(ltName) ||
+                    ltName.Equals("ByLayer", StringComparison.OrdinalIgnoreCase))
+                {
+                    ltName = GuessLinetypeFromSemanticSource(source);
+                }
+
+                EnsureLinetypeLoadedIfPossible(db, tr, ltName);
+
+                if (!string.IsNullOrWhiteSpace(ltName))
+                    target.Linetype = ltName;
+            }
+            catch
+            {
+            }
+
+            try
+            {
+                if (source.LineWeightValue.HasValue)
+                    target.LineWeight = (LineWeight)source.LineWeightValue.Value;
+                else
+                    target.LineWeight = LineWeight.LineWeight000;
+            }
+            catch
+            {
+            }
+        }
+
+        private static string GuessLinetypeFromSemanticSource(SheetEntity source)
+        {
+            if (source == null)
+                return "Continuous";
+
+            var layer = (source.Layer ?? string.Empty).ToUpperInvariant();
+
+            if (source.IsCenterLine || layer.Contains("CL") || layer.Contains("CENTER"))
+                return "CENTER";
+
+            if (source.IsHiddenLine || layer.Contains("HL") || layer.Contains("HIDDEN"))
+                return "HIDDEN";
+
+            return "Continuous";
+        }
+
+        private static void EnsureLinetypeLoadedIfPossible(
+    Database db,
+    Transaction tr,
+    string? linetypeName)
+        {
+            if (db == null || tr == null)
+                return;
+
+            if (string.IsNullOrWhiteSpace(linetypeName))
+                return;
+
+            if (linetypeName.Equals("ByLayer", StringComparison.OrdinalIgnoreCase) ||
+                linetypeName.Equals("ByBlock", StringComparison.OrdinalIgnoreCase))
+                return;
+
+            try
+            {
+                var lt = (LinetypeTable)tr.GetObject(db.LinetypeTableId, OpenMode.ForRead);
+
+                if (lt.Has(linetypeName))
+                    return;
+            }
+            catch
+            {
+                return;
+            }
+
+            try
+            {
+                db.LoadLineTypeFile(linetypeName, "acad.lin");
+            }
+            catch
+            {
+                try
+                {
+                    db.LoadLineTypeFile(linetypeName, "default.lin");
+                }
+                catch
+                {
+                }
             }
         }
 
