@@ -940,6 +940,217 @@ namespace FluxCAD.BricsCAD.Plugin26
 
 
 
+        [CommandMethod("FLUX_DEBUG_DIRECTIONAL_EDGE_PROFILES")]
+        public static void FluxDebugDirectionalEdgeProfiles()
+        {
+            var doc = Bricscad.ApplicationServices.Application.DocumentManager.MdiActiveDocument;
+            var db = doc.Database;
+            var ed = doc.Editor;
+
+            using (doc.LockDocument())
+            using (var tr = db.TransactionManager.StartTransaction())
+            {
+                var msId = SymbolUtilityServices.GetBlockModelSpaceId(db);
+                var ms = (BlockTableRecord)tr.GetObject(msId, OpenMode.ForWrite);
+
+                var groups = CollectVisibleOutlineWorkspaceSheetEntities(tr, ms);
+
+                if (groups.Count == 0)
+                {
+                    ed.WriteMessage("\n[DIR-EDGE] No visible outline workspace entities found.");
+                    return;
+                }
+
+                foreach (var pair in groups.OrderBy(x => x.Key))
+                {
+                    int islandId = pair.Key;
+                    var visibleEntities = pair.Value;
+
+                    var viewBounds = Bounds2DHelper.FromEntities(visibleEntities);
+
+                    var edgeSet = BuildDirectionalEdgeProfiles(
+                        islandId,
+                        viewBounds,
+                        visibleEntities);
+
+                    DrawDirectionalEdgeProfilesDebug(
+                        db,
+                        tr,
+                        ms,
+                        ed,
+                        edgeSet);
+                }
+
+                ed.WriteMessage($"\n[DIR-EDGE] Done. IslandCount={groups.Count}");
+
+                tr.Commit();
+            }
+        }
+
+
+        private static Dictionary<int, List<SheetEntity>> CollectVisibleOutlineWorkspaceSheetEntities(
+    Transaction tr,
+    BlockTableRecord ms)
+        {
+            var result = new Dictionary<int, List<SheetEntity>>();
+
+            foreach (ObjectId id in ms)
+            {
+                var ent = tr.GetObject(id, OpenMode.ForRead, false) as Entity;
+                if (ent == null)
+                    continue;
+
+                if (string.IsNullOrWhiteSpace(ent.Layer))
+                    continue;
+
+                if (!ent.Layer.StartsWith("FLUX_VISIBLE_OUTLINE_WORK_I"))
+                    continue;
+
+                if (!TryBuildDirectionalSheetEntity(ent, out var sheetEntity))
+                    continue;
+
+                int islandId = ExtractIslandIdFromLayer(ent.Layer);
+
+                if (!result.TryGetValue(islandId, out var list))
+                {
+                    list = new List<SheetEntity>();
+                    result[islandId] = list;
+                }
+
+                list.Add(sheetEntity);
+            }
+
+            return result;
+        }
+
+        private static bool TryBuildDirectionalSheetEntity(
+    Entity ent,
+    out SheetEntity sheetEntity)
+        {
+            sheetEntity = null!;
+
+            if (ent == null)
+                return false;
+
+            if (!TryGetEntityBoundsSafe(ent, out var bounds) || bounds.IsEmpty)
+                return false;
+
+            var e = new SheetEntity
+            {
+                Handle = ent.Handle.ToString(),
+                Layer = ent.Layer,
+                Bounds = bounds,
+                Anchor = bounds.Center,
+                EntityType = ent.GetType().Name,
+                Kind = ResolveDirectionalEntityKind(ent),
+                IsVisible = true,
+                LinetypeName = ent.Linetype,
+                EffectiveLinetypeName = ent.Linetype,
+                IsCenterLine = IsCenterLine(ent),
+                IsHiddenLine = IsHiddenLine(ent)
+            };
+
+            FillDirectionalGeometryInfo(ent, e);
+
+            sheetEntity = e;
+            return true;
+        }
+
+        private static SheetEntityKind ResolveDirectionalEntityKind(Entity ent)
+        {
+            return ent switch
+            {
+                BlockReference => SheetEntityKind.BlockReference,
+                AttributeReference => SheetEntityKind.InsertAttribute,
+                DBText => SheetEntityKind.Text,
+                MText => SheetEntityKind.MText,
+                Dimension => SheetEntityKind.Dimension,
+                Leader => SheetEntityKind.Leader,
+
+                Line => SheetEntityKind.Line,
+                Teigha.DatabaseServices.Polyline => SheetEntityKind.Polyline,
+                Arc => SheetEntityKind.Arc,
+                Circle => SheetEntityKind.Circle,
+                Ellipse => SheetEntityKind.Ellipse,
+                Hatch => SheetEntityKind.Hatch,
+                Solid => SheetEntityKind.Solid,
+                Face => SheetEntityKind.Face,
+                DBPoint => SheetEntityKind.Point,
+                Spline => SheetEntityKind.Spline,
+                Region => SheetEntityKind.Region,
+
+                _ => SheetEntityKind.Unknown
+            };
+        }
+
+        private static void FillDirectionalGeometryInfo(
+    Entity ent,
+    SheetEntity e)
+        {
+            if (ent is Line line)
+            {
+                e.StartPoint = new Point2D(line.StartPoint.X, line.StartPoint.Y);
+                e.EndPoint = new Point2D(line.EndPoint.X, line.EndPoint.Y);
+                return;
+            }
+
+            if (ent is Arc arc)
+            {
+                e.StartPoint = new Point2D(arc.StartPoint.X, arc.StartPoint.Y);
+                e.EndPoint = new Point2D(arc.EndPoint.X, arc.EndPoint.Y);
+                e.CenterPoint = new Point2D(arc.Center.X, arc.Center.Y);
+                e.Radius = arc.Radius;
+                e.StartAngleDeg = arc.StartAngle * 180.0 / Math.PI;
+                e.EndAngleDeg = arc.EndAngle * 180.0 / Math.PI;
+                return;
+            }
+
+            if (ent is Circle circle)
+            {
+                e.CenterPoint = new Point2D(circle.Center.X, circle.Center.Y);
+                e.Radius = circle.Radius;
+                return;
+            }
+
+            if (ent is Teigha.DatabaseServices.Polyline pl)
+            {
+                var pts = new List<Point2D>();
+
+                for (int i = 0; i < pl.NumberOfVertices; i++)
+                {
+                    var p = pl.GetPoint2dAt(i);
+                    pts.Add(new Point2D(p.X, p.Y));
+                }
+
+                e.Vertices = pts;
+                e.IsClosed = pl.Closed;
+
+                if (pts.Count > 0)
+                    e.StartPoint = pts[0];
+
+                if (pts.Count > 1)
+                    e.EndPoint = pts[^1];
+
+                return;
+            }
+
+            if (ent is Ellipse ellipse)
+            {
+                e.CenterPoint = new Point2D(ellipse.Center.X, ellipse.Center.Y);
+
+                try
+                {
+                    e.StartPoint = new Point2D(ellipse.StartPoint.X, ellipse.StartPoint.Y);
+                    e.EndPoint = new Point2D(ellipse.EndPoint.X, ellipse.EndPoint.Y);
+                }
+                catch
+                {
+                    // 일부 ellipse는 start/end 접근이 실패할 수 있으므로 bounds 기반 연결만 사용
+                }
+            }
+        }
+
+
 
         [CommandMethod("FLUX_COPY_VISIBLE_OUTLINE_WORKSPACE_V2")]
         public static void CopyVisibleOutlineWorkspaceV2()
@@ -986,6 +1197,22 @@ namespace FluxCAD.BricsCAD.Plugin26
 
                     ApplyEffectiveVisualPropertiesBeforeLayerMove(db, tr, clone);
 
+                    // 핵심 추가: 원본 FLUX_VIEW_COPY 계열 layer에서 island id 추출
+                    int islandId = ExtractIslandIdFromLayer(ent.Layer);
+
+                    if (islandId < 0)
+                    {
+                        ed.WriteMessage($"\n[VISIBLE-OUTLINE] Skip: cannot extract island id. Layer={ent.Layer}");
+                        removed++;
+                        continue;
+                    }
+
+                    // 핵심 추가: visible workspace 전용 island layer 생성
+                    string targetLayer = EnsureVisibleOutlineWorkspaceIslandLayer(db, tr, islandId);
+
+                    // 핵심 추가: clone을 visible workspace island layer로 이동
+                    clone.Layer = targetLayer;
+
                     ms.AppendEntity(clone);
                     tr.AddNewlyCreatedDBObject(clone, true);
 
@@ -996,6 +1223,51 @@ namespace FluxCAD.BricsCAD.Plugin26
 
                 tr.Commit();
             }
+        }
+
+        private static string EnsureVisibleOutlineWorkspaceIslandLayer(
+    Database db,
+    Transaction tr,
+    int islandId)
+        {
+            string name = $"FLUX_VISIBLE_OUTLINE_WORK_I{islandId:000}";
+
+            var lt = (LayerTable)tr.GetObject(db.LayerTableId, OpenMode.ForRead);
+
+            if (!lt.Has(name))
+            {
+                lt.UpgradeOpen();
+
+                var ltr = new LayerTableRecord
+                {
+                    Name = name,
+                    Color = Color.FromColorIndex(ColorMethod.ByAci, 4)
+                };
+
+                lt.Add(ltr);
+                tr.AddNewlyCreatedDBObject(ltr, true);
+            }
+
+            return name;
+        }
+
+        private static int ExtractIslandIdFromLayer_New(string layerName)
+        {
+            if (string.IsNullOrWhiteSpace(layerName))
+                return 0;
+
+            var match = System.Text.RegularExpressions.Regex.Match(
+                layerName,
+                @"I(?<id>\d+)",
+                System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+
+            if (!match.Success)
+                return 0;
+
+            if (int.TryParse(match.Groups["id"].Value, out int id))
+                return id;
+
+            return 0;
         }
 
 
@@ -1187,6 +1459,234 @@ namespace FluxCAD.BricsCAD.Plugin26
                 $"Disconnected={profile.DisconnectedEntities.Count}, " +
                 $"Protrusion={profile.ProtrusionEntities.Count}";
         }
+
+        private static short ResolveDirectionalEdgeDebugColor(
+    EdgeSide side,
+    DirectionalEdgeEntityRole role)
+        {
+            if (role == DirectionalEdgeEntityRole.ProtrusionBoundary)
+                return 1; // red
+
+            if (role == DirectionalEdgeEntityRole.DisconnectedNoise)
+                return 8; // gray
+
+            if (role == DirectionalEdgeEntityRole.OuterMostBoundary)
+            {
+                return side switch
+                {
+                    EdgeSide.Top => 3,      // green
+                    EdgeSide.Bottom => 5,   // blue
+                    EdgeSide.Left => 2,     // yellow
+                    EdgeSide.Right => 6,    // magenta
+                    _ => 7
+                };
+            }
+
+            if (role == DirectionalEdgeEntityRole.ConnectedBoundary)
+                return 4; // cyan
+
+            if (role == DirectionalEdgeEntityRole.NearFeature)
+                return 30; // orange-like
+
+            return 7;
+        }
+
+        private static void LogDirectionalEdgeProfile(
+            Bricscad.EditorInput.Editor ed,
+            DirectionalEdgeProfile profile)
+        {
+            if (ed == null || profile == null)
+                return;
+
+            ed.WriteMessage(
+                $"\n[DIR-EDGE] View={profile.ViewIslandId}, Side={profile.Side}, " +
+                $"Hits={profile.Hits.Count}, OuterMost={profile.OuterMostEntities.Count}, " +
+                $"Connected={profile.ConnectedBoundaryEntities.Count}, " +
+                $"Protrusion={profile.ProtrusionEntities.Count}, " +
+                $"NearFeature={profile.NearFeatureEntities.Count}, " +
+                $"Disconnected={profile.DisconnectedEntities.Count}, " +
+                $"Complexity={profile.Complexity}");
+
+            foreach (var hit in profile.Hits
+                .OrderBy(x => x.DistanceFromOuter)
+                .ThenBy(x => x.Entity.Handle)
+                .Take(80))
+            {
+                var e = hit.Entity;
+
+                ed.WriteMessage(
+                    $"\n  - H={e.Handle}, Kind={e.Kind}, Role={hit.Role}, " +
+                    $"Dist={hit.DistanceFromOuter:F3}, " +
+                    $"Bounds=({e.Bounds.MinX:F1},{e.Bounds.MinY:F1})-({e.Bounds.MaxX:F1},{e.Bounds.MaxY:F1}), " +
+                    $"Reason={hit.Reason}");
+            }
+        }
+
+
+        private static void DrawDirectionalAccessBandDebug(
+    Database db,
+    Transaction tr,
+    BlockTableRecord ms,
+    DirectionalEdgeProfile profile,
+    string layerName)
+        {
+            if (profile == null || profile.AccessBand.IsEmpty)
+                return;
+
+            short color = profile.Side switch
+            {
+                EdgeSide.Top => 3,
+                EdgeSide.Bottom => 5,
+                EdgeSide.Left => 2,
+                EdgeSide.Right => 6,
+                _ => 7
+            };
+
+            ObjectId layerId = EnsureLayer(db, tr, layerName, color);
+
+            var b = profile.AccessBand;
+
+            var pl = new Teigha.DatabaseServices.Polyline();
+            pl.SetDatabaseDefaults();
+            pl.LayerId = layerId;
+            pl.ColorIndex = color;
+            pl.AddVertexAt(0, new Teigha.Geometry.Point2d(b.MinX, b.MinY), 0, 0, 0);
+            pl.AddVertexAt(1, new Teigha.Geometry.Point2d(b.MaxX, b.MinY), 0, 0, 0);
+            pl.AddVertexAt(2, new Teigha.Geometry.Point2d(b.MaxX, b.MaxY), 0, 0, 0);
+            pl.AddVertexAt(3, new Teigha.Geometry.Point2d(b.MinX, b.MaxY), 0, 0, 0);
+            pl.Closed = true;
+
+            ms.AppendEntity(pl);
+            tr.AddNewlyCreatedDBObject(pl, true);
+        }
+
+
+        private static ObjectId EnsureLayer(
+    Database db,
+    Transaction tr,
+    string layerName,
+    short colorIndex)
+        {
+            var lt = (LayerTable)tr.GetObject(db.LayerTableId, OpenMode.ForRead);
+
+            if (lt.Has(layerName))
+            {
+                var existingId = lt[layerName];
+
+                var existing = (LayerTableRecord)tr.GetObject(existingId, OpenMode.ForWrite);
+                existing.Color = Teigha.Colors.Color.FromColorIndex(
+                    Teigha.Colors.ColorMethod.ByAci,
+                    colorIndex);
+
+                return existingId;
+            }
+
+            lt.UpgradeOpen();
+
+            var layer = new LayerTableRecord
+            {
+                Name = layerName,
+                Color = Teigha.Colors.Color.FromColorIndex(
+                    Teigha.Colors.ColorMethod.ByAci,
+                    colorIndex)
+            };
+
+            var id = lt.Add(layer);
+            tr.AddNewlyCreatedDBObject(layer, true);
+
+            return id;
+        }
+
+
+        private static void DrawDirectionalEdgeHitBoundsDebug(
+    Database db,
+    Transaction tr,
+    BlockTableRecord ms,
+    DirectionalEdgeProfile profile,
+    string layerName)
+        {
+            if (profile == null)
+                return;
+
+            foreach (var hit in profile.Hits)
+            {
+                var e = hit.Entity;
+                if (e == null || e.Bounds.IsEmpty)
+                    continue;
+
+                short color = ResolveDirectionalEdgeDebugColor(profile.Side, hit.Role);
+                ObjectId layerId = EnsureLayer(db, tr, layerName, color);
+
+                DrawBoundsPolyline(
+                    tr,
+                    ms,
+                    e.Bounds,
+                    layerId,
+                    color);
+            }
+        }
+
+        private static void DrawBoundsPolyline(
+    Transaction tr,
+    BlockTableRecord ms,
+    Bounds2D b,
+    ObjectId layerId,
+    short colorIndex)
+        {
+            if (b.IsEmpty)
+                return;
+
+            var pl = new Teigha.DatabaseServices.Polyline();
+            pl.SetDatabaseDefaults();
+            pl.LayerId = layerId;
+            pl.ColorIndex = colorIndex;
+
+            pl.AddVertexAt(0, new Teigha.Geometry.Point2d(b.MinX, b.MinY), 0, 0, 0);
+            pl.AddVertexAt(1, new Teigha.Geometry.Point2d(b.MaxX, b.MinY), 0, 0, 0);
+            pl.AddVertexAt(2, new Teigha.Geometry.Point2d(b.MaxX, b.MaxY), 0, 0, 0);
+            pl.AddVertexAt(3, new Teigha.Geometry.Point2d(b.MinX, b.MaxY), 0, 0, 0);
+            pl.Closed = true;
+
+            ms.AppendEntity(pl);
+            tr.AddNewlyCreatedDBObject(pl, true);
+        }
+
+        private static void DrawDirectionalEdgeProfilesDebug(
+    Database db,
+    Transaction tr,
+    BlockTableRecord ms,
+    Bricscad.EditorInput.Editor ed,
+    ViewDirectionalEdgeProfileSet set)
+        {
+            if (set == null)
+                return;
+
+            const string bandLayer = "FLUX_DIR_EDGE_ACCESS_BAND";
+            const string hitLayer = "FLUX_DIR_EDGE_HITS";
+
+            foreach (var profile in set.Profiles)
+            {
+                LogDirectionalEdgeProfile(ed, profile);
+
+                DrawDirectionalAccessBandDebug(
+                    db,
+                    tr,
+                    ms,
+                    profile,
+                    bandLayer);
+
+                DrawDirectionalEdgeHitBoundsDebug(
+                    db,
+                    tr,
+                    ms,
+                    profile,
+                    hitLayer);
+            }
+        }
+
+
+
+
 
         private static void ExpandConnectedBoundaryFromOuterSeeds_old(
     DirectionalEdgeProfile profile,
