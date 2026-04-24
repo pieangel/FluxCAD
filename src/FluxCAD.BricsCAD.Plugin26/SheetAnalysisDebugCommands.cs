@@ -828,6 +828,135 @@ namespace FluxCAD.BricsCAD.Plugin26
         }
 
 
+        [CommandMethod("FLUX_COPY_VISIBLE_OUTLINE_WORKSPACE_V2")]
+        public static void CopyVisibleOutlineWorkspaceV2()
+        {
+            var doc = Bricscad.ApplicationServices.Application.DocumentManager.MdiActiveDocument;
+            var db = doc.Database;
+            var ed = doc.Editor;
+
+            using (var tr = db.TransactionManager.StartTransaction())
+            {
+                var msId = SymbolUtilityServices.GetBlockModelSpaceId(db);
+                var ms = (BlockTableRecord)tr.GetObject(msId, OpenMode.ForWrite);
+
+                var sourceIds = CollectFluxViewCopyEntities(tr, ms);
+
+                if (sourceIds.Count == 0)
+                {
+                    ed.WriteMessage("\n[VISIBLE-OUTLINE] No source entities found.");
+                    return;
+                }
+
+                var displacement = Matrix3d.Displacement(new Vector3d(3000, 0, 0));
+
+                int kept = 0;
+                int removed = 0;
+
+                foreach (ObjectId id in sourceIds)
+                {
+                    var ent = tr.GetObject(id, OpenMode.ForRead) as Entity;
+                    if (ent == null)
+                        continue;
+
+                    if (!IsVisibleOutlineCandidate(ent))
+                    {
+                        removed++;
+                        continue;
+                    }
+
+                    var clone = ent.Clone() as Entity;
+                    if (clone == null)
+                        continue;
+
+                    clone.TransformBy(displacement);
+
+                    ApplyEffectiveVisualPropertiesBeforeLayerMove(db, tr, clone);
+
+                    ms.AppendEntity(clone);
+                    tr.AddNewlyCreatedDBObject(clone, true);
+
+                    kept++;
+                }
+
+                ed.WriteMessage($"\n[VISIBLE-OUTLINE] Kept={kept}, Removed={removed}");
+
+                tr.Commit();
+            }
+        }
+
+
+        private static List<ObjectId> CollectFluxViewCopyEntities(
+    Transaction tr,
+    BlockTableRecord ms)
+        {
+            var result = new List<ObjectId>();
+
+            foreach (ObjectId id in ms)
+            {
+                var ent = tr.GetObject(id, OpenMode.ForRead) as Entity;
+                if (ent == null)
+                    continue;
+
+                if (string.IsNullOrEmpty(ent.Layer))
+                    continue;
+
+                if (!ent.Layer.StartsWith("FLUX_VIEW_COPY_OUT_I"))
+                    continue;
+
+                result.Add(id);
+            }
+
+            return result;
+        }
+
+        private static bool IsVisibleOutlineCandidate(Entity ent)
+        {
+            if (ent == null)
+                return false;
+
+            if (!IsCurveLikeEntity(ent))
+                return false;
+
+            if (IsCenterLine(ent))
+                return false;
+
+            if (IsHiddenLine(ent))
+                return false;
+
+            if (!IsContinuousLike(ent))
+                return false;
+
+            return true;
+        }
+
+        private static bool IsCenterLine(Entity ent)
+        {
+            var lt = ent.Linetype?.ToUpperInvariant() ?? "";
+
+            return lt.Contains("CENTER");
+        }
+
+        private static bool IsHiddenLine(Entity ent)
+        {
+            var lt = ent.Linetype?.ToUpperInvariant() ?? "";
+
+            return lt.Contains("HIDDEN") ||
+                   lt.Contains("DASHED");
+        }
+
+        private static bool IsContinuousLike(Entity ent)
+        {
+            var lt = ent.Linetype?.ToUpperInvariant() ?? "";
+
+            if (string.IsNullOrEmpty(lt))
+                return true;
+
+            return lt.Contains("CONTINUOUS") ||
+                   lt == "BYLAYER";
+        }
+
+
         [CommandMethod("FLUX_COPY_VISIBLE_OUTLINE_WORKSPACE")]
         public void FluxCopyVisibleOutlineWorkspace()
         {
@@ -7052,6 +7181,7 @@ namespace FluxCAD.BricsCAD.Plugin26
                    ent is Polyline2d ||
                    ent is Polyline3d ||
                    ent is Spline ||
+                   ent is Solid ||
                    ent is Face;   // 최소 수정 추가
         }
 
