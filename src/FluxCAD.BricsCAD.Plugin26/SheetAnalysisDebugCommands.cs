@@ -1037,6 +1037,97 @@ namespace FluxCAD.BricsCAD.Plugin26
         }
 
 
+        private const string FluxSemanticRegAppName = "FLUX_SEMANTIC";
+
+        private static void EnsureRegApp(Database db, Transaction tr, string name)
+        {
+            var rat = (RegAppTable)tr.GetObject(db.RegAppTableId, OpenMode.ForRead);
+
+            if (rat.Has(name))
+                return;
+
+            rat.UpgradeOpen();
+
+            var rec = new RegAppTableRecord
+            {
+                Name = name
+            };
+
+            rat.Add(rec);
+            tr.AddNewlyCreatedDBObject(rec, true);
+        }
+
+        private static void AttachFluxSemanticXData(
+            Database db,
+            Transaction tr,
+            Entity ent,
+            SheetEntity source)
+        {
+            if (ent == null || source == null)
+                return;
+
+            EnsureRegApp(db, tr, FluxSemanticRegAppName);
+
+            ent.XData = new ResultBuffer(
+                new TypedValue((int)DxfCode.ExtendedDataRegAppName, FluxSemanticRegAppName),
+                new TypedValue((int)DxfCode.ExtendedDataAsciiString, $"Role={source.Role}"),
+                new TypedValue((int)DxfCode.ExtendedDataAsciiString, $"Kind={source.Kind}"),
+                new TypedValue((int)DxfCode.ExtendedDataAsciiString, $"IsHidden={source.IsHiddenLine}"),
+                new TypedValue((int)DxfCode.ExtendedDataAsciiString, $"IsCenter={source.IsCenterLine}"),
+                new TypedValue((int)DxfCode.ExtendedDataAsciiString, $"SourceLayer={source.Layer ?? ""}")
+            );
+        }
+
+        private static bool TryGetFluxSemanticValue(
+    Entity ent,
+    string key,
+    out string value)
+        {
+            value = "";
+
+            if (ent?.XData == null)
+                return false;
+
+            foreach (TypedValue tv in ent.XData)
+            {
+                if (tv.TypeCode != (int)DxfCode.ExtendedDataAsciiString)
+                    continue;
+
+                var s = tv.Value?.ToString() ?? "";
+
+                if (!s.StartsWith(key + "=", StringComparison.OrdinalIgnoreCase))
+                    continue;
+
+                value = s.Substring(key.Length + 1);
+                return true;
+            }
+
+            return false;
+        }
+
+        private static bool IsFluxReferenceGeometryEntity(Entity ent)
+        {
+            if (TryGetFluxSemanticValue(ent, "Role", out var role) &&
+                role.Equals("ReferenceGeometry", StringComparison.OrdinalIgnoreCase))
+                return true;
+
+            if (TryGetFluxSemanticValue(ent, "IsHidden", out var hidden) &&
+                hidden.Equals("True", StringComparison.OrdinalIgnoreCase))
+                return true;
+
+            if (TryGetFluxSemanticValue(ent, "IsCenter", out var center) &&
+                center.Equals("True", StringComparison.OrdinalIgnoreCase))
+                return true;
+
+            if (TryGetFluxSemanticValue(ent, "SourceLayer", out var sourceLayer) &&
+                (LooksLikeHiddenCad(sourceLayer) || LooksLikeCenterCad(sourceLayer)))
+                return true;
+
+            return false;
+        }
+
+
+
         private static bool IsSideBoundaryCandidateForDirectionalSearch(SheetEntity e)
         {
             if (e == null)
@@ -1595,6 +1686,9 @@ namespace FluxCAD.BricsCAD.Plugin26
                     // 핵심 추가: clone을 visible workspace island layer로 이동
                     clone.Layer = targetLayer;
 
+                    // 선택 사항: 기존 XData 보존
+                    CopyFluxSemanticXData(ent, clone);
+
                     ms.AppendEntity(clone);
                     tr.AddNewlyCreatedDBObject(clone, true);
 
@@ -1607,6 +1701,19 @@ namespace FluxCAD.BricsCAD.Plugin26
 
                 tr.Commit();
             }
+        }
+
+
+        private static void CopyFluxSemanticXData(Entity source, Entity target)
+        {
+            if (source == null || target == null)
+                return;
+
+            var rb = source.XData;
+            if (rb == null)
+                return;
+
+            target.XData = rb;
         }
 
         private static bool TryGetSheetBoundsFromOriginalEntities(
@@ -3033,7 +3140,11 @@ namespace FluxCAD.BricsCAD.Plugin26
             if (!IsCurveLikeEntity(ent))
                 return false;
 
-            // 핵심: linetype만 보지 말고 layer + linetype을 함께 검사
+            // 핵심: SNAPSHOT에서 저장한 semantic role 기준으로 제거
+            if (IsFluxReferenceGeometryEntity(ent))
+                return false;
+
+            // 보조 안전장치
             if (IsHiddenOrCenterCadEntity(ent))
                 return false;
 
@@ -3651,12 +3762,18 @@ namespace FluxCAD.BricsCAD.Plugin26
                             int recreatedCount = 0;
                             var displacement = Matrix3d.Displacement(new Vector3d(groupDx, groupDy, 0.0));
 
-                            var deepCloneLeaves = snapshotLeaves
-                                .Where(x => x != null && CanDeepCloneSnapshotLeafAsWorldEntity(x))
-                                .ToList();
+                            //                             var deepCloneLeaves = snapshotLeaves
+                            //                                 .Where(x => x != null && CanDeepCloneSnapshotLeafAsWorldEntity(x))
+                            //                                 .ToList();
+                            // 
+                            //                             var recreateLeaves = snapshotLeaves
+                            //                                 .Where(x => x == null || !CanDeepCloneSnapshotLeafAsWorldEntity(x))
+                            //                                 .ToList();
+
+                            var deepCloneLeaves = new List<SheetEntity>();
 
                             var recreateLeaves = snapshotLeaves
-                                .Where(x => x == null || !CanDeepCloneSnapshotLeafAsWorldEntity(x))
+                                .Where(x => x != null)
                                 .ToList();
 
                             var sourceHandles = deepCloneLeaves
@@ -3718,6 +3835,9 @@ namespace FluxCAD.BricsCAD.Plugin26
                                 ApplySnapshotVisualPropertiesForIslandLayerMove(db, tr, ent, leaf, islandOutLayer);
                                 //ent.Layer = islandOutLayer;
                                 ent.TransformBy(displacement);
+
+                                AttachFluxSemanticXData(db, tr, ent, leaf);
+
                                 ms.AppendEntity(ent);
                                 tr.AddNewlyCreatedDBObject(ent, true);
 
@@ -3744,6 +3864,9 @@ namespace FluxCAD.BricsCAD.Plugin26
                                 ApplySnapshotVisualPropertiesForIslandLayerMove(db, tr, ent, leaf, islandOutLayer);
                                 // ent.Layer = islandOutLayer;
                                 ent.TransformBy(displacement);
+
+                                AttachFluxSemanticXData(db, tr, ent, leaf);
+
                                 ms.AppendEntity(ent);
                                 tr.AddNewlyCreatedDBObject(ent, true);
 
