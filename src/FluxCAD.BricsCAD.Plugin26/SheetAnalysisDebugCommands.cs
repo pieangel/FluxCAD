@@ -834,7 +834,7 @@ namespace FluxCAD.BricsCAD.Plugin26
             Left,
             Right
         }
-
+        /*
         private enum DirectionalEdgeEntityRole
         {
             Unknown = 0,
@@ -846,6 +846,38 @@ namespace FluxCAD.BricsCAD.Plugin26
             NearFeature,            // 구멍, 슬롯 등 근처 feature
             ReferenceHint,          // 두께/숨은선/중심선 등 참고 정보
             DisconnectedNoise       // 연결되지 않은 노이즈
+        }
+        */  
+
+        private enum DirectionalEdgeEntityRole
+        {
+            Unknown = 0,
+
+            // 해당 방향에서 가장 먼저 만난 외곽 seed
+            OuterMostBoundary,
+
+            // 실제 외곽 side를 구성하는 chain
+            // Line, Polyline segment, Arc 모두 포함 가능
+            SideBoundaryChain,
+
+            // 그래프상 도달 가능하지만 외곽 확정은 아님
+            ReachableGraph,
+
+            // 외곽 chain에 붙어 있으나 side 진행 방향을 바꾸는 코너/라운드/필렛
+            // 단, 외곽 contour 일부이면 SideBoundaryChain과 함께 CornerBoundary 성격도 가질 수 있음
+            CornerBoundary,
+
+            // 외곽 안쪽의 구멍/슬롯/내부 원/내부 Arc
+            InternalFeature,
+
+            ProtrusionBoundary,
+            RecessBoundary,
+            NearFeature,
+
+            // 중심선/숨은선/두께선/치수 보조선
+            ReferenceHint,
+
+            DisconnectedNoise
         }
 
         private enum DirectionalEdgeComplexity
@@ -898,7 +930,14 @@ namespace FluxCAD.BricsCAD.Plugin26
 
             public List<SheetEntity> OuterMostEntities { get; } = new();
 
-            public List<SheetEntity> ConnectedBoundaryEntities { get; } = new();
+            // 기존 ConnectedBoundaryEntities 대신 의미 분리
+            public List<SheetEntity> ReachableGraphEntities { get; } = new();
+
+            public List<SheetEntity> SideBoundaryEntities { get; } = new();
+
+            public List<SheetEntity> CornerBoundaryEntities { get; } = new();
+
+            public List<SheetEntity> InternalFeatureEntities { get; } = new();
 
             public List<SheetEntity> ProtrusionEntities { get; } = new();
 
@@ -916,6 +955,7 @@ namespace FluxCAD.BricsCAD.Plugin26
 
             public string Reason { get; set; } = string.Empty;
         }
+
 
         private sealed class ViewDirectionalEdgeProfileSet
         {
@@ -961,12 +1001,21 @@ namespace FluxCAD.BricsCAD.Plugin26
                     return;
                 }
 
+                LogDirectionalWorkspaceGroupSummary(ed, groups);
+
                 foreach (var pair in groups.OrderBy(x => x.Key))
                 {
                     int islandId = pair.Key;
                     var visibleEntities = pair.Value;
 
                     var viewBounds = Bounds2DHelper.FromEntities(visibleEntities);
+
+//                     LogDirectionalWorkspaceIslandAudit(
+//                         ed,
+//                         islandId,
+//                         visibleEntities,
+//                         viewBounds,
+//                         targetHandle: "61C");
 
                     var edgeSet = BuildDirectionalEdgeProfiles(
                         islandId,
@@ -988,11 +1037,227 @@ namespace FluxCAD.BricsCAD.Plugin26
         }
 
 
+        private static bool IsSideBoundaryCandidateForDirectionalSearch(SheetEntity e)
+        {
+            if (e == null)
+                return false;
+
+            if (e.Bounds.IsEmpty)
+                return false;
+
+            if (e.IsCenterLine || e.IsHiddenLine)
+                return false;
+
+            return e.Kind == SheetEntityKind.Line ||
+                   e.Kind == SheetEntityKind.Polyline;
+        }
+
+        private static bool IsInternalOrCornerFeatureCandidate(SheetEntity e)
+        {
+            if (e == null)
+                return false;
+
+            if (e.Bounds.IsEmpty)
+                return false;
+
+            if (e.IsCenterLine || e.IsHiddenLine)
+                return false;
+
+            return e.Kind == SheetEntityKind.Circle ||
+                   e.Kind == SheetEntityKind.Arc ||
+                   e.Kind == SheetEntityKind.Ellipse ||
+                   e.Kind == SheetEntityKind.Spline;
+        }
+
+
+
+        private static void LogDirectionalWorkspaceGroupSummary(
+    Bricscad.EditorInput.Editor ed,
+    IReadOnlyDictionary<int, List<SheetEntity>> groups)
+        {
+            if (ed == null || groups == null)
+                return;
+
+            ed.WriteMessage("\n================ DIR-WORKSPACE GROUP SUMMARY ================");
+
+            foreach (var pair in groups.OrderBy(x => x.Key))
+            {
+                int islandId = pair.Key;
+                var entities = pair.Value ?? new List<SheetEntity>();
+
+                var bounds = Bounds2DHelper.FromEntities(entities);
+
+                int lineCount = entities.Count(e => e.Kind == SheetEntityKind.Line);
+                int arcCount = entities.Count(e => e.Kind == SheetEntityKind.Arc);
+                int circleCount = entities.Count(e => e.Kind == SheetEntityKind.Circle);
+                int polyCount = entities.Count(e => e.Kind == SheetEntityKind.Polyline);
+
+                ed.WriteMessage(
+                    $"\n[I:{islandId}] Count={entities.Count}, " +
+                    $"Line={lineCount}, Arc={arcCount}, Circle={circleCount}, Polyline={polyCount}, " +
+                    $"Bounds=({bounds.MinX:F3},{bounds.MinY:F3})-({bounds.MaxX:F3},{bounds.MaxY:F3})");
+            }
+
+            ed.WriteMessage("\n=============================================================");
+        }
+
+        private static void LogDirectionalWorkspaceIslandAudit(
+    Bricscad.EditorInput.Editor ed,
+    int islandId,
+    IReadOnlyList<SheetEntity> visibleEntities,
+    Bounds2D viewBounds,
+    string targetHandle)
+        {
+            if (ed == null || visibleEntities == null)
+                return;
+
+            ed.WriteMessage($"\n================ DIR-WORKSPACE ISLAND AUDIT I:{islandId} ================");
+            ed.WriteMessage(
+                $"\nViewBounds=({viewBounds.MinX:F3},{viewBounds.MinY:F3})-({viewBounds.MaxX:F3},{viewBounds.MaxY:F3}), " +
+                $"W={viewBounds.Width:F3}, H={viewBounds.Height:F3}");
+
+            ed.WriteMessage($"\nEntityCount={visibleEntities.Count}");
+
+            LogTargetHandleInDirectionalWorkspace(
+                ed,
+                islandId,
+                targetHandle,
+                visibleEntities,
+                viewBounds);
+
+            LogDirectionalOuterCandidates(
+                ed,
+                islandId,
+                visibleEntities,
+                viewBounds,
+                EdgeSide.Top);
+
+            LogDirectionalOuterCandidates(
+                ed,
+                islandId,
+                visibleEntities,
+                viewBounds,
+                EdgeSide.Bottom);
+
+            LogDirectionalOuterCandidates(
+                ed,
+                islandId,
+                visibleEntities,
+                viewBounds,
+                EdgeSide.Left);
+
+            LogDirectionalOuterCandidates(
+                ed,
+                islandId,
+                visibleEntities,
+                viewBounds,
+                EdgeSide.Right);
+
+            ed.WriteMessage("\n=======================================================================");
+        }
+
+        private static void LogTargetHandleInDirectionalWorkspace(
+    Bricscad.EditorInput.Editor ed,
+    int islandId,
+    string targetHandle,
+    IReadOnlyList<SheetEntity> visibleEntities,
+    Bounds2D viewBounds)
+        {
+            if (string.IsNullOrWhiteSpace(targetHandle))
+                return;
+
+            var matches = visibleEntities
+                .Where(e => e != null &&
+                            string.Equals(e.Handle, targetHandle, StringComparison.OrdinalIgnoreCase))
+                .ToList();
+
+            if (matches.Count == 0)
+            {
+                //ed.WriteMessage(
+                //    $"\n[HANDLE-TRACE] I:{islandId}, H={targetHandle}, FOUND=False in visibleEntities");
+                return;
+            }
+
+            foreach (var e in matches)
+            {
+                bool boundsOk = !e.Bounds.IsEmpty;
+                bool intersectsView = boundsOk && Bounds2DHelper.Intersects(e.Bounds, viewBounds, 0.0);
+                bool boundaryCandidate = IsBoundaryCandidateForDirectionalSearch(e);
+
+//                 ed.WriteMessage(
+//                     $"\n[HANDLE-TRACE] I:{islandId}, H={targetHandle}, FOUND=True, " +
+//                     $"Kind={e.Kind}, Role={e.Role}, BoundsOk={boundsOk}, IntersectsView={intersectsView}, " +
+//                     $"BoundaryCandidate={boundaryCandidate}, " +
+//                     $"Bounds=({e.Bounds.MinX:F3},{e.Bounds.MinY:F3})-({e.Bounds.MaxX:F3},{e.Bounds.MaxY:F3}), " +
+//                     $"Layer={e.Layer}, Lt={e.LinetypeName}, EffLt={e.EffectiveLinetypeName}");
+            }
+        }
+
+        private static void LogDirectionalOuterCandidates(
+    Bricscad.EditorInput.Editor ed,
+    int islandId,
+    IReadOnlyList<SheetEntity> entities,
+    Bounds2D viewBounds,
+    EdgeSide side)
+        {
+            if (entities == null || viewBounds.IsEmpty)
+                return;
+
+            double outer = GetOuterCoordinate(viewBounds, side);
+
+            var rows = entities
+                .Where(e => e != null && !e.Bounds.IsEmpty)
+                .Select(e =>
+                {
+                    double sideCoord = GetEntitySideCoordinate(e.Bounds, side);
+                    double dist = Math.Abs(outer - sideCoord);
+                    double coverage = ComputeDirectionalSpanCoverage(e.Bounds, viewBounds, side);
+                    bool boundaryCandidate = IsBoundaryCandidateForDirectionalSearch(e);
+                    bool sideCompatible = IsDirectionalSideCompatible(e, side);
+
+                    return new
+                    {
+                        Entity = e,
+                        SideCoord = sideCoord,
+                        Dist = dist,
+                        Coverage = coverage,
+                        BoundaryCandidate = boundaryCandidate,
+                        SideCompatible = sideCompatible
+                    };
+                })
+                .OrderBy(x => x.Dist)
+                .ThenByDescending(x => x.Coverage)
+                .Take(20)
+                .ToList();
+
+            //ed.WriteMessage(
+            //    $"\n[OUTER-CANDIDATES] I:{islandId}, Side={side}, Outer={outer:F3}");
+
+            foreach (var x in rows)
+            {
+                var e = x.Entity;
+
+                ed.WriteMessage(
+                    $"\n  H={e.Handle}, Kind={e.Kind}, Role={e.Role}, " +
+                    $"SideCoord={x.SideCoord:F3}, Dist={x.Dist:F3}, Coverage={x.Coverage:F3}, " +
+                    $"BoundaryCandidate={x.BoundaryCandidate}, SideCompatible={x.SideCompatible}, " +
+                    $"Bounds=({e.Bounds.MinX:F3},{e.Bounds.MinY:F3})-({e.Bounds.MaxX:F3},{e.Bounds.MaxY:F3}), " +
+                    $"Layer={e.Layer}, Lt={e.LinetypeName}, EffLt={e.EffectiveLinetypeName}");
+            }
+        }
+
+
+
         private static Dictionary<int, List<SheetEntity>> CollectVisibleOutlineWorkspaceSheetEntities(
     Transaction tr,
     BlockTableRecord ms)
         {
             var result = new Dictionary<int, List<SheetEntity>>();
+
+            var doc = Bricscad.ApplicationServices.Application.DocumentManager.MdiActiveDocument;
+            var ed = doc?.Editor;
+
+            ed?.WriteMessage("\n[COLLECT-FUNC-ENTER] CollectVisibleOutlineWorkspaceSheetEntities entered");
 
             foreach (ObjectId id in ms)
             {
@@ -1000,14 +1265,59 @@ namespace FluxCAD.BricsCAD.Plugin26
                 if (ent == null)
                     continue;
 
+                if (ent.Handle.ToString().Equals("61C", StringComparison.OrdinalIgnoreCase) ||
+                    ent.Layer.Contains("I006"))
+                {
+                    ed?.WriteMessage(
+                        $"\n[COLLECT-RAW] H={ent.Handle}, Type={ent.GetType().Name}, Layer={ent.Layer}, Lt={ent.Linetype}");
+                }
+
+                if (ent.Layer.StartsWith("FLUX_VISIBLE_OUTLINE_WORK_I006", StringComparison.OrdinalIgnoreCase) &&
+                    ent is Line line)
+                {
+                    ed?.WriteMessage(
+                        $"\n[COLLECT-I006-LINE] H={ent.Handle}, " +
+                        $"SP=({line.StartPoint.X:F3},{line.StartPoint.Y:F3}), " +
+                        $"EP=({line.EndPoint.X:F3},{line.EndPoint.Y:F3}), " +
+                        $"Layer={ent.Layer}, Lt={ent.Linetype}");
+                }
+
+                string handle = ent.Handle.ToString();
+                bool isTarget = string.Equals(handle, "61C", StringComparison.OrdinalIgnoreCase);
+
+                if (isTarget)
+                {
+                    ed?.WriteMessage(
+                        $"\n[COLLECT-TRACE] H=61C FOUND-IN-MODELSPACE, Type={ent.GetType().Name}, Layer={ent.Layer}, Lt={ent.Linetype}");
+                }
+
                 if (string.IsNullOrWhiteSpace(ent.Layer))
+                {
+                    if (isTarget)
+                        ed?.WriteMessage("\n[COLLECT-TRACE] H=61C REJECT: Empty layer");
                     continue;
+                }
 
-                if (!ent.Layer.StartsWith("FLUX_VISIBLE_OUTLINE_WORK_I"))
+                if (!ent.Layer.StartsWith("FLUX_VISIBLE_OUTLINE_WORK_I", StringComparison.OrdinalIgnoreCase))
+                {
+                    if (isTarget)
+                        ed?.WriteMessage($"\n[COLLECT-TRACE] H=61C REJECT: Layer mismatch. Layer={ent.Layer}");
                     continue;
+                }
 
-                if (!TryBuildDirectionalSheetEntity(ent, out var sheetEntity))
+                if (!TryBuildDirectionalSheetEntityWithReason(ent, out var sheetEntity, out var reason))
+                {
+                    if (isTarget)
+                        ed?.WriteMessage($"\n[COLLECT-TRACE] H=61C REJECT: TryBuild failed. Reason={reason}");
                     continue;
+                }
+
+                if (isTarget)
+                {
+                    ed?.WriteMessage(
+                        $"\n[COLLECT-TRACE] H=61C ACCEPTED, Kind={sheetEntity.Kind}, " +
+                        $"Bounds=({sheetEntity.Bounds.MinX:F3},{sheetEntity.Bounds.MinY:F3})-({sheetEntity.Bounds.MaxX:F3},{sheetEntity.Bounds.MaxY:F3})");
+                }
 
                 int islandId = ExtractIslandIdFromLayer(ent.Layer);
 
@@ -1022,6 +1332,69 @@ namespace FluxCAD.BricsCAD.Plugin26
 
             return result;
         }
+
+        private static bool TryBuildDirectionalSheetEntityWithReason(
+    Entity ent,
+    out SheetEntity sheetEntity,
+    out string reason)
+        {
+            sheetEntity = null!;
+            reason = "";
+
+            if (ent == null)
+            {
+                reason = "Entity is null";
+                return false;
+            }
+
+            if (!TryGetEntityBoundsSafe(ent, out var bounds) || bounds.IsEmpty)
+            {
+                if (ent is Line line)
+                {
+                    bounds = Bounds2D.FromPoints(
+                        new Point2D(line.StartPoint.X, line.StartPoint.Y),
+                        new Point2D(line.EndPoint.X, line.EndPoint.Y));
+
+                    reason = "Fallback: Line bounds from Start/End point";
+                }
+                else
+                {
+                    reason = "TryGetEntityBoundsSafe failed";
+                    return false;
+                }
+            }
+
+            if (bounds.IsEmpty)
+            {
+                reason =
+                    $"Bounds.IsEmpty. Bounds=({bounds.MinX:F3},{bounds.MinY:F3})-({bounds.MaxX:F3},{bounds.MaxY:F3})";
+                return false;
+            }
+
+            var e = new SheetEntity
+            {
+                Handle = ent.Handle.ToString(),
+                Layer = ent.Layer,
+                Bounds = bounds,
+                Anchor = bounds.Center,
+                EntityType = ent.GetType().Name,
+                Kind = ResolveDirectionalEntityKind(ent),
+                IsVisible = true,
+                LinetypeName = ent.Linetype,
+                EffectiveLinetypeName = ent.Linetype,
+                IsCenterLine = IsCenterLine(ent),
+                IsHiddenLine = IsHiddenLine(ent)
+            };
+
+            FillDirectionalGeometryInfo(ent, e);
+
+            sheetEntity = e;
+            reason = "OK";
+            return true;
+        }
+
+
+
 
         private static bool TryBuildDirectionalSheetEntity(
     Entity ent,
@@ -1364,7 +1737,439 @@ namespace FluxCAD.BricsCAD.Plugin26
             return result;
         }
 
+
         private static DirectionalEdgeProfile BuildDirectionalEdgeProfile(
+    int viewIslandId,
+    Bounds2D viewBounds,
+    IReadOnlyList<SheetEntity> visibleEntities,
+    EdgeSide side)
+        {
+            double band = ComputeDirectionalAccessBandSize(viewBounds);
+            Bounds2D accessBand = BuildAccessBand(viewBounds, side, band);
+
+            var profile = new DirectionalEdgeProfile
+            {
+                ViewIslandId = viewIslandId,
+                Side = side,
+                ViewBounds = viewBounds,
+                AccessBand = accessBand,
+                OuterCoordinate = GetOuterCoordinate(viewBounds, side)
+            };
+
+            if (visibleEntities == null || visibleEntities.Count == 0 || viewBounds.IsEmpty)
+            {
+                profile.Reason = "No visible entities";
+                return profile;
+            }
+
+            double step = ComputeDirectionalProbeStep(viewBounds);
+            double maxDepth = ComputeDirectionalProbeDepth(viewBounds);
+            double tolerance = ComputeConnectionTolerance(viewBounds);
+
+            var doc = Bricscad.ApplicationServices.Application.DocumentManager.MdiActiveDocument;
+            var ed = doc?.Editor;
+
+//             if (ed != null)
+//             {
+//                 LogDirectionalCandidateDistances(
+//                     ed,
+//                     viewIslandId,
+//                     viewBounds,
+//                     side,
+//                     visibleEntities);
+//             }
+
+            var firstWave = CaptureFirstDirectionalWave(
+                viewBounds,
+                visibleEntities,
+                side,
+                step,
+                maxDepth);
+
+            if (firstWave.Count == 0)
+            {
+                profile.Reason = "No first directional wave found";
+                return profile;
+            }
+
+            foreach (var e in firstWave)
+            {
+                double sideCoord = GetEntitySideCoordinate(e.Bounds, side);
+                double dist = Math.Abs(profile.OuterCoordinate - sideCoord);
+
+                var hit = new DirectionalEdgeEntityHit
+                {
+                    Entity = e,
+                    SideCoordinate = sideCoord,
+                    DistanceFromOuter = dist,
+                    TouchesAccessBand = Bounds2DHelper.Intersects(e.Bounds, accessBand, 0.0),
+                    Role = DirectionalEdgeEntityRole.OuterMostBoundary,
+                    Reason = "Captured by first directional wave"
+                };
+
+                profile.Hits.Add(hit);
+                profile.OuterMostEntities.Add(e);
+            }
+
+            BuildSideBoundaryChainFromOuterSeeds(
+    profile,
+    visibleEntities,
+    tolerance);
+
+            ClassifyRemainingDirectionalHits(
+                profile,
+                visibleEntities,
+                accessBand,
+                side);
+
+            DetectSimpleProtrusionCandidates(profile, tolerance);
+
+            profile.Complexity = ResolveDirectionalComplexity(profile);
+
+            profile.Reason =
+                $"Side={side}, FirstWave={firstWave.Count}, " +
+                $"SideBoundary={profile.SideBoundaryEntities.Count}, " +
+                $"ReachableGraph={profile.ReachableGraphEntities.Count}, " +
+                $"InternalFeature={profile.InternalFeatureEntities.Count}, " +
+                $"Corner={profile.CornerBoundaryEntities.Count}, " +
+                $"NearFeature={profile.NearFeatureEntities.Count}, " +
+                $"Disconnected={profile.DisconnectedEntities.Count}, " +
+                $"Complexity={profile.Complexity}";
+
+            return profile;
+        }
+
+        private static List<SheetEntity> CaptureFirstDirectionalWave(
+    Bounds2D viewBounds,
+    IReadOnlyList<SheetEntity> entities,
+    EdgeSide side,
+    double step,
+    double maxDepth)
+        {
+            var result = new List<SheetEntity>();
+
+            if (viewBounds.IsEmpty || entities == null || entities.Count == 0)
+                return result;
+
+            double depth = step;
+
+            while (depth <= maxDepth)
+            {
+                Bounds2D probeBand = BuildDirectionalProbeBand(viewBounds, side, depth, step);
+
+                var hits = entities
+                    .Where(e =>
+                        e != null &&
+                        !e.Bounds.IsEmpty &&
+                        IsSideBoundaryCandidateForDirectionalSearch(e) &&
+                        IsDirectionalSideCompatible(e, side) &&
+                        Bounds2DHelper.Intersects(e.Bounds, probeBand, tolerance: 0.0))
+                    .ToList();
+
+                if (hits.Count > 0)
+                {
+                    result.AddRange(hits);
+                    return result;
+                }
+
+                depth += step;
+            }
+
+            return result;
+        }
+
+
+        private static bool IsBoundaryConnectable(
+    DirectionalEdgeProfile profile,
+    SheetEntity a,
+    SheetEntity b,
+    double tolerance)
+        {
+            if (a == null || b == null)
+                return false;
+
+            if (a.Handle == b.Handle)
+                return false;
+
+            if (a.Bounds.IsEmpty || b.Bounds.IsEmpty)
+                return false;
+
+            // Side chain은 Line / Polyline 중심으로만 연결한다.
+            if (!IsSideBoundaryCandidateForDirectionalSearch(a))
+                return false;
+
+            if (!IsSideBoundaryCandidateForDirectionalSearch(b))
+                return false;
+
+            // 빠른 배제 용도일 뿐, 이것만으로 연결 판정하지 않는다.
+            if (!Bounds2DHelper.Intersects(a.Bounds, b.Bounds, tolerance))
+                return false;
+
+            if (HasEndpointConnection(a, b, tolerance))
+                return true;
+
+            if (HasVertexConnection(a, b, tolerance))
+                return true;
+
+            // 중요:
+            // Bounds distance fallback 금지.
+            // Closed Polyline 내부의 Circle/Arc가 연결된 것으로 오인될 수 있음.
+            return false;
+        }
+
+
+
+        private static void LogDirectionalCandidateDistances(
+    Bricscad.EditorInput.Editor ed,
+    int viewIslandId,
+    Bounds2D viewBounds,
+    EdgeSide side,
+    IReadOnlyList<SheetEntity> entities)
+        {
+            if (ed == null || entities == null || viewBounds.IsEmpty)
+                return;
+
+            double outer = GetOuterCoordinate(viewBounds, side);
+
+            ed.WriteMessage(
+                $"\n================ DIR-CANDIDATE-DIST I:{viewIslandId} Side={side} ================");
+            ed.WriteMessage(
+                $"\nViewBounds=({viewBounds.MinX:F3},{viewBounds.MinY:F3})-({viewBounds.MaxX:F3},{viewBounds.MaxY:F3}), Outer={outer:F3}");
+
+            var rows = entities
+                .Where(e =>
+                    e != null &&
+                    !e.Bounds.IsEmpty &&
+                    IsBoundaryCandidateForDirectionalSearch(e))
+                .Select(e =>
+                {
+                    double sideCoord = GetEntitySideCoordinate(e.Bounds, side);
+                    double dist = Math.Abs(outer - sideCoord);
+                    double coverage = ComputeDirectionalSpanCoverage(e.Bounds, viewBounds, side);
+
+                    return new
+                    {
+                        Entity = e,
+                        SideCoord = sideCoord,
+                        Dist = dist,
+                        Coverage = coverage
+                    };
+                })
+                .OrderBy(x => x.Dist)
+                .ThenByDescending(x => x.Coverage)
+                .Take(40)
+                .ToList();
+
+            foreach (var x in rows)
+            {
+                var e = x.Entity;
+
+                ed.WriteMessage(
+                    $"\n  H={e.Handle}, Kind={e.Kind}, Role={e.Role}, " +
+                    $"SideCoord={x.SideCoord:F3}, Dist={x.Dist:F3}, Coverage={x.Coverage:F3}, " +
+                    $"Bounds=({e.Bounds.MinX:F3},{e.Bounds.MinY:F3})-({e.Bounds.MaxX:F3},{e.Bounds.MaxY:F3}), " +
+                    $"Layer={e.Layer}, Lt={e.LinetypeName}, EffLt={e.EffectiveLinetypeName}");
+            }
+
+            ed.WriteMessage(
+                "\n==========================================================================");
+        }
+
+        private static double ComputeDirectionalSpanCoverage(
+    Bounds2D entityBounds,
+    Bounds2D viewBounds,
+    EdgeSide side)
+        {
+            if (entityBounds.IsEmpty || viewBounds.IsEmpty)
+                return 0.0;
+
+            if (side == EdgeSide.Top || side == EdgeSide.Bottom)
+            {
+                double overlap =
+                    Math.Max(0.0,
+                        Math.Min(entityBounds.MaxX, viewBounds.MaxX) -
+                        Math.Max(entityBounds.MinX, viewBounds.MinX));
+
+                return viewBounds.Width <= 0.0 ? 0.0 : overlap / viewBounds.Width;
+            }
+            else
+            {
+                double overlap =
+                    Math.Max(0.0,
+                        Math.Min(entityBounds.MaxY, viewBounds.MaxY) -
+                        Math.Max(entityBounds.MinY, viewBounds.MinY));
+
+                return viewBounds.Height <= 0.0 ? 0.0 : overlap / viewBounds.Height;
+            }
+        }
+
+
+
+        private static Bounds2D BuildDirectionalProbeBand(
+            Bounds2D bounds,
+            EdgeSide side,
+            double depth,
+            double thickness)
+        {
+            return side switch
+            {
+                EdgeSide.Top =>
+                    new Bounds2D(
+                        bounds.MinX,
+                        bounds.MaxY - depth,
+                        bounds.MaxX,
+                        bounds.MaxY - Math.Max(0.0, depth - thickness)),
+
+                EdgeSide.Bottom =>
+                    new Bounds2D(
+                        bounds.MinX,
+                        bounds.MinY + Math.Max(0.0, depth - thickness),
+                        bounds.MaxX,
+                        bounds.MinY + depth),
+
+                EdgeSide.Left =>
+                    new Bounds2D(
+                        bounds.MinX + Math.Max(0.0, depth - thickness),
+                        bounds.MinY,
+                        bounds.MinX + depth,
+                        bounds.MaxY),
+
+                EdgeSide.Right =>
+                    new Bounds2D(
+                        bounds.MaxX - depth,
+                        bounds.MinY,
+                        bounds.MaxX - Math.Max(0.0, depth - thickness),
+                        bounds.MaxY),
+
+                _ => bounds
+            };
+        }
+
+        private static double ComputeDirectionalProbeStep(Bounds2D bounds)
+        {
+            if (bounds.IsEmpty)
+                return 1.0;
+
+            double shortSide = Math.Min(bounds.Width, bounds.Height);
+
+            return Math.Max(1.0, shortSide * 0.01);
+        }
+
+        private static double ComputeDirectionalProbeDepth(Bounds2D bounds)
+        {
+            if (bounds.IsEmpty)
+                return 1.0;
+
+            double shortSide = Math.Min(bounds.Width, bounds.Height);
+
+            return Math.Max(5.0, shortSide * 0.25);
+        }
+
+        private static bool IsBoundaryCandidateForDirectionalSearch(SheetEntity e)
+        {
+            if (e == null)
+                return false;
+
+            if (e.Bounds.IsEmpty)
+                return false;
+
+            if (e.IsCenterLine || e.IsHiddenLine)
+                return false;
+
+            return e.Kind == SheetEntityKind.Line ||
+                   e.Kind == SheetEntityKind.Arc ||
+                   e.Kind == SheetEntityKind.Circle ||
+                   e.Kind == SheetEntityKind.Polyline ||
+                   e.Kind == SheetEntityKind.Ellipse ||
+                   e.Kind == SheetEntityKind.Spline;
+        }
+
+        private static void ClassifyRemainingDirectionalHits(
+            DirectionalEdgeProfile profile,
+            IReadOnlyList<SheetEntity> visibleEntities,
+            Bounds2D accessBand,
+            EdgeSide side)
+        {
+            var known = new HashSet<string>();
+
+            foreach (var e in profile.OuterMostEntities)
+                known.Add(e.Handle);
+
+            foreach (var e in profile.SideBoundaryEntities)
+                known.Add(e.Handle);
+
+            foreach (var e in visibleEntities)
+            {
+                if (e == null || e.Bounds.IsEmpty)
+                    continue;
+
+                if (known.Contains(e.Handle))
+                    continue;
+
+                if (!Bounds2DHelper.Intersects(e.Bounds, accessBand, tolerance: 0.0))
+                    continue;
+
+                double sideCoord = GetEntitySideCoordinate(e.Bounds, side);
+                double dist = Math.Abs(profile.OuterCoordinate - sideCoord);
+
+                var hit = new DirectionalEdgeEntityHit
+                {
+                    Entity = e,
+                    SideCoordinate = sideCoord,
+                    DistanceFromOuter = dist,
+                    TouchesAccessBand = true
+                };
+
+                if (e.IsCenterLine || e.IsHiddenLine)
+                {
+                    hit.Role = DirectionalEdgeEntityRole.ReferenceHint;
+                    hit.Reason = "Center/hidden line reference hint";
+                    profile.ReferenceHintEntities.Add(e);
+                }
+                else if (IsBoundaryCandidateForDirectionalSearch(e))
+                {
+                    hit.Role = DirectionalEdgeEntityRole.NearFeature;
+                    hit.Reason = "Inside access band but not connected to outer boundary";
+                    profile.NearFeatureEntities.Add(e);
+                }
+                else
+                {
+                    hit.Role = DirectionalEdgeEntityRole.DisconnectedNoise;
+                    hit.Reason = "Non-boundary entity in access band";
+                    profile.DisconnectedEntities.Add(e);
+                }
+
+                profile.Hits.Add(hit);
+            }
+        }
+
+        private static DirectionalEdgeComplexity ResolveDirectionalComplexity(
+    DirectionalEdgeProfile profile)
+        {
+            if (profile == null)
+                return DirectionalEdgeComplexity.Unknown;
+
+            if (profile.ProtrusionEntities.Count > 0)
+                return DirectionalEdgeComplexity.Protruded;
+
+            int sideBoundary = profile.SideBoundaryEntities.Count;
+            int near = profile.NearFeatureEntities.Count;
+            int corner = profile.CornerBoundaryEntities.Count;
+
+            if (sideBoundary <= 2 && near == 0 && corner == 0)
+                return DirectionalEdgeComplexity.StraightLike;
+
+            if (corner > 0)
+                return DirectionalEdgeComplexity.Curved;
+
+            if (sideBoundary <= 4 && near <= 2)
+                return DirectionalEdgeComplexity.Stepped;
+
+            return DirectionalEdgeComplexity.Complex;
+        }
+
+
+        private static DirectionalEdgeProfile BuildDirectionalEdgeProfile_old(
     int viewIslandId,
     Bounds2D viewBounds,
     IReadOnlyList<SheetEntity> visibleEntities,
@@ -1431,10 +2236,10 @@ namespace FluxCAD.BricsCAD.Plugin26
                 }
             }
 
-            ExpandConnectedBoundaryFromOuterSeeds(
+            BuildSideBoundaryChainFromOuterSeeds(
                 profile,
                 visibleEntities,
-                ComputeConnectionTolerance(viewBounds));
+                tol);
 
             profile.Complexity =
                 profile.OuterMostEntities.Count <= 2
@@ -1447,7 +2252,8 @@ namespace FluxCAD.BricsCAD.Plugin26
             return profile;
         }
 
-        private static void ExpandConnectedBoundaryFromOuterSeeds(
+
+        private static void BuildSideBoundaryChainFromOuterSeeds(
     DirectionalEdgeProfile profile,
     IReadOnlyList<SheetEntity> visibleEntities,
     double tolerance)
@@ -1460,13 +2266,13 @@ namespace FluxCAD.BricsCAD.Plugin26
                     .Where(x => x != null)
                     .Select(x => x.Handle));
 
-            var queue = new Queue<SheetEntity>(profile.OuterMostEntities);
+            var queue = new Queue<SheetEntity>(
+                profile.OuterMostEntities
+                    .Where(IsSideBoundaryCandidateForDirectionalSearch));
 
             while (queue.Count > 0)
             {
                 var current = queue.Dequeue();
-                if (current == null || current.Bounds.IsEmpty)
-                    continue;
 
                 foreach (var candidate in visibleEntities)
                 {
@@ -1484,93 +2290,214 @@ namespace FluxCAD.BricsCAD.Plugin26
                 }
             }
 
-            profile.ConnectedBoundaryEntities.Clear();
+            profile.SideBoundaryEntities.Clear();
+            profile.ReachableGraphEntities.Clear();
+            profile.CornerBoundaryEntities.Clear();
+            profile.InternalFeatureEntities.Clear();
 
             foreach (var e in visibleEntities)
             {
-                if (e == null)
+                if (e == null || e.Bounds.IsEmpty)
                     continue;
-
-                if (!accepted.Contains(e.Handle))
-                    continue;
-
-                profile.ConnectedBoundaryEntities.Add(e);
 
                 var hit = profile.Hits.FirstOrDefault(x => x.Entity.Handle == e.Handle);
-                if (hit != null)
+
+                if (accepted.Contains(e.Handle))
                 {
-                    hit.IsConnectedToSeed = true;
+                    profile.SideBoundaryEntities.Add(e);
+                    profile.ReachableGraphEntities.Add(e);
 
-                    if (hit.Role != DirectionalEdgeEntityRole.OuterMostBoundary)
-                        hit.Role = DirectionalEdgeEntityRole.ConnectedBoundary;
+                    if (hit != null)
+                    {
+                        hit.IsConnectedToSeed = true;
 
-                    hit.Reason = "Connected from outer seed";
+                        if (hit.Role != DirectionalEdgeEntityRole.OuterMostBoundary)
+                            hit.Role = DirectionalEdgeEntityRole.SideBoundaryChain;
+
+                        hit.Reason = "Side boundary chain from outer seed";
+                    }
+
+                    continue;
+                }
+
+                if (IsInternalOrCornerFeatureCandidate(e))
+                {
+                    if (e.Kind == SheetEntityKind.Arc)
+                    {
+                        profile.CornerBoundaryEntities.Add(e);
+
+                        if (hit != null)
+                        {
+                            hit.Role = DirectionalEdgeEntityRole.CornerBoundary;
+                            hit.Reason = "Arc separated from side boundary";
+                        }
+                    }
+                    else
+                    {
+                        profile.InternalFeatureEntities.Add(e);
+
+                        if (hit != null)
+                        {
+                            hit.Role = DirectionalEdgeEntityRole.InternalFeature;
+                            hit.Reason = "Internal feature separated from side boundary";
+                        }
+                    }
                 }
             }
 
-            foreach (var hit in profile.Hits)
-            {
-                if (accepted.Contains(hit.Entity.Handle))
-                    continue;
-
-                if (hit.Role == DirectionalEdgeEntityRole.Unknown)
-                    hit.Role = DirectionalEdgeEntityRole.DisconnectedNoise;
-
-                profile.DisconnectedEntities.Add(hit.Entity);
-            }
-
-            DetectSimpleProtrusionCandidates(profile, tolerance);
-
             profile.Reason +=
-                $", Connected={profile.ConnectedBoundaryEntities.Count}, " +
-                $"Disconnected={profile.DisconnectedEntities.Count}, " +
-                $"Protrusion={profile.ProtrusionEntities.Count}";
+                $", SideBoundary={profile.SideBoundaryEntities.Count}, " +
+                $"InternalFeature={profile.InternalFeatureEntities.Count}, " +
+                $"Corner={profile.CornerBoundaryEntities.Count}";
         }
 
+
+
+//         private static void ExpandConnectedBoundaryFromOuterSeeds_old2(
+//     DirectionalEdgeProfile profile,
+//     IReadOnlyList<SheetEntity> visibleEntities,
+//     double tolerance)
+//         {
+//             if (profile.OuterMostEntities.Count == 0)
+//                 return;
+// 
+//             var accepted = new HashSet<string>(
+//                 profile.OuterMostEntities
+//                     .Where(x => x != null)
+//                     .Select(x => x.Handle));
+// 
+//             var queue = new Queue<SheetEntity>(profile.OuterMostEntities);
+// 
+//             while (queue.Count > 0)
+//             {
+//                 var current = queue.Dequeue();
+//                 if (current == null || current.Bounds.IsEmpty)
+//                     continue;
+// 
+//                 foreach (var candidate in visibleEntities)
+//                 {
+//                     if (candidate == null || candidate.Bounds.IsEmpty)
+//                         continue;
+// 
+//                     if (accepted.Contains(candidate.Handle))
+//                         continue;
+// 
+//                     if (!IsBoundaryConnectable(profile, current, candidate, tolerance))
+//                         continue;
+// 
+//                     accepted.Add(candidate.Handle);
+//                     queue.Enqueue(candidate);
+//                 }
+//             }
+// 
+//             profile.ConnectedBoundaryEntities.Clear();
+// 
+//             foreach (var e in visibleEntities)
+//             {
+//                 if (e == null)
+//                     continue;
+// 
+//                 if (!accepted.Contains(e.Handle))
+//                     continue;
+// 
+//                 profile.ConnectedBoundaryEntities.Add(e);
+// 
+//                 var hit = profile.Hits.FirstOrDefault(x => x.Entity.Handle == e.Handle);
+//                 if (hit != null)
+//                 {
+//                     hit.IsConnectedToSeed = true;
+// 
+//                     if (hit.Role != DirectionalEdgeEntityRole.OuterMostBoundary)
+//                         hit.Role = DirectionalEdgeEntityRole.ConnectedBoundary;
+// 
+//                     hit.Reason = "Connected from outer seed";
+//                 }
+//             }
+// 
+//             foreach (var hit in profile.Hits)
+//             {
+//                 if (accepted.Contains(hit.Entity.Handle))
+//                     continue;
+// 
+//                 if (hit.Role == DirectionalEdgeEntityRole.Unknown)
+//                     hit.Role = DirectionalEdgeEntityRole.DisconnectedNoise;
+// 
+//                 profile.DisconnectedEntities.Add(hit.Entity);
+//             }
+// 
+//             DetectSimpleProtrusionCandidates(profile, tolerance);
+// 
+//             profile.Reason +=
+//                 $", Connected={profile.ConnectedBoundaryEntities.Count}, " +
+//                 $"Disconnected={profile.DisconnectedEntities.Count}, " +
+//                 $"Protrusion={profile.ProtrusionEntities.Count}";
+//         }
+
         private static short ResolveDirectionalEdgeDebugColor(
-    EdgeSide side,
-    DirectionalEdgeEntityRole role)
+     EdgeSide side,
+     DirectionalEdgeEntityRole role)
         {
-            if (role == DirectionalEdgeEntityRole.ProtrusionBoundary)
-                return 1; // red
-
-            if (role == DirectionalEdgeEntityRole.DisconnectedNoise)
-                return 8; // gray
-
-            if (role == DirectionalEdgeEntityRole.OuterMostBoundary)
+            return role switch
             {
-                return side switch
+                // 방향별 최외곽 seed
+                DirectionalEdgeEntityRole.OuterMostBoundary => side switch
                 {
                     EdgeSide.Top => 3,      // green
                     EdgeSide.Bottom => 5,   // blue
                     EdgeSide.Left => 2,     // yellow
                     EdgeSide.Right => 6,    // magenta
-                    _ => 7
-                };
-            }
+                    _ => 7                  // white
+                },
 
-            if (role == DirectionalEdgeEntityRole.ConnectedBoundary)
-                return 4; // cyan
+                // 실제 외곽 side chain
+                DirectionalEdgeEntityRole.SideBoundaryChain => 4,      // cyan
 
-            if (role == DirectionalEdgeEntityRole.NearFeature)
-                return 30; // orange-like
+                // 그래프상 도달 가능하지만 외곽 확정 아님
+                DirectionalEdgeEntityRole.ReachableGraph => 140,       // dark green-ish
 
-            return 7;
+                // 외곽 corner / round / fillet 후보
+                DirectionalEdgeEntityRole.CornerBoundary => 1,         // red
+
+                // 내부 구멍, 슬롯, 내부 절단 feature
+                DirectionalEdgeEntityRole.InternalFeature => 30,       // orange-like
+
+                // 돌출부
+                DirectionalEdgeEntityRole.ProtrusionBoundary => 10,    // red/orange
+
+                // 오목부
+                DirectionalEdgeEntityRole.RecessBoundary => 160,       // blue-ish
+
+                // 외곽 근처 feature
+                DirectionalEdgeEntityRole.NearFeature => 40,           // orange/yellow
+
+                // 중심선/숨은선/두께선 등 참고선
+                DirectionalEdgeEntityRole.ReferenceHint => 8,          // gray
+
+                // 연결되지 않은 노이즈
+                DirectionalEdgeEntityRole.DisconnectedNoise => 9,      // light gray
+
+                _ => 7
+            };
         }
 
         private static void LogDirectionalEdgeProfile(
-            Bricscad.EditorInput.Editor ed,
-            DirectionalEdgeProfile profile)
+    Bricscad.EditorInput.Editor ed,
+    DirectionalEdgeProfile profile)
         {
             if (ed == null || profile == null)
                 return;
 
             ed.WriteMessage(
                 $"\n[DIR-EDGE] View={profile.ViewIslandId}, Side={profile.Side}, " +
-                $"Hits={profile.Hits.Count}, OuterMost={profile.OuterMostEntities.Count}, " +
-                $"Connected={profile.ConnectedBoundaryEntities.Count}, " +
+                $"Hits={profile.Hits.Count}, " +
+                $"OuterMost={profile.OuterMostEntities.Count}, " +
+                $"SideBoundary={profile.SideBoundaryEntities.Count}, " +
+                $"ReachableGraph={profile.ReachableGraphEntities.Count}, " +
+                $"InternalFeature={profile.InternalFeatureEntities.Count}, " +
+                $"Corner={profile.CornerBoundaryEntities.Count}, " +
                 $"Protrusion={profile.ProtrusionEntities.Count}, " +
                 $"NearFeature={profile.NearFeatureEntities.Count}, " +
+                $"ReferenceHint={profile.ReferenceHintEntities.Count}, " +
                 $"Disconnected={profile.DisconnectedEntities.Count}, " +
                 $"Complexity={profile.Complexity}");
 
@@ -1589,6 +2516,33 @@ namespace FluxCAD.BricsCAD.Plugin26
             }
         }
 
+        private static bool IsDirectionalSideCompatible(
+    SheetEntity e,
+    EdgeSide side)
+        {
+            if (e == null || e.Bounds.IsEmpty)
+                return false;
+
+            if (e.Kind != SheetEntityKind.Line)
+                return true;
+
+            double w = e.Bounds.Width;
+            double h = e.Bounds.Height;
+
+            double eps = Math.Max(1e-6, Math.Max(w, h) * 0.01);
+
+            bool horizontal = w > h * 5.0 || h <= eps;
+            bool vertical = h > w * 5.0 || w <= eps;
+
+            return side switch
+            {
+                EdgeSide.Top => horizontal,
+                EdgeSide.Bottom => horizontal,
+                EdgeSide.Left => vertical,
+                EdgeSide.Right => vertical,
+                _ => true
+            };
+        }
 
         private static void DrawDirectionalAccessBandDebug(
     Database db,
@@ -1755,87 +2709,90 @@ namespace FluxCAD.BricsCAD.Plugin26
 
 
 
-        private static void ExpandConnectedBoundaryFromOuterSeeds_old(
-    DirectionalEdgeProfile profile,
-    IReadOnlyList<SheetEntity> visibleEntities,
-    double tolerance)
-        {
-            if (profile.OuterMostEntities.Count == 0)
-                return;
+//         private static void ExpandConnectedBoundaryFromOuterSeeds_old(
+//     DirectionalEdgeProfile profile,
+//     IReadOnlyList<SheetEntity> visibleEntities,
+//     double tolerance)
+//         {
+//             if (profile.OuterMostEntities.Count == 0)
+//                 return;
+// 
+//             var accepted = new HashSet<string>(
+//                 profile.OuterMostEntities
+//                     .Where(x => x != null)
+//                     .Select(x => x.Handle));
+// 
+//             var queue = new Queue<SheetEntity>(profile.OuterMostEntities);
+// 
+//             while (queue.Count > 0)
+//             {
+//                 var current = queue.Dequeue();
+//                 if (current == null || current.Bounds.IsEmpty)
+//                     continue;
+// 
+//                 foreach (var candidate in visibleEntities)
+//                 {
+//                     if (candidate == null || candidate.Bounds.IsEmpty)
+//                         continue;
+// 
+//                     if (accepted.Contains(candidate.Handle))
+//                         continue;
+// 
+//                     if (!IsBoundaryConnectable(profile, current, candidate, tolerance))
+//                         continue;
+// 
+//                     accepted.Add(candidate.Handle);
+//                     queue.Enqueue(candidate);
+//                 }
+//             }
+// 
+//             profile.ConnectedBoundaryEntities.Clear();
+// 
+//             foreach (var e in visibleEntities)
+//             {
+//                 if (e == null)
+//                     continue;
+// 
+//                 if (!accepted.Contains(e.Handle))
+//                     continue;
+// 
+//                 profile.ConnectedBoundaryEntities.Add(e);
+// 
+//                 var hit = profile.Hits.FirstOrDefault(x => x.Entity.Handle == e.Handle);
+//                 if (hit != null)
+//                 {
+//                     hit.IsConnectedToSeed = true;
+// 
+//                     if (hit.Role != DirectionalEdgeEntityRole.OuterMostBoundary)
+//                         hit.Role = DirectionalEdgeEntityRole.ConnectedBoundary;
+// 
+//                     hit.Reason = "Connected from outer seed";
+//                 }
+//             }
+// 
+//             foreach (var hit in profile.Hits)
+//             {
+//                 if (accepted.Contains(hit.Entity.Handle))
+//                     continue;
+// 
+//                 if (hit.Role == DirectionalEdgeEntityRole.Unknown)
+//                     hit.Role = DirectionalEdgeEntityRole.DisconnectedNoise;
+// 
+//                 profile.DisconnectedEntities.Add(hit.Entity);
+//             }
+// 
+//             DetectSimpleProtrusionCandidates(profile, tolerance);
+// 
+//             profile.Reason +=
+//                 $"SideBoundary={profile.SideBoundaryEntities.Count}, " +
+//                 $"ReachableGraph={profile.ReachableGraphEntities.Count}, " +
+//                 $"InternalFeature={profile.InternalFeatureEntities.Count}, " +
+//                 $"Corner={profile.CornerBoundaryEntities.Count}, " +
+//                 $"Disconnected={profile.DisconnectedEntities.Count}, " +
+//                 $"Protrusion={profile.ProtrusionEntities.Count}";
+//         }
 
-            var accepted = new HashSet<string>(
-                profile.OuterMostEntities
-                    .Where(x => x != null)
-                    .Select(x => x.Handle));
-
-            var queue = new Queue<SheetEntity>(profile.OuterMostEntities);
-
-            while (queue.Count > 0)
-            {
-                var current = queue.Dequeue();
-                if (current == null || current.Bounds.IsEmpty)
-                    continue;
-
-                foreach (var candidate in visibleEntities)
-                {
-                    if (candidate == null || candidate.Bounds.IsEmpty)
-                        continue;
-
-                    if (accepted.Contains(candidate.Handle))
-                        continue;
-
-                    if (!IsBoundaryConnectable(profile, current, candidate, tolerance))
-                        continue;
-
-                    accepted.Add(candidate.Handle);
-                    queue.Enqueue(candidate);
-                }
-            }
-
-            profile.ConnectedBoundaryEntities.Clear();
-
-            foreach (var e in visibleEntities)
-            {
-                if (e == null)
-                    continue;
-
-                if (!accepted.Contains(e.Handle))
-                    continue;
-
-                profile.ConnectedBoundaryEntities.Add(e);
-
-                var hit = profile.Hits.FirstOrDefault(x => x.Entity.Handle == e.Handle);
-                if (hit != null)
-                {
-                    hit.IsConnectedToSeed = true;
-
-                    if (hit.Role != DirectionalEdgeEntityRole.OuterMostBoundary)
-                        hit.Role = DirectionalEdgeEntityRole.ConnectedBoundary;
-
-                    hit.Reason = "Connected from outer seed";
-                }
-            }
-
-            foreach (var hit in profile.Hits)
-            {
-                if (accepted.Contains(hit.Entity.Handle))
-                    continue;
-
-                if (hit.Role == DirectionalEdgeEntityRole.Unknown)
-                    hit.Role = DirectionalEdgeEntityRole.DisconnectedNoise;
-
-                profile.DisconnectedEntities.Add(hit.Entity);
-            }
-
-            DetectSimpleProtrusionCandidates(profile, tolerance);
-
-            profile.Reason +=
-                $", Connected={profile.ConnectedBoundaryEntities.Count}, " +
-                $"Disconnected={profile.DisconnectedEntities.Count}, " +
-                $"Protrusion={profile.ProtrusionEntities.Count}";
-        }
-
-        private static bool IsBoundaryConnectable(
+        private static bool IsBoundaryConnectable_old(
     DirectionalEdgeProfile profile,
     SheetEntity a,
     SheetEntity b,
@@ -1946,10 +2903,10 @@ namespace FluxCAD.BricsCAD.Plugin26
     DirectionalEdgeProfile profile,
     double tolerance)
         {
-            if (profile.ConnectedBoundaryEntities.Count == 0)
+            if (profile.SideBoundaryEntities.Count == 0)
                 return;
 
-            foreach (var e in profile.ConnectedBoundaryEntities)
+            foreach (var e in profile.SideBoundaryEntities)
             {
                 double sideCoord = GetEntitySideCoordinate(e.Bounds, profile.Side);
                 double dist = Math.Abs(profile.OuterCoordinate - sideCoord);
@@ -1974,7 +2931,7 @@ namespace FluxCAD.BricsCAD.Plugin26
                 {
                     hit.Role = DirectionalEdgeEntityRole.ProtrusionBoundary;
                     hit.IsLikelyProtrusionPart = true;
-                    hit.Reason = "Connected outer extreme and small local boundary";
+                    hit.Reason = "Side boundary outer extreme and small local boundary";
                 }
             }
 
@@ -2076,17 +3033,31 @@ namespace FluxCAD.BricsCAD.Plugin26
             if (!IsCurveLikeEntity(ent))
                 return false;
 
-            if (IsCenterLine(ent))
+            // 핵심: linetype만 보지 말고 layer + linetype을 함께 검사
+            if (IsHiddenOrCenterCadEntity(ent))
                 return false;
-
-            if (IsHiddenLine(ent))
-                return false;
-
-            //if (!IsContinuousLike(ent))
-            //    return false;
 
             return true;
         }
+
+        private static bool LooksLikeHiddenCad(string value)
+        {
+            if (string.IsNullOrWhiteSpace(value))
+                return false;
+
+            return value.Contains("HIDDEN")
+                || value.Contains("HID")
+                || value.Contains("HL")
+                || value.Contains("DASH")
+                || value.Contains("DASHED")
+                || value.Contains("DOT")
+                || value.Contains("DOTTED")
+                || value.Contains("PHANTOM")
+                || value.Contains("숨은")
+                || value.Contains("은선");
+        }
+
+
 
         private static bool IsCenterLine(Entity ent)
         {
@@ -2579,47 +3550,8 @@ namespace FluxCAD.BricsCAD.Plugin26
                             $"HintScore={candidate.VisualHintScore}, Noise={candidate.IsLikelySemanticNoise}, " +
                             $"Reason={candidate.RoleReason}");
 
-                        if (!candidate.IsVisible)
-                        {
-                            ed.WriteMessage($"\n[SNAPSHOT-COPY-REJECT] H={candidate.Handle}, Why=NotVisible");
+                        if (!ShouldCopyForSnapshotWorkspace(candidate, sheetBounds, ed))
                             continue;
-                        }
-
-                        if (!candidate.IsGeometryLike)
-                        {
-                            ed.WriteMessage($"\n[SNAPSHOT-COPY-REJECT] H={candidate.Handle}, Why=NotGeometryLike");
-                            continue;
-                        }
-
-                        if (candidate.IsTextLike || candidate.IsDimensionLike)
-                        {
-                            ed.WriteMessage($"\n[SNAPSHOT-COPY-REJECT] H={candidate.Handle}, Why=TextOrDimension");
-                            continue;
-                        }
-
-                        if (candidate.IsLikelySemanticNoise)
-                        {
-                            ed.WriteMessage($"\n[SNAPSHOT-COPY-REJECT] H={candidate.Handle}, Why=SemanticNoise");
-                            continue;
-                        }
-
-                        if (candidate.IsTableLikeLayer)
-                        {
-                            ed.WriteMessage($"\n[SNAPSHOT-COPY-REJECT] H={candidate.Handle}, Why=TableLikeLayer");
-                            continue;
-                        }
-
-                        if (candidate.IsTitleLikeLayer)
-                        {
-                            ed.WriteMessage($"\n[SNAPSHOT-COPY-REJECT] H={candidate.Handle}, Why=TitleLikeLayer");
-                            continue;
-                        }
-
-                        if (IsSemanticFrameLikeEntity(candidate, sheetBounds))
-                        {
-                            ed.WriteMessage($"\n[SNAPSHOT-COPY-REJECT] H={candidate.Handle}, Why=SemanticFrameLike");
-                            continue;
-                        }
 
                         ed.WriteMessage($"\n[SNAPSHOT-COPY-KEEP] H={candidate.Handle}");
                         filteredSemanticEntities.Add(candidate);
@@ -3873,47 +4805,8 @@ namespace FluxCAD.BricsCAD.Plugin26
                             $"HintScore={candidate.VisualHintScore}, Noise={candidate.IsLikelySemanticNoise}, " +
                             $"Reason={candidate.RoleReason}");
 
-                        if (!candidate.IsVisible)
-                        {
-                            ed.WriteMessage($"\n[SNAPSHOT-COPY-REJECT] H={candidate.Handle}, Why=NotVisible");
+                        if (!ShouldCopyForSnapshotWorkspace(candidate, sheetBounds, ed))
                             continue;
-                        }
-
-                        if (!candidate.IsGeometryLike)
-                        {
-                            ed.WriteMessage($"\n[SNAPSHOT-COPY-REJECT] H={candidate.Handle}, Why=NotGeometryLike");
-                            continue;
-                        }
-
-                        if (candidate.IsTextLike || candidate.IsDimensionLike)
-                        {
-                            ed.WriteMessage($"\n[SNAPSHOT-COPY-REJECT] H={candidate.Handle}, Why=TextOrDimension");
-                            continue;
-                        }
-
-                        if (candidate.IsLikelySemanticNoise)
-                        {
-                            ed.WriteMessage($"\n[SNAPSHOT-COPY-REJECT] H={candidate.Handle}, Why=SemanticNoise");
-                            continue;
-                        }
-
-                        if (candidate.IsTableLikeLayer)
-                        {
-                            ed.WriteMessage($"\n[SNAPSHOT-COPY-REJECT] H={candidate.Handle}, Why=TableLikeLayer");
-                            continue;
-                        }
-
-                        if (candidate.IsTitleLikeLayer)
-                        {
-                            ed.WriteMessage($"\n[SNAPSHOT-COPY-REJECT] H={candidate.Handle}, Why=TitleLikeLayer");
-                            continue;
-                        }
-
-                        if (IsSemanticFrameLikeEntity(candidate, sheetBounds))
-                        {
-                            ed.WriteMessage($"\n[SNAPSHOT-COPY-REJECT] H={candidate.Handle}, Why=SemanticFrameLike");
-                            continue;
-                        }
 
                         ed.WriteMessage($"\n[SNAPSHOT-COPY-KEEP] H={candidate.Handle}");
                         filteredSemanticEntities.Add(candidate);
@@ -12046,6 +12939,66 @@ namespace FluxCAD.BricsCAD.Plugin26
             return (value ?? string.Empty).Trim().ToUpperInvariant();
         }
 
+
+        private static bool ShouldCopyForSnapshotWorkspace(
+    SheetEntity candidate,
+    Bounds2D sheetBounds,
+    Bricscad.EditorInput.Editor ed)
+        {
+            if (candidate == null)
+                return false;
+
+            if (!candidate.IsVisible)
+            {
+                ed.WriteMessage($"\n[SNAPSHOT-COPY-REJECT] H={candidate.Handle}, Why=NotVisible");
+                return false;
+            }
+
+            // 중요:
+            // ReferenceGeometry / Hidden / Center는 여기서 제거하지 않는다.
+            // 이 단계는 FLUX_VIEW_COPY_OUT 보존 단계다.
+
+            if (!candidate.IsGeometryLike)
+            {
+                ed.WriteMessage($"\n[SNAPSHOT-COPY-REJECT] H={candidate.Handle}, Why=NotGeometryLike");
+                return false;
+            }
+
+            if (candidate.IsTextLike || candidate.IsDimensionLike)
+            {
+                ed.WriteMessage($"\n[SNAPSHOT-COPY-REJECT] H={candidate.Handle}, Why=TextOrDimension");
+                return false;
+            }
+
+            if (candidate.IsLikelySemanticNoise)
+            {
+                ed.WriteMessage($"\n[SNAPSHOT-COPY-REJECT] H={candidate.Handle}, Why=SemanticNoise");
+                return false;
+            }
+
+            if (candidate.IsTableLikeLayer)
+            {
+                ed.WriteMessage($"\n[SNAPSHOT-COPY-REJECT] H={candidate.Handle}, Why=TableLikeLayer");
+                return false;
+            }
+
+            if (candidate.IsTitleLikeLayer)
+            {
+                ed.WriteMessage($"\n[SNAPSHOT-COPY-REJECT] H={candidate.Handle}, Why=TitleLikeLayer");
+                return false;
+            }
+
+            if (IsSemanticFrameLikeEntity(candidate, sheetBounds))
+            {
+                ed.WriteMessage($"\n[SNAPSHOT-COPY-REJECT] H={candidate.Handle}, Why=SemanticFrameLike");
+                return false;
+            }
+
+            return true;
+        }
+
+
+
         private static bool LooksLikeCenterCad(string value)
         {
             if (string.IsNullOrWhiteSpace(value))
@@ -12053,19 +13006,30 @@ namespace FluxCAD.BricsCAD.Plugin26
 
             return value.Contains("CENTER")
                 || value.Contains("CENTRE")
+                || value.Contains("CENTERLINE")
                 || value.Contains("CNTR")
-                || value.Contains("CTR");
+                || value.Contains("CTR")
+                || value == "CL"
+                || value.Contains("중심");
         }
 
-        private static bool LooksLikeHiddenCad(string value)
+        private static bool LooksLikeHiddenCad_old(string value)
         {
             if (string.IsNullOrWhiteSpace(value))
                 return false;
 
+            value = value.Trim().ToUpperInvariant();
+
             return value.Contains("HIDDEN")
                 || value.Contains("HID")
+                || value.Contains("HL")
+                || value.Contains("DASH")
+                || value.Contains("DASHED")
                 || value.Contains("DOT")
-                || value.Contains("PHANTOM");
+                || value.Contains("DOTTED")
+                || value.Contains("PHANTOM")
+                || value.Contains("숨은")
+                || value.Contains("은선");
         }
 
         private static void ExportEntitiesToNewDwg(

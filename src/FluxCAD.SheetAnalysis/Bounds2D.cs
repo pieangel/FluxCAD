@@ -4,6 +4,7 @@ using System.Linq;
 using System.Text;
 using System.Threading.Tasks;
 
+
 namespace FluxCAD.SheetAnalysis
 {
     public readonly record struct Bounds2D(double MinX, double MinY, double MaxX, double MaxY)
@@ -21,6 +22,15 @@ namespace FluxCAD.SheetAnalysis
 
         public static Bounds2D Empty => new(0, 0, 0, 0);
 
-        public bool IsEmpty => Width <= 0 || Height <= 0;
+        public bool IsEmpty => Width < 0 || Height < 0;
+
+        public bool IsZeroArea => Width <= 0 || Height <= 0;
+
+        public static Bounds2D FromPoints(Point2D a, Point2D b)
+            => new(
+                Math.Min(a.X, b.X),
+                Math.Min(a.Y, b.Y),
+                Math.Max(a.X, b.X),
+                Math.Max(a.Y, b.Y));
     }
 }

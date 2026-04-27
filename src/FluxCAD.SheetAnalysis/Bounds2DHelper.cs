@@ -16,9 +16,26 @@ namespace FluxCAD.SheetAnalysis
             return new Bounds2D(minX, minY, maxX, maxY);
         }
 
+//         public static bool IsEmpty(Bounds2D bounds)
+//         {
+//             bounds = Normalize(bounds);
+//             return bounds.Width <= 0 || bounds.Height <= 0;
+//         }
+
         public static bool IsEmpty(Bounds2D bounds)
         {
             bounds = Normalize(bounds);
+
+            // 선분 Bounds는 Empty가 아니다.
+            // Min/Max가 뒤집힌 비정상 Bounds만 Empty로 본다.
+            return bounds.Width < 0 || bounds.Height < 0;
+        }
+
+        public static bool IsZeroArea(Bounds2D bounds)
+        {
+            bounds = Normalize(bounds);
+
+            // 면적이 필요한 곳에서만 사용
             return bounds.Width <= 0 || bounds.Height <= 0;
         }
 
@@ -54,7 +71,10 @@ namespace FluxCAD.SheetAnalysis
         {
             ArgumentNullException.ThrowIfNull(entities);
 
-            var list = entities.ToList();
+            var list = entities
+                .Where(x => x != null && !IsEmpty(x.Bounds))
+                .ToList();
+
             if (list.Count == 0)
                 return new Bounds2D(0, 0, 0, 0);
 
