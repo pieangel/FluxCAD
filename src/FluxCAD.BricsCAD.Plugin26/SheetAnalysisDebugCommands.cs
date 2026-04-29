@@ -954,6 +954,8 @@ namespace FluxCAD.BricsCAD.Plugin26
             public bool HasRecess => RecessEntities.Count > 0;
 
             public string Reason { get; set; } = string.Empty;
+
+            public OrderedEdgeChain? OrderedChain { get; set; }
         }
 
 
@@ -978,6 +980,195 @@ namespace FluxCAD.BricsCAD.Plugin26
                 Profiles.FirstOrDefault(x => x.Side == EdgeSide.Right);
         }
 
+
+
+        [CommandMethod("FLUX_DEBUG_DIRECTIONAL_EDGE_ANALYSIS")]
+        public static void FluxDebugDirectionalEdgeAnalysis()
+        {
+            var doc = Bricscad.ApplicationServices.Application.DocumentManager.MdiActiveDocument;
+            var db = doc.Database;
+            var ed = doc.Editor;
+
+            using (doc.LockDocument())
+            using (var tr = db.TransactionManager.StartTransaction())
+            {
+                var msId = SymbolUtilityServices.GetBlockModelSpaceId(db);
+                var ms = (BlockTableRecord)tr.GetObject(msId, OpenMode.ForWrite);
+
+                var groups = CollectVisibleOutlineWorkspaceSheetEntities(tr, ms);
+
+                if (groups.Count == 0)
+                {
+                    ed.WriteMessage("\n[DIR-ANALYSIS] No visible outline workspace entities found.");
+                    return;
+                }
+
+                ed.WriteMessage($"\n[DIR-ANALYSIS] Start. ViewCount={groups.Count}");
+
+                foreach (var pair in groups.OrderBy(x => x.Key))
+                {
+                    int islandId = pair.Key;
+                    var visibleEntities = pair.Value;
+
+                    var viewBounds = Bounds2DHelper.FromEntities(visibleEntities);
+
+                    var edgeSet = BuildDirectionalEdgeProfiles(
+                        islandId,
+                        viewBounds,
+                        visibleEntities);
+
+                    LogDirectionalEdgeAnalysis(ed, edgeSet);
+
+                    DrawDirectionalEdgeProfilesDebug(
+                        db,
+                        tr,
+                        ms,
+                        ed,
+                        edgeSet);
+                }
+
+                ed.WriteMessage($"\n[DIR-ANALYSIS] Done. ViewCount={groups.Count}");
+
+                tr.Commit();
+            }
+        }
+
+        private static void LogDirectionalEdgeAnalysis(
+    Bricscad.EditorInput.Editor ed,
+    ViewDirectionalEdgeProfileSet edgeSet)
+        {
+            if (ed == null || edgeSet == null)
+                return;
+
+            ed.WriteMessage(
+                $"\n[DIR-ANALYSIS:VIEW] Island={edgeSet.ViewIslandId}, " +
+                $"Bounds=({edgeSet.ViewBounds.MinX:F2},{edgeSet.ViewBounds.MinY:F2})-" +
+                $"({edgeSet.ViewBounds.MaxX:F2},{edgeSet.ViewBounds.MaxY:F2})");
+
+            foreach (var profile in edgeSet.Profiles)
+            {
+                ed.WriteMessage(
+                    $"\n  [SIDE] {profile.Side}, " +
+                    $"Complexity={profile.Complexity}, " +
+                    $"OuterMost={profile.OuterMostEntities.Count}, " +
+                    $"SideBoundary={profile.SideBoundaryEntities.Count}, " +
+                    $"Corner={profile.CornerBoundaryEntities.Count}, " +
+                    $"InternalFeature={profile.InternalFeatureEntities.Count}, " +
+                    $"NearFeature={profile.NearFeatureEntities.Count}, " +
+                    $"ReferenceHint={profile.ReferenceHintEntities.Count}, " +
+                    $"Disconnected={profile.DisconnectedEntities.Count}");
+
+                ed.WriteMessage(
+                    $"\n    Reason={profile.Reason}");
+
+                foreach (var e in profile.SideBoundaryEntities)
+                {
+                    ed.WriteMessage(
+                        $"\n    [CHAIN-CANDIDATE] H={e.Handle}, " +
+                        $"Kind={e.Kind}, " +
+                        $"Layer={e.Layer}, " +
+                        $"Start={FormatPoint2D(e.StartPoint)}, " +
+                        $"End={FormatPoint2D(e.EndPoint)}");
+                }
+
+                foreach (var e in profile.CornerBoundaryEntities)
+                {
+                    ed.WriteMessage(
+                        $"\n    [CORNER] H={e.Handle}, " +
+                        $"Kind={e.Kind}, " +
+                        $"Start={FormatPoint2D(e.StartPoint)}, " +
+                        $"End={FormatPoint2D(e.EndPoint)}");
+                }
+
+                foreach (var e in profile.InternalFeatureEntities)
+                {
+                    ed.WriteMessage(
+                        $"\n    [INTERNAL] H={e.Handle}, Kind={e.Kind}, Layer={e.Layer}");
+                }
+            }
+        }
+
+        private static string FormatPoint2D(Point2D? p)
+        {
+            if (!p.HasValue)
+                return "null";
+
+            return $"({p.Value.X:F3},{p.Value.Y:F3})";
+        }
+
+        private static bool IsOuterContourCandidateForDirectionalAnalysis(
+    SheetEntity e,
+    Bounds2D viewBounds,
+    IReadOnlyList<SheetEntity> visibleEntities,
+    double tolerance)
+        {
+            if (e == null || e.Bounds.IsEmpty)
+                return false;
+
+            if (e.IsCenterLine || e.IsHiddenLine)
+                return false;
+
+            if (e.Role == SheetEntityRole.ReferenceGeometry)
+                return false;
+
+            if (e.Kind == SheetEntityKind.Circle)
+            {
+                return IsCircleLikelyOuterContour(
+                    e,
+                    viewBounds,
+                    visibleEntities,
+                    tolerance);
+            }
+
+            return
+                e.Kind == SheetEntityKind.Line ||
+                e.Kind == SheetEntityKind.Arc ||
+                e.Kind == SheetEntityKind.Polyline;
+        }
+
+        private static bool IsCircleLikelyOuterContour(
+            SheetEntity e,
+            Bounds2D viewBounds,
+            IReadOnlyList<SheetEntity> visibleEntities,
+            double tolerance)
+        {
+            if (e == null || e.Kind != SheetEntityKind.Circle)
+                return false;
+
+            if (e.Bounds.IsEmpty || viewBounds.IsEmpty)
+                return false;
+
+            double viewW = viewBounds.Width;
+            double viewH = viewBounds.Height;
+
+            if (viewW <= tolerance || viewH <= tolerance)
+                return false;
+
+            double widthRatio = e.Bounds.Width / viewW;
+            double heightRatio = e.Bounds.Height / viewH;
+            double areaRatio = e.Bounds.Area / viewBounds.Area;
+
+            bool touchesOuter =
+                Math.Abs(e.Bounds.MinX - viewBounds.MinX) <= tolerance ||
+                Math.Abs(e.Bounds.MaxX - viewBounds.MaxX) <= tolerance ||
+                Math.Abs(e.Bounds.MinY - viewBounds.MinY) <= tolerance ||
+                Math.Abs(e.Bounds.MaxY - viewBounds.MaxY) <= tolerance;
+
+            bool largeEnough =
+                widthRatio >= 0.70 ||
+                heightRatio >= 0.70 ||
+                areaRatio >= 0.45;
+
+            bool hasOtherOuterLike =
+                visibleEntities.Any(x =>
+                    x != null &&
+                    x.Handle != e.Handle &&
+                    (x.Kind == SheetEntityKind.Line ||
+                     x.Kind == SheetEntityKind.Arc ||
+                     x.Kind == SheetEntityKind.Polyline));
+
+            return touchesOuter && largeEnough && !hasOtherOuterLike;
+        }
 
 
         [CommandMethod("FLUX_DEBUG_DIRECTIONAL_EDGE_PROFILES")]
@@ -1829,17 +2020,27 @@ namespace FluxCAD.BricsCAD.Plugin26
                 ViewBounds = viewBounds
             };
 
-            result.Profiles.Add(BuildDirectionalEdgeProfile(
-                viewIslandId, viewBounds, visibleEntities, EdgeSide.Top));
+            double tolerance = ComputeConnectionTolerance(viewBounds);
+
+            var outerCandidates = visibleEntities
+                .Where(e => IsOuterContourCandidateForDirectionalAnalysis(
+                    e,
+                    viewBounds,
+                    visibleEntities,
+                    tolerance))
+                .ToList();
 
             result.Profiles.Add(BuildDirectionalEdgeProfile(
-                viewIslandId, viewBounds, visibleEntities, EdgeSide.Bottom));
+                viewIslandId, viewBounds, outerCandidates, EdgeSide.Top));
 
             result.Profiles.Add(BuildDirectionalEdgeProfile(
-                viewIslandId, viewBounds, visibleEntities, EdgeSide.Left));
+                viewIslandId, viewBounds, outerCandidates, EdgeSide.Bottom));
 
             result.Profiles.Add(BuildDirectionalEdgeProfile(
-                viewIslandId, viewBounds, visibleEntities, EdgeSide.Right));
+                viewIslandId, viewBounds, outerCandidates, EdgeSide.Left));
+
+            result.Profiles.Add(BuildDirectionalEdgeProfile(
+                viewIslandId, viewBounds, outerCandidates, EdgeSide.Right));
 
             return result;
         }
@@ -1919,9 +2120,26 @@ namespace FluxCAD.BricsCAD.Plugin26
             }
 
             BuildSideBoundaryChainFromOuterSeeds(
-    profile,
-    visibleEntities,
-    tolerance);
+                profile,
+                visibleEntities,
+                tolerance);
+
+            var chainEdges = profile.SideBoundaryEntities
+                .Where(e => IsCompatibleWithSideDirection(e, side, tolerance))
+                .ToList();
+
+            profile.OrderedChain = BuildOrderedEdgeChain(
+                side,
+                chainEdges,
+                tolerance);
+
+            foreach (var e in profile.OrderedChain?.Segments.Select(x => x.Entity)
+                  ?? Enumerable.Empty<SheetEntity>())
+            {
+                ed.WriteMessage(
+                    $"\n    [ORDERED-CHAIN] H={e.Handle}, Kind={e.Kind}, " +
+                    $"Start={FormatPoint2D(e.StartPoint)}, End={FormatPoint2D(e.EndPoint)}");
+            }
 
             ClassifyRemainingDirectionalHits(
                 profile,
@@ -1934,6 +2152,8 @@ namespace FluxCAD.BricsCAD.Plugin26
             profile.Complexity = ResolveDirectionalComplexity(profile);
 
             profile.Reason =
+                $"OrderedChain={profile.OrderedChain?.Segments.Count ?? 0}, " +
+                $"ChainGap={profile.OrderedChain?.HasGap ?? false}, " +
                 $"Side={side}, FirstWave={firstWave.Count}, " +
                 $"SideBoundary={profile.SideBoundaryEntities.Count}, " +
                 $"ReachableGraph={profile.ReachableGraphEntities.Count}, " +
@@ -1944,6 +2164,31 @@ namespace FluxCAD.BricsCAD.Plugin26
                 $"Complexity={profile.Complexity}";
 
             return profile;
+        }
+
+        private static bool IsCompatibleWithSideDirection(
+            SheetEntity e,
+            EdgeSide side,
+            double tolerance)
+        {
+            if (e == null)
+                return false;
+
+            if (!e.StartPoint.HasValue || !e.EndPoint.HasValue)
+                return true; // Arc/Polyline은 다음 단계에서 별도 처리
+
+            double dx = Math.Abs(e.EndPoint.Value.X - e.StartPoint.Value.X);
+            double dy = Math.Abs(e.EndPoint.Value.Y - e.StartPoint.Value.Y);
+
+            bool horizontal = dy <= tolerance;
+            bool vertical = dx <= tolerance;
+
+            return side switch
+            {
+                EdgeSide.Top or EdgeSide.Bottom => horizontal,
+                EdgeSide.Left or EdgeSide.Right => vertical,
+                _ => true
+            };
         }
 
         private static List<SheetEntity> CaptureFirstDirectionalWave(
@@ -2358,6 +2603,199 @@ namespace FluxCAD.BricsCAD.Plugin26
 
             return profile;
         }
+
+
+        private sealed class OrderedEdgeSegment
+        {
+            public SheetEntity Entity { get; init; } = null!;
+            public Point2D Start { get; set; }
+            public Point2D End { get; set; }
+
+            public bool Reversed { get; set; }
+
+            public string Handle => Entity.Handle;
+            public SheetEntityKind Kind => Entity.Kind;
+        }
+
+        private sealed class OrderedEdgeChain
+        {
+            public EdgeSide Side { get; init; }
+            public List<OrderedEdgeSegment> Segments { get; } = new();
+
+            public bool IsClosed { get; set; }
+            public bool HasGap { get; set; }
+            public double TotalGap { get; set; }
+
+            public string Reason { get; set; } = string.Empty;
+        }
+
+
+        private static OrderedEdgeChain BuildOrderedEdgeChain(
+    EdgeSide side,
+    IReadOnlyList<SheetEntity> edges,
+    double tolerance)
+        {
+            var chain = new OrderedEdgeChain
+            {
+                Side = side
+            };
+
+            if (edges == null || edges.Count == 0)
+            {
+                chain.Reason = "No edges";
+                return chain;
+            }
+
+            var segments = edges
+                .Select(TryCreateOrderedEdgeSegment)
+                .Where(x => x != null)
+                .Cast<OrderedEdgeSegment>()
+                .ToList();
+
+            if (segments.Count == 0)
+            {
+                chain.Reason = "No connectable edge segments";
+                return chain;
+            }
+
+            var remaining = new List<OrderedEdgeSegment>(segments);
+
+            var current = PickChainStart(side, remaining);
+            remaining.Remove(current);
+            chain.Segments.Add(current);
+
+            while (remaining.Count > 0)
+            {
+                var tail = chain.Segments[^1].End;
+
+                OrderedEdgeSegment? best = null;
+                bool reverse = false;
+                double bestDist = double.MaxValue;
+
+                foreach (var candidate in remaining)
+                {
+                    double d1 = Bounds2DHelper.Distance(tail, candidate.Start);
+                    double d2 = Bounds2DHelper.Distance(tail, candidate.End);
+
+                    if (d1 < bestDist)
+                    {
+                        bestDist = d1;
+                        best = candidate;
+                        reverse = false;
+                    }
+
+                    if (d2 < bestDist)
+                    {
+                        bestDist = d2;
+                        best = candidate;
+                        reverse = true;
+                    }
+                }
+
+                if (best == null || bestDist > tolerance)
+                {
+                    chain.HasGap = true;
+                    chain.TotalGap += bestDist;
+                    chain.Reason = $"Gap detected. Gap={bestDist:F3}";
+                    break;
+                }
+
+                if (reverse)
+                    ReverseSegment(best);
+
+                remaining.Remove(best);
+                chain.Segments.Add(best);
+            }
+
+            if (chain.Segments.Count >= 2)
+            {
+                var first = chain.Segments[0].Start;
+                var last = chain.Segments[^1].End;
+
+                chain.IsClosed = Bounds2DHelper.Distance(first, last) <= tolerance;
+            }
+
+            if (string.IsNullOrWhiteSpace(chain.Reason))
+            {
+                chain.Reason =
+                    $"Ordered={chain.Segments.Count}, Closed={chain.IsClosed}, Gap={chain.HasGap}";
+            }
+
+            return chain;
+        }
+
+
+        private static OrderedEdgeSegment? TryCreateOrderedEdgeSegment(SheetEntity e)
+        {
+            if (e == null)
+                return null;
+
+            if (e.StartPoint.HasValue && e.EndPoint.HasValue)
+            {
+                return new OrderedEdgeSegment
+                {
+                    Entity = e,
+                    Start = e.StartPoint.Value,
+                    End = e.EndPoint.Value
+                };
+            }
+
+            if (e.Vertices != null && e.Vertices.Count >= 2)
+            {
+                return new OrderedEdgeSegment
+                {
+                    Entity = e,
+                    Start = e.Vertices.First(),
+                    End = e.Vertices.Last()
+                };
+            }
+
+            return null;
+        }
+
+        private static void ReverseSegment(OrderedEdgeSegment seg)
+        {
+            var temp = seg.Start;
+            seg.Start = seg.End;
+            seg.End = temp;
+            seg.Reversed = !seg.Reversed;
+        }
+
+        private static OrderedEdgeSegment PickChainStart(
+    EdgeSide side,
+    List<OrderedEdgeSegment> segments)
+        {
+            return side switch
+            {
+                EdgeSide.Top =>
+                    segments
+                        .OrderBy(x => Math.Min(x.Start.X, x.End.X))
+                        .ThenByDescending(x => Math.Max(x.Start.Y, x.End.Y))
+                        .First(),
+
+                EdgeSide.Bottom =>
+                    segments
+                        .OrderBy(x => Math.Min(x.Start.X, x.End.X))
+                        .ThenBy(x => Math.Min(x.Start.Y, x.End.Y))
+                        .First(),
+
+                EdgeSide.Left =>
+                    segments
+                        .OrderBy(x => Math.Min(x.Start.Y, x.End.Y))
+                        .ThenBy(x => Math.Min(x.Start.X, x.End.X))
+                        .First(),
+
+                EdgeSide.Right =>
+                    segments
+                        .OrderBy(x => Math.Min(x.Start.Y, x.End.Y))
+                        .ThenByDescending(x => Math.Max(x.Start.X, x.End.X))
+                        .First(),
+
+                _ => segments[0]
+            };
+        }
+
+
 
 
         private static void BuildSideBoundaryChainFromOuterSeeds(
