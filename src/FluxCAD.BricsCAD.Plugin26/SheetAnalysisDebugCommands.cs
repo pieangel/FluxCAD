@@ -33,6 +33,17 @@ namespace FluxCAD.BricsCAD.Plugin26
 {
     public sealed class SheetAnalysisDebugCommands
     {
+        private sealed class ClosedOuterLoop
+        {
+            public int ViewIslandId { get; init; }
+            public List<OrderedEdgeSegment> Segments { get; } = new();
+
+            public bool IsClosed { get; set; }
+            public bool HasGap { get; set; }
+            public double TotalGap { get; set; }
+
+            public string Reason { get; set; } = string.Empty;
+        }
 
         private sealed class GlobalCurveCandidate
         {
@@ -978,6 +989,8 @@ namespace FluxCAD.BricsCAD.Plugin26
 
             public DirectionalEdgeProfile? Right =>
                 Profiles.FirstOrDefault(x => x.Side == EdgeSide.Right);
+
+            public ClosedOuterLoop? OuterLoop { get; set; }
         }
 
 
@@ -1034,8 +1047,8 @@ namespace FluxCAD.BricsCAD.Plugin26
         }
 
         private static void LogDirectionalEdgeAnalysis(
-    Bricscad.EditorInput.Editor ed,
-    ViewDirectionalEdgeProfileSet edgeSet)
+            Bricscad.EditorInput.Editor ed,
+            ViewDirectionalEdgeProfileSet edgeSet)
         {
             if (ed == null || edgeSet == null)
                 return;
@@ -1044,6 +1057,24 @@ namespace FluxCAD.BricsCAD.Plugin26
                 $"\n[DIR-ANALYSIS:VIEW] Island={edgeSet.ViewIslandId}, " +
                 $"Bounds=({edgeSet.ViewBounds.MinX:F2},{edgeSet.ViewBounds.MinY:F2})-" +
                 $"({edgeSet.ViewBounds.MaxX:F2},{edgeSet.ViewBounds.MaxY:F2})");
+
+            if (edgeSet.OuterLoop != null)
+            {
+                ed.WriteMessage(
+                    $"\n  [OUTER-LOOP] Segments={edgeSet.OuterLoop.Segments.Count}, " +
+                    $"Closed={edgeSet.OuterLoop.IsClosed}, " +
+                    $"Gap={edgeSet.OuterLoop.HasGap}, " +
+                    $"TotalGap={edgeSet.OuterLoop.TotalGap:F3}, " +
+                    $"Reason={edgeSet.OuterLoop.Reason}");
+
+                foreach (var seg in edgeSet.OuterLoop.Segments)
+                {
+                    ed.WriteMessage(
+                        $"\n    [LOOP-SEG] H={seg.Handle}, Kind={seg.Kind}, " +
+                        $"Start={FormatPoint2D(seg.Start)}, End={FormatPoint2D(seg.End)}, " +
+                        $"Reversed={seg.Reversed}");
+                }
+            }
 
             foreach (var profile in edgeSet.Profiles)
             {
@@ -1226,6 +1257,150 @@ namespace FluxCAD.BricsCAD.Plugin26
                 tr.Commit();
             }
         }
+
+        private static ClosedOuterLoop BuildClosedOuterLoop(
+    ViewDirectionalEdgeProfileSet edgeSet,
+    double tolerance)
+        {
+            var loop = new ClosedOuterLoop
+            {
+                ViewIslandId = edgeSet.ViewIslandId
+            };
+
+            var candidates = new List<OrderedEdgeSegment>();
+
+            foreach (var profile in edgeSet.Profiles)
+            {
+                if (profile.OrderedChain == null)
+                    continue;
+
+                foreach (var seg in profile.OrderedChain.Segments)
+                {
+                    if (seg.Entity.Kind == SheetEntityKind.Line ||
+                        seg.Entity.Kind == SheetEntityKind.Polyline)
+                    {
+                        candidates.Add(CloneSegment(seg));
+                    }
+                }
+
+                foreach (var arc in profile.CornerBoundaryEntities)
+                {
+                    if (arc.Kind != SheetEntityKind.Arc)
+                        continue;
+
+                    var arcSeg = TryCreateOrderedEdgeSegment(arc);
+                    if (arcSeg != null)
+                        candidates.Add(arcSeg);
+                }
+            }
+
+            candidates = candidates
+                .GroupBy(x => x.Handle)
+                .Select(g => g.First())
+                .ToList();
+
+            if (candidates.Count == 0)
+            {
+                loop.Reason = "No outer loop candidates";
+                return loop;
+            }
+
+            var remaining = new List<OrderedEdgeSegment>(candidates);
+
+            var start = PickOuterLoopStart(remaining);
+            remaining.Remove(start);
+            loop.Segments.Add(start);
+
+            while (remaining.Count > 0)
+            {
+                var tail = loop.Segments[^1].End;
+
+                OrderedEdgeSegment? best = null;
+                bool reverse = false;
+                double bestDist = double.MaxValue;
+
+                foreach (var candidate in remaining)
+                {
+                    double d1 = Distance(tail, candidate.Start);
+                    double d2 = Distance(tail, candidate.End);
+
+                    if (d1 < bestDist)
+                    {
+                        bestDist = d1;
+                        best = candidate;
+                        reverse = false;
+                    }
+
+                    if (d2 < bestDist)
+                    {
+                        bestDist = d2;
+                        best = candidate;
+                        reverse = true;
+                    }
+                }
+
+                if (best == null || bestDist > tolerance)
+                {
+                    loop.HasGap = true;
+                    loop.TotalGap += bestDist;
+                    loop.Reason = $"Gap detected. Gap={bestDist:F3}";
+                    break;
+                }
+
+                if (reverse)
+                    ReverseSegment(best);
+
+                remaining.Remove(best);
+                loop.Segments.Add(best);
+
+                var first = loop.Segments[0].Start;
+                var last = loop.Segments[^1].End;
+
+                if (Distance(first, last) <= tolerance)
+                {
+                    loop.IsClosed = true;
+                    break;
+                }
+            }
+
+            if (!loop.IsClosed && loop.Segments.Count >= 2)
+            {
+                var first = loop.Segments[0].Start;
+                var last = loop.Segments[^1].End;
+
+                loop.IsClosed = Distance(first, last) <= tolerance;
+            }
+
+            if (string.IsNullOrWhiteSpace(loop.Reason))
+            {
+                loop.Reason =
+                    $"Segments={loop.Segments.Count}, Closed={loop.IsClosed}, Gap={loop.HasGap}, TotalGap={loop.TotalGap:F3}";
+            }
+
+            return loop;
+        }
+
+        private static OrderedEdgeSegment CloneSegment(OrderedEdgeSegment seg)
+        {
+            return new OrderedEdgeSegment
+            {
+                Entity = seg.Entity,
+                Start = seg.Start,
+                End = seg.End,
+                Reversed = seg.Reversed
+            };
+        }
+
+        private static OrderedEdgeSegment PickOuterLoopStart(
+            IReadOnlyList<OrderedEdgeSegment> segments)
+        {
+            return segments
+                .OrderBy(x => Math.Min(x.Start.Y, x.End.Y))
+                .ThenBy(x => Math.Min(x.Start.X, x.End.X))
+                .First();
+        }
+
+
 
 
         private const string FluxSemanticRegAppName = "FLUX_SEMANTIC";
@@ -2042,6 +2217,10 @@ namespace FluxCAD.BricsCAD.Plugin26
             result.Profiles.Add(BuildDirectionalEdgeProfile(
                 viewIslandId, viewBounds, outerCandidates, EdgeSide.Right));
 
+            result.OuterLoop = BuildClosedOuterLoop(
+                result,
+                tolerance);
+
             return result;
         }
 
@@ -2125,13 +2304,24 @@ namespace FluxCAD.BricsCAD.Plugin26
                 tolerance);
 
             var chainEdges = profile.SideBoundaryEntities
-                .Where(e => IsCompatibleWithSideDirection(e, side, tolerance))
+                .Where(e => IsCompatibleWithSideDirection(
+                    e,
+                    side,
+                    viewBounds,
+                    tolerance))
                 .ToList();
 
             profile.OrderedChain = BuildOrderedEdgeChain(
                 side,
                 chainEdges,
                 tolerance);
+
+            /*
+            AttachCornerArcsToOrderedChain(
+                profile.OrderedChain,
+                profile.CornerBoundaryEntities,
+                tolerance);
+            */
 
             foreach (var e in profile.OrderedChain?.Segments.Select(x => x.Entity)
                   ?? Enumerable.Empty<SheetEntity>())
@@ -2167,26 +2357,45 @@ namespace FluxCAD.BricsCAD.Plugin26
         }
 
         private static bool IsCompatibleWithSideDirection(
-            SheetEntity e,
-            EdgeSide side,
-            double tolerance)
+    SheetEntity e,
+    EdgeSide side,
+    Bounds2D viewBounds,
+    double tolerance)
         {
             if (e == null)
                 return false;
 
             if (!e.StartPoint.HasValue || !e.EndPoint.HasValue)
-                return true; // Arc/Polyline은 다음 단계에서 별도 처리
+                return true;
 
-            double dx = Math.Abs(e.EndPoint.Value.X - e.StartPoint.Value.X);
-            double dy = Math.Abs(e.EndPoint.Value.Y - e.StartPoint.Value.Y);
+            var sp = e.StartPoint.Value;
+            var ep = e.EndPoint.Value;
+
+            double dx = Math.Abs(ep.X - sp.X);
+            double dy = Math.Abs(ep.Y - sp.Y);
 
             bool horizontal = dy <= tolerance;
             bool vertical = dx <= tolerance;
 
+            double minX = Math.Min(sp.X, ep.X);
+            double maxX = Math.Max(sp.X, ep.X);
+            double minY = Math.Min(sp.Y, ep.Y);
+            double maxY = Math.Max(sp.Y, ep.Y);
+
             return side switch
             {
-                EdgeSide.Top or EdgeSide.Bottom => horizontal,
-                EdgeSide.Left or EdgeSide.Right => vertical,
+                EdgeSide.Top =>
+                    horizontal && Math.Abs(maxY - viewBounds.MaxY) <= tolerance,
+
+                EdgeSide.Bottom =>
+                    horizontal && Math.Abs(minY - viewBounds.MinY) <= tolerance,
+
+                EdgeSide.Left =>
+                    vertical && Math.Abs(minX - viewBounds.MinX) <= tolerance,
+
+                EdgeSide.Right =>
+                    vertical && Math.Abs(maxX - viewBounds.MaxX) <= tolerance,
+
                 _ => true
             };
         }
@@ -2627,6 +2836,115 @@ namespace FluxCAD.BricsCAD.Plugin26
             public double TotalGap { get; set; }
 
             public string Reason { get; set; } = string.Empty;
+
+            public List<OrderedEdgeSegment> ConnectorSegments { get; } = new();
+        }
+
+
+        private static void AttachCornerArcsToOrderedChain(
+            OrderedEdgeChain chain,
+            IReadOnlyList<SheetEntity> cornerArcs,
+            double tolerance)
+        {
+            if (chain == null || chain.Segments.Count == 0)
+                return;
+
+            if (cornerArcs == null || cornerArcs.Count == 0)
+                return;
+
+            var used = new HashSet<string>();
+
+            bool added;
+
+            do
+            {
+                added = false;
+
+                var chainStart = chain.Segments[0].Start;
+                var chainEnd = chain.Segments[^1].End;
+
+                foreach (var arc in cornerArcs)
+                {
+                    if (arc == null || arc.Kind != SheetEntityKind.Arc)
+                        continue;
+
+                    if (used.Contains(arc.Handle))
+                        continue;
+
+                    if (!arc.StartPoint.HasValue || !arc.EndPoint.HasValue)
+                        continue;
+
+                    var a = arc.StartPoint.Value;
+                    var b = arc.EndPoint.Value;
+
+                    // Arc가 chain 앞쪽에 붙는 경우
+                    if (Distance(chainStart, a) <= tolerance)
+                    {
+                        var seg = new OrderedEdgeSegment
+                        {
+                            Entity = arc,
+                            Start = b,
+                            End = a
+                        };
+
+                        chain.Segments.Insert(0, seg);
+                        chain.ConnectorSegments.Add(seg);
+                        used.Add(arc.Handle);
+                        added = true;
+                        break;
+                    }
+
+                    if (Distance(chainStart, b) <= tolerance)
+                    {
+                        var seg = new OrderedEdgeSegment
+                        {
+                            Entity = arc,
+                            Start = a,
+                            End = b
+                        };
+
+                        chain.Segments.Insert(0, seg);
+                        chain.ConnectorSegments.Add(seg);
+                        used.Add(arc.Handle);
+                        added = true;
+                        break;
+                    }
+
+                    // Arc가 chain 뒤쪽에 붙는 경우
+                    if (Distance(chainEnd, a) <= tolerance)
+                    {
+                        var seg = new OrderedEdgeSegment
+                        {
+                            Entity = arc,
+                            Start = a,
+                            End = b
+                        };
+
+                        chain.Segments.Add(seg);
+                        chain.ConnectorSegments.Add(seg);
+                        used.Add(arc.Handle);
+                        added = true;
+                        break;
+                    }
+
+                    if (Distance(chainEnd, b) <= tolerance)
+                    {
+                        var seg = new OrderedEdgeSegment
+                        {
+                            Entity = arc,
+                            Start = b,
+                            End = a
+                        };
+
+                        chain.Segments.Add(seg);
+                        chain.ConnectorSegments.Add(seg);
+                        used.Add(arc.Handle);
+                        added = true;
+                        break;
+                    }
+                }
+            }
+            while (added);
         }
 
 
