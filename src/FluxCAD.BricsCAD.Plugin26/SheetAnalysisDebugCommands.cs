@@ -27,12 +27,28 @@ using Teigha.GraphicsInterface;
 using Teigha.GraphicsSystem;
 using Teigha.Runtime;
 using static System.Formats.Asn1.AsnWriter;
+using static System.Runtime.InteropServices.JavaScript.JSType;
 using TeighaColor = Teigha.Colors.Color;
 
 namespace FluxCAD.BricsCAD.Plugin26
 {
     public sealed class SheetAnalysisDebugCommands
     {
+        public enum DirectionalEdgeRole
+        {
+            Unknown,
+            OuterMostBoundary,
+            SideBoundary,
+            ProtrusionBoundary,
+            Corner,
+            NearFeature,
+            InternalFeature,
+            ReferenceHint,
+            Disconnected,
+
+            OuterLoopBoundary // 추가
+        }
+
         private sealed class ClosedOuterLoop
         {
             public int ViewIslandId { get; init; }
@@ -885,6 +901,8 @@ namespace FluxCAD.BricsCAD.Plugin26
             RecessBoundary,
             NearFeature,
 
+            OuterLoopBoundary,   // Graph ClosedOuterLoop에 포함된 외곽선
+
             // 중심선/숨은선/두께선/치수 보조선
             ReferenceHint,
 
@@ -943,6 +961,8 @@ namespace FluxCAD.BricsCAD.Plugin26
 
             // 기존 ConnectedBoundaryEntities 대신 의미 분리
             public List<SheetEntity> ReachableGraphEntities { get; } = new();
+
+            public List<SheetEntity> OuterLoopBoundaryEntities { get; } = new();
 
             public List<SheetEntity> SideBoundaryEntities { get; } = new();
 
@@ -1045,6 +1065,198 @@ namespace FluxCAD.BricsCAD.Plugin26
                 tr.Commit();
             }
         }
+
+        private static void ApplyOuterLoopResultToDirectionalProfiles(
+    ViewDirectionalEdgeProfileSet result)
+        {
+            if (result == null || result.OuterLoop == null)
+                return;
+
+            if (!result.OuterLoop.IsClosed)
+                return;
+
+            if (result.OuterLoop.Segments.Count == 0)
+                return;
+
+            var outerLoopHandles = new HashSet<string>(
+                result.OuterLoop.Segments
+                    .Where(s => s?.Entity != null)
+                    .Select(s => s.Entity.Handle),
+                StringComparer.OrdinalIgnoreCase);
+
+            foreach (var profile in result.Profiles)
+            {
+                if (profile == null)
+                    continue;
+
+                foreach (var hit in profile.Hits)
+                {
+                    if (hit?.Entity == null)
+                        continue;
+
+                    if (!outerLoopHandles.Contains(hit.Entity.Handle))
+                        continue;
+
+                    hit.Role = DirectionalEdgeEntityRole.OuterLoopBoundary;
+                    hit.IsConnectedToSeed = true;
+                    hit.Reason = "Entity belongs to graph closed outer loop";
+
+                    AddUnique(profile.OuterLoopBoundaryEntities, hit.Entity);
+                    AddUnique(profile.SideBoundaryEntities, hit.Entity);
+
+                    RemoveByHandle(profile.NearFeatureEntities, hit.Entity.Handle);
+                    RemoveByHandle(profile.DisconnectedEntities, hit.Entity.Handle);
+                    RemoveByHandle(profile.InternalFeatureEntities, hit.Entity.Handle);
+                    RemoveByHandle(profile.ProtrusionEntities, hit.Entity.Handle);
+                    RemoveByHandle(profile.RecessEntities, hit.Entity.Handle);
+                }
+
+                profile.Complexity = ResolveDirectionalComplexity(profile);
+
+                profile.Reason =
+                    $"PostOuterLoopCorrection=True, " +
+                    $"Side={profile.Side}, " +
+                    $"SideBoundary={profile.SideBoundaryEntities.Count}, " +
+                    $"OuterLoopBoundary={profile.OuterLoopBoundaryEntities.Count}, " +
+                    $"ReachableGraph={profile.ReachableGraphEntities.Count}, " +
+                    $"InternalFeature={profile.InternalFeatureEntities.Count}, " +
+                    $"Corner={profile.CornerBoundaryEntities.Count}, " +
+                    $"NearFeature={profile.NearFeatureEntities.Count}, " +
+                    $"Disconnected={profile.DisconnectedEntities.Count}, " +
+                    $"Complexity={profile.Complexity}";
+            }
+        }
+
+
+        private static HashSet<string> CollectCircleRelatedAuxiliaryArcHandles(
+    Transaction tr,
+    IReadOnlyList<ObjectId> sourceIds,
+    Bricscad.EditorInput.Editor? ed)
+        {
+            var result = new HashSet<string>();
+
+            var circles = new List<Circle>();
+            var arcs = new List<Arc>();
+
+            foreach (var id in sourceIds)
+            {
+                if (!id.IsValid || id.IsErased)
+                    continue;
+
+                if (tr.GetObject(id, OpenMode.ForRead) is Circle c)
+                    circles.Add(c);
+                else if (tr.GetObject(id, OpenMode.ForRead) is Arc a)
+                    arcs.Add(a);
+            }
+
+            if (circles.Count == 0 || arcs.Count == 0)
+                return result;
+
+            foreach (var arc in arcs)
+            {
+                foreach (var circle in circles)
+                {
+                    if (!IsCircleRelatedAuxiliaryArc(ed, circle, arc))
+                        continue;
+
+                    result.Add(arc.Handle.ToString());
+                    break;
+                }
+            }
+
+            ed?.WriteMessage(
+                $"\n[VISIBLE-OUTLINE] RemovedCircleRelatedArcs={result.Count}");
+
+            return result;
+        }
+
+
+        private static bool IsCircleRelatedAuxiliaryArc(Bricscad.EditorInput.Editor? ed, Circle circle, Arc arc)
+        {
+            if (circle == null || arc == null)
+                return false;
+
+            double circleRadius = circle.Radius;
+            double arcRadius = arc.Radius;
+
+            if (circleRadius <= 1e-9 || arcRadius <= 1e-9)
+                return false;
+
+            if (!TryGetEntityBoundsSafe(circle, out var cb) ||
+                !TryGetEntityBoundsSafe(arc, out var ab))
+                return false;
+
+            cb = Bounds2DHelper.Normalize(cb);
+            ab = Bounds2DHelper.Normalize(ab);
+
+            double centerDist = circle.Center.DistanceTo(arc.Center);
+            double boundsDist = Bounds2DHelper.Distance(cb, ab);
+            double radiusRatio = arcRadius / circleRadius;
+
+            // 핵심 1: 중심 공유를 다시 강하게 본다.
+            double centerTol = Math.Max(circleRadius * 0.35, 0.5);
+            if (centerDist > centerTol)
+                return false;
+
+            // 핵심 2: 반지름은 보조 arc 범위만 허용
+            if (radiusRatio < 0.75 || radiusRatio > 1.35)
+                return false;
+
+            // 핵심 3: bounds도 거의 겹쳐야 한다.
+            double nearTol = Math.Max(circleRadius * 0.35, 0.5);
+            if (boundsDist > nearTol)
+                return false;
+
+            return true;
+        }
+
+
+
+        private static void AddUnique(
+            List<SheetEntity> list,
+            SheetEntity entity)
+        {
+            if (list == null || entity == null)
+                return;
+
+            if (list.Any(x => string.Equals(x.Handle, entity.Handle, StringComparison.OrdinalIgnoreCase)))
+                return;
+
+            list.Add(entity);
+        }
+
+        private static void RemoveByHandle(
+            List<SheetEntity> list,
+            string handle)
+        {
+            if (list == null || string.IsNullOrWhiteSpace(handle))
+                return;
+
+            list.RemoveAll(x =>
+                x != null &&
+                string.Equals(x.Handle, handle, StringComparison.OrdinalIgnoreCase));
+        }
+
+
+        private static bool IsInOuterLoop(
+            ClosedOuterLoop? outerLoop,
+            SheetEntity entity)
+        {
+            if (outerLoop == null || entity == null)
+                return false;
+
+            if (!outerLoop.IsClosed)
+                return false;
+
+            if (outerLoop.Segments == null || outerLoop.Segments.Count == 0)
+                return false;
+
+            var handle = entity.Handle;
+
+            return outerLoop.Segments.Any(s =>
+                string.Equals(s.Handle, handle, StringComparison.OrdinalIgnoreCase));
+        }
+
 
         private static void LogDirectionalEdgeAnalysis(
             Bricscad.EditorInput.Editor ed,
@@ -2002,6 +2214,9 @@ namespace FluxCAD.BricsCAD.Plugin26
                     return;
                 }
 
+                var circleRelatedAuxArcHandles =
+                    CollectCircleRelatedAuxiliaryArcHandles(tr, sourceIds, ed);
+
                 if (!TryGetSheetBoundsFromOriginalEntities(tr, ms, out var sheetBounds))
                 {
                     ed.WriteMessage("\n[VISIBLE-OUTLINE] Failed to calculate original sheet bounds.");
@@ -2021,6 +2236,12 @@ namespace FluxCAD.BricsCAD.Plugin26
                     var ent = tr.GetObject(id, OpenMode.ForRead) as Entity;
                     if (ent == null)
                         continue;
+
+                    if (circleRelatedAuxArcHandles.Contains(ent.Handle.ToString()))
+                    {
+                        removed++;
+                        continue;
+                    }
 
                     if (!IsVisibleOutlineCandidate(ent))
                     {
@@ -2063,6 +2284,7 @@ namespace FluxCAD.BricsCAD.Plugin26
 
                 ed.WriteMessage(
                     $"\n[VISIBLE-OUTLINE] Kept={kept}, Removed={removed}, " +
+                    $"RemovedCircleRelatedArcs={circleRelatedAuxArcHandles.Count}, " +
                     $"Dx={dx:0.###}, SheetWidth={sheetBounds.Width:0.###}");
 
                 tr.Commit();
@@ -2185,9 +2407,9 @@ namespace FluxCAD.BricsCAD.Plugin26
 
 
         private static ViewDirectionalEdgeProfileSet BuildDirectionalEdgeProfiles(
-    int viewIslandId,
-    Bounds2D viewBounds,
-    IReadOnlyList<SheetEntity> visibleEntities)
+            int viewIslandId,
+            Bounds2D viewBounds,
+            IReadOnlyList<SheetEntity> visibleEntities)
         {
             var result = new ViewDirectionalEdgeProfileSet
             {
@@ -2217,11 +2439,274 @@ namespace FluxCAD.BricsCAD.Plugin26
             result.Profiles.Add(BuildDirectionalEdgeProfile(
                 viewIslandId, viewBounds, outerCandidates, EdgeSide.Right));
 
-            result.OuterLoop = BuildClosedOuterLoop(
-                result,
+            result.OuterLoop = BuildClosedOuterLoopFromGraph(
+                viewIslandId,
+                outerCandidates,
                 tolerance);
 
+            ApplyOuterLoopResultToDirectionalProfiles(result);
+
             return result;
+        }
+
+        private sealed class LoopGraphNode
+        {
+            public int Id { get; init; }
+            public Point2D Point { get; init; }
+            public List<int> EdgeIds { get; } = new();
+        }
+
+        private sealed class LoopGraphEdge
+        {
+            public int Id { get; init; }
+            public OrderedEdgeSegment Segment { get; init; } = null!;
+            public int A { get; init; }
+            public int B { get; init; }
+        }
+
+        private static ClosedOuterLoop BuildClosedOuterLoopFromGraph(
+            int viewIslandId,
+            IReadOnlyList<SheetEntity> candidates,
+            double tolerance)
+        {
+            var loop = new ClosedOuterLoop
+            {
+                ViewIslandId = viewIslandId
+            };
+
+            if (candidates == null || candidates.Count == 0)
+            {
+                loop.Reason = "No graph candidates";
+                return loop;
+            }
+
+            var segments = candidates
+                .Where(e =>
+                    e != null &&
+                    !e.Bounds.IsEmpty &&
+                    !e.IsCenterLine &&
+                    !e.IsHiddenLine &&
+                    (e.Kind == SheetEntityKind.Line ||
+                     e.Kind == SheetEntityKind.Arc ||
+                     e.Kind == SheetEntityKind.Polyline))
+                .Select(TryCreateOrderedEdgeSegment)
+                .Where(x => x != null)
+                .Cast<OrderedEdgeSegment>()
+                .GroupBy(x => x.Handle)
+                .Select(g => g.First())
+                .ToList();
+
+            if (segments.Count == 0)
+            {
+                loop.Reason = "No connectable graph segments";
+                return loop;
+            }
+
+            var nodes = new List<LoopGraphNode>();
+            var edges = new List<LoopGraphEdge>();
+
+            int GetOrCreateNode(Point2D p)
+            {
+                foreach (var n in nodes)
+                {
+                    if (Distance(n.Point, p) <= tolerance)
+                        return n.Id;
+                }
+
+                int id = nodes.Count;
+
+                nodes.Add(new LoopGraphNode
+                {
+                    Id = id,
+                    Point = p
+                });
+
+                return id;
+            }
+
+            foreach (var seg in segments)
+            {
+                int a = GetOrCreateNode(seg.Start);
+                int b = GetOrCreateNode(seg.End);
+
+                if (a == b)
+                    continue;
+
+                int edgeId = edges.Count;
+
+                edges.Add(new LoopGraphEdge
+                {
+                    Id = edgeId,
+                    Segment = CloneSegment(seg),
+                    A = a,
+                    B = b
+                });
+
+                nodes[a].EdgeIds.Add(edgeId);
+                nodes[b].EdgeIds.Add(edgeId);
+            }
+
+            if (edges.Count == 0)
+            {
+                loop.Reason = "No valid graph edges";
+                return loop;
+            }
+
+            var visitedEdges = new HashSet<int>();
+            ClosedOuterLoop? bestLoop = null;
+            double bestArea = 0.0;
+
+            foreach (var startEdge in edges)
+            {
+                if (visitedEdges.Contains(startEdge.Id))
+                    continue;
+
+                var componentEdges = new List<LoopGraphEdge>();
+                var queue = new Queue<int>();
+                var visitedNodes = new HashSet<int>();
+
+                queue.Enqueue(startEdge.A);
+                visitedNodes.Add(startEdge.A);
+
+                while (queue.Count > 0)
+                {
+                    int nodeId = queue.Dequeue();
+
+                    foreach (int edgeId in nodes[nodeId].EdgeIds)
+                    {
+                        var edge = edges[edgeId];
+
+                        if (!componentEdges.Any(x => x.Id == edge.Id))
+                            componentEdges.Add(edge);
+
+                        int next = edge.A == nodeId ? edge.B : edge.A;
+
+                        if (visitedNodes.Add(next))
+                            queue.Enqueue(next);
+                    }
+                }
+
+                foreach (var e in componentEdges)
+                    visitedEdges.Add(e.Id);
+
+                bool allDegreeTwo = visitedNodes.All(n => nodes[n].EdgeIds.Count(id => componentEdges.Any(e => e.Id == id)) == 2);
+
+                if (!allDegreeTwo || componentEdges.Count < 3)
+                    continue;
+
+                var ordered = TryOrderClosedGraphComponent(
+                    componentEdges,
+                    nodes,
+                    tolerance);
+
+                if (ordered.Count < 3)
+                    continue;
+
+                var first = ordered[0].Start;
+                var last = ordered[^1].End;
+
+                if (Distance(first, last) > tolerance)
+                    continue;
+
+                double area = Math.Abs(ComputeLoopAreaByChord(ordered));
+
+                if (area > bestArea)
+                {
+                    bestArea = area;
+
+                    bestLoop = new ClosedOuterLoop
+                    {
+                        ViewIslandId = viewIslandId,
+                        IsClosed = true,
+                        HasGap = false,
+                        TotalGap = 0,
+                        Reason = $"Graph closed loop selected. Segments={ordered.Count}, Area={area:F3}"
+                    };
+
+                    bestLoop.Segments.AddRange(ordered);
+                }
+            }
+
+            if (bestLoop != null)
+                return bestLoop;
+
+            loop.Reason = $"No closed graph loop found. Nodes={nodes.Count}, Edges={edges.Count}";
+            return loop;
+        }
+
+        private static List<OrderedEdgeSegment> TryOrderClosedGraphComponent(
+    IReadOnlyList<LoopGraphEdge> componentEdges,
+    IReadOnlyList<LoopGraphNode> nodes,
+    double tolerance)
+        {
+            var result = new List<OrderedEdgeSegment>();
+
+            if (componentEdges == null || componentEdges.Count == 0)
+                return result;
+
+            var unused = componentEdges.ToDictionary(x => x.Id, x => x);
+
+            var firstEdge = componentEdges
+                .OrderBy(e => nodes[e.A].Point.Y)
+                .ThenBy(e => nodes[e.A].Point.X)
+                .First();
+
+            unused.Remove(firstEdge.Id);
+
+            var firstSeg = CloneSegment(firstEdge.Segment);
+
+            int startNode = firstEdge.A;
+            int currentNode = firstEdge.B;
+
+            firstSeg.Start = nodes[startNode].Point;
+            firstSeg.End = nodes[currentNode].Point;
+
+            result.Add(firstSeg);
+
+            while (unused.Count > 0)
+            {
+                var nextEdge = unused.Values
+                    .FirstOrDefault(e => e.A == currentNode || e.B == currentNode);
+
+                if (nextEdge == null)
+                    break;
+
+                unused.Remove(nextEdge.Id);
+
+                int nextNode = nextEdge.A == currentNode
+                    ? nextEdge.B
+                    : nextEdge.A;
+
+                var seg = CloneSegment(nextEdge.Segment);
+                seg.Start = nodes[currentNode].Point;
+                seg.End = nodes[nextNode].Point;
+
+                result.Add(seg);
+
+                currentNode = nextNode;
+
+                if (currentNode == startNode)
+                    break;
+            }
+
+            return result;
+        }
+
+        private static double ComputeLoopAreaByChord(
+            IReadOnlyList<OrderedEdgeSegment> segments)
+        {
+            if (segments == null || segments.Count < 3)
+                return 0.0;
+
+            double sum = 0.0;
+
+            foreach (var seg in segments)
+            {
+                sum += seg.Start.X * seg.End.Y;
+                sum -= seg.End.X * seg.Start.Y;
+            }
+
+            return sum * 0.5;
         }
 
 
@@ -2346,6 +2831,7 @@ namespace FluxCAD.BricsCAD.Plugin26
                 $"ChainGap={profile.OrderedChain?.HasGap ?? false}, " +
                 $"Side={side}, FirstWave={firstWave.Count}, " +
                 $"SideBoundary={profile.SideBoundaryEntities.Count}, " +
+                $"OuterLoopBoundary={profile.OuterLoopBoundaryEntities.Count}, " +
                 $"ReachableGraph={profile.ReachableGraphEntities.Count}, " +
                 $"InternalFeature={profile.InternalFeatureEntities.Count}, " +
                 $"Corner={profile.CornerBoundaryEntities.Count}, " +
@@ -3320,6 +3806,9 @@ namespace FluxCAD.BricsCAD.Plugin26
 
                 // 외곽 corner / round / fillet 후보
                 DirectionalEdgeEntityRole.CornerBoundary => 1,         // red
+
+                DirectionalEdgeEntityRole.OuterLoopBoundary => 4,
+
 
                 // 내부 구멍, 슬롯, 내부 절단 feature
                 DirectionalEdgeEntityRole.InternalFeature => 30,       // orange-like
