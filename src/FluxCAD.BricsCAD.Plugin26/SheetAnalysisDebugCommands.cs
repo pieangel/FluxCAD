@@ -1312,6 +1312,141 @@ namespace FluxCAD.BricsCAD.Plugin26
                 .ToList();
         }
 
+        private static List<Bounds2D> MergeChildAreasToColumnBands(
+    IReadOnlyList<Bounds2D> areas,
+    Bounds2D parentBounds,
+    SheetBlockAreaAnalysisOptions options)
+        {
+            if (areas == null || areas.Count == 0)
+                return new List<Bounds2D>();
+
+            var sorted = areas
+                .OrderBy(x => x.Center.X)
+                .ThenByDescending(x => x.Center.Y)
+                .ToList();
+
+            double xTolerance = Math.Max(
+                parentBounds.Width * 0.01,
+                20.0);
+
+            var bands = new List<List<Bounds2D>>();
+
+            foreach (var area in sorted)
+            {
+                List<Bounds2D>? matched = null;
+
+                foreach (var band in bands)
+                {
+                    var bandBounds = UnionBounds(band);
+
+                    double overlapX = Math.Max(
+                        0,
+                        Math.Min(bandBounds.MaxX, area.MaxX) -
+                        Math.Max(bandBounds.MinX, area.MinX));
+
+                    double minWidth = Math.Max(
+                        1e-6,
+                        Math.Min(bandBounds.Width, area.Width));
+
+                    double overlapRatio = overlapX / minWidth;
+
+                    bool sameColumn =
+                        overlapRatio >= 0.55 ||
+                        Math.Abs(bandBounds.Center.X - area.Center.X) <= xTolerance;
+
+                    if (sameColumn)
+                    {
+                        matched = band;
+                        break;
+                    }
+                }
+
+                if (matched == null)
+                {
+                    matched = new List<Bounds2D>();
+                    bands.Add(matched);
+                }
+
+                matched.Add(area);
+            }
+
+            return bands
+                .Select(UnionBounds)
+                .OrderBy(x => x.Center.X)
+                .ToList();
+        }
+
+        private static List<StructuralGridCell> BuildStructuralGridCells(
+    IReadOnlyList<Bounds2D> rowBands,
+    IReadOnlyList<Bounds2D> columnBands,
+    IReadOnlyList<FastFrameScanInfo> infos,
+    Bounds2D parentBounds,
+    SheetBlockAreaAnalysisOptions options)
+        {
+            var result = new List<StructuralGridCell>();
+
+            for (int r = 0; r < rowBands.Count; r++)
+            {
+                var row = rowBands[r];
+
+                for (int c = 0; c < columnBands.Count; c++)
+                {
+                    var col = columnBands[c];
+
+                    double minX = Math.Max(row.MinX, col.MinX);
+                    double minY = Math.Max(row.MinY, col.MinY);
+
+                    double maxX = Math.Min(row.MaxX, col.MaxX);
+                    double maxY = Math.Min(row.MaxY, col.MaxY);
+
+                    if (maxX <= minX || maxY <= minY)
+                        continue;
+
+                    var cellBounds = new Bounds2D(
+                        minX,
+                        minY,
+                        maxX,
+                        maxY);
+
+                    var cellInfos = infos
+                        .Where(x => cellBounds.Contains(x.Bounds.Center))
+                        .ToList();
+
+                    if (cellInfos.Count == 0)
+                        continue;
+
+                    double entityArea =
+                        cellInfos.Sum(x => x.Bounds.Area);
+
+                    double density =
+                        entityArea /
+                        Math.Max(cellBounds.Area, 1e-6);
+
+                    int dividerCount =
+                        cellInfos.Count(x =>
+                            x.IsLongHorizontal ||
+                            x.IsLongVertical);
+
+                    result.Add(new StructuralGridCell
+                    {
+                        RowIndex = r,
+                        ColumnIndex = c,
+                        Bounds = cellBounds,
+
+                        EntityCount = cellInfos.Count,
+                        DividerCount = dividerCount,
+
+                        Density = density,
+
+                        Confidence = Math.Min(
+                            1.0,
+                            density * 5.0)
+                    });
+                }
+            }
+
+            return result;
+        }
 
 
         private static List<Bounds2D> DetectChildSheetBlockAreasFromFastInfos(
@@ -1421,6 +1556,31 @@ namespace FluxCAD.BricsCAD.Plugin26
 
             ed.WriteMessage(
                 $"\n[DetectChildFast] RowBands={rowBands.Count}");
+
+            var columnBands = MergeChildAreasToColumnBands(
+                filtered,
+                parentBounds,
+                options);
+
+            ed.WriteMessage(
+                $"\n[DetectChildFast] RowBands={rowBands.Count}, ColumnBands={columnBands.Count}");
+
+            var gridCells = BuildStructuralGridCells(
+                rowBands,
+                columnBands,
+                infos,
+                parentBounds,
+                options);
+
+            ed.WriteMessage(
+                $"\n[DetectChildFast] GridCells={gridCells.Count}");
+
+            foreach (var cell in gridCells)
+            {
+                ed.WriteMessage(
+                    $"\n[GridCell] {cell}");
+            }
+
 
             return rowBands;
         }
@@ -1767,6 +1927,37 @@ namespace FluxCAD.BricsCAD.Plugin26
 
             public double SpanRatio { get; init; }
             public double Confidence { get; init; }
+        }
+
+        private sealed class StructuralGridCell
+        {
+            public int RowIndex { get; init; }
+
+            public int ColumnIndex { get; init; }
+
+            public Bounds2D Bounds { get; init; }
+
+            public double Density { get; set; }
+
+            public int EntityCount { get; set; }
+
+            public int DividerCount { get; set; }
+
+            public double Confidence { get; set; }
+
+            public string Kind { get; set; } = "Unknown";
+
+            public string Reason { get; set; } = "";
+
+            public override string ToString()
+            {
+                return
+                    $"R={RowIndex}, C={ColumnIndex}, " +
+                    $"Density={Density:0.000}, " +
+                    $"Entities={EntityCount}, " +
+                    $"Dividers={DividerCount}, " +
+                    $"Kind={Kind}";
+            }
         }
 
 
@@ -2334,15 +2525,99 @@ namespace FluxCAD.BricsCAD.Plugin26
         private sealed class FastFrameScanInfo
         {
             public ObjectId Id { get; init; }
+
             public string Handle { get; init; } = "";
+
             public string Kind { get; init; } = "";
+
             public Bounds2D Bounds { get; init; } = Bounds2D.Empty;
 
             public Line? Line { get; init; }
+
             public Teigha.DatabaseServices.Polyline? Polyline { get; init; }
 
             public bool IsLine => Line != null;
+
             public bool IsPolyline => Polyline != null;
+
+            // =========================================================
+            // Geometry Metrics
+            // =========================================================
+
+            public double Width => Bounds.Width;
+
+            public double Height => Bounds.Height;
+
+            public double Area => Bounds.Area;
+
+            public double CenterX => Bounds.Center.X;
+
+            public double CenterY => Bounds.Center.Y;
+
+            public double AspectRatio =>
+                Height <= 1e-6
+                    ? 999999
+                    : Width / Height;
+
+            // =========================================================
+            // Structural Hints
+            // =========================================================
+
+            public bool IsHorizontalLike =>
+                Width > Height * 3.0;
+
+            public bool IsVerticalLike =>
+                Height > Width * 3.0;
+
+            public bool IsLongHorizontal =>
+                IsHorizontalLike &&
+                Width >= 100.0;
+
+            public bool IsLongVertical =>
+                IsVerticalLike &&
+                Height >= 100.0;
+
+            public bool IsTiny =>
+                Width < 5 &&
+                Height < 5;
+
+            public bool IsLarge =>
+                Area >= 10000.0;
+
+            // =========================================================
+            // Semantic Hints
+            // =========================================================
+
+            public bool IsFrameCandidate { get; set; }
+
+            public bool IsDividerCandidate { get; set; }
+
+            public bool IsRepeatedPatternCandidate { get; set; }
+
+            // =========================================================
+            // Recursive / Analysis
+            // =========================================================
+
+            public int RecursiveDepthHint { get; set; }
+
+            public double StructuralScore { get; set; }
+
+            public string StructuralReason { get; set; } = "";
+
+            // =========================================================
+            // Debug
+            // =========================================================
+
+            public override string ToString()
+            {
+                return
+                    $"Kind={Kind}, " +
+                    $"Bounds={Bounds}, " +
+                    $"W={Width:0.##}, " +
+                    $"H={Height:0.##}, " +
+                    $"LongH={IsLongHorizontal}, " +
+                    $"LongV={IsLongVertical}";
+            }
         }
 
         private sealed class FastSheetBlockFrameCandidate
