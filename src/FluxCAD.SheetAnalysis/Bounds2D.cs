@@ -20,7 +20,7 @@ namespace FluxCAD.SheetAnalysis
         public bool Intersects(Bounds2D other)
             => !(other.MaxX < MinX || other.MinX > MaxX || other.MaxY < MinY || other.MinY > MaxY);
 
-        public static Bounds2D Empty => new(0, 0, 0, 0);
+        //public static Bounds2D Empty => new(0, 0, 0, 0);
 
         public bool IsEmpty => Width < 0 || Height < 0;
 
@@ -32,5 +32,54 @@ namespace FluxCAD.SheetAnalysis
                 Math.Min(a.Y, b.Y),
                 Math.Max(a.X, b.X),
                 Math.Max(a.Y, b.Y));
+
+        public Bounds2D Inflate(double margin)
+    => new(MinX - margin, MinY - margin, MaxX + margin, MaxY + margin);
+
+        public Bounds2D Deflate(double margin)
+            => new(MinX + margin, MinY + margin, MaxX - margin, MaxY - margin);
+
+        public bool Contains(Bounds2D other)
+            => other.MinX >= MinX && other.MaxX <= MaxX
+            && other.MinY >= MinY && other.MaxY <= MaxY;
+
+        public bool ContainsCenterOf(Bounds2D other)
+            => Contains(other.Center);
+
+        public double IntersectionArea(Bounds2D other)
+        {
+            var minX = Math.Max(MinX, other.MinX);
+            var minY = Math.Max(MinY, other.MinY);
+            var maxX = Math.Min(MaxX, other.MaxX);
+            var maxY = Math.Min(MaxY, other.MaxY);
+
+            var w = maxX - minX;
+            var h = maxY - minY;
+
+            if (w <= 0 || h <= 0)
+                return 0;
+
+            return w * h;
+        }
+
+        public double OverlapRatio(Bounds2D other)
+        {
+            if (IsZeroArea || other.IsZeroArea)
+                return 0;
+
+            return IntersectionArea(other) / Math.Min(Area, other.Area);
+        }
+
+        public bool NearlyContains(Bounds2D other, double tolerance)
+            => other.MinX >= MinX - tolerance
+            && other.MaxX <= MaxX + tolerance
+            && other.MinY >= MinY - tolerance
+            && other.MaxY <= MaxY + tolerance;
+
+        public static Bounds2D Empty => new(
+    double.PositiveInfinity,
+    double.PositiveInfinity,
+    double.NegativeInfinity,
+    double.NegativeInfinity);
     }
 }
