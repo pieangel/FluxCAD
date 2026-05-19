@@ -1096,6 +1096,45 @@ namespace FluxCAD.BricsCAD.Plugin26
 
                     ed.WriteMessage($"\n[FAST-SHEET-BLOCK] FinalCandidates={candidates.Count}");
 
+                    var treeOptions = new SheetBlockAreaAnalysisOptions
+                    {
+                        MaxDepth = 2,
+                        MinChildAreaRatio = 0.03,
+                        MaxChildAreaRatio = 0.92,
+                        InnerMarginRatio = 0.01,
+                        MinEntitiesPerChild = 5,
+                        DividerPositionToleranceRatio = 0.005,
+                        OuterDividerRejectToleranceRatio = 0.01,
+                        MinDividerSpanRatio = 0.35,
+                        DrawDebugOverlay = true
+                    };
+
+                    var rootNodes = new List<SheetBlockAreaNode>();
+                    int nextNodeId = 1;
+
+                    foreach (var c in candidates)
+                    {
+                        var root = BuildSheetBlockAreaNodeRecursiveFromFastInfos(
+                            infos,
+                            c.Bounds,
+                            depth: 0,
+                            parentId: null,
+                            treeOptions,
+                            ref nextNodeId);
+
+                        root.LayoutKind = c.Kind.ToString();
+                        root.Confidence = c.Score;
+                        root.Reason = c.Reason;
+
+                        rootNodes.Add(root);
+                    }
+
+                    foreach (var root in rootNodes)
+                    {
+                        WriteSheetBlockAreaTreeLog(ed, root);
+                    }
+
+
                     DrawFastFrameCandidates(db, tr, candidates.Select(x => x.Bounds).ToList());
 
                     int i = 1;
@@ -1116,18 +1155,90 @@ namespace FluxCAD.BricsCAD.Plugin26
             }
         }
 
-//         private sealed class SheetBlockAreaNode
-//         {
-//             public int Id { get; init; }
-//             public int Depth { get; init; }
-//             public int? ParentId { get; init; }
-// 
-//             public Bounds2D Bounds { get; init; }
-//             public string LayoutKind { get; set; } = "Unknown";
-// 
-//             public List<SheetBlockAreaNode> Children { get; } = new();
-//         }
 
+        private static SheetBlockAreaNode BuildSheetBlockAreaNodeRecursiveFromFastInfos(
+    IReadOnlyList<FastFrameScanInfo> infos,
+    Bounds2D areaBounds,
+    int depth,
+    int? parentId,
+    SheetBlockAreaAnalysisOptions options,
+    ref int nextId)
+        {
+            var node = new SheetBlockAreaNode
+            {
+                Id = nextId++,
+                Depth = depth,
+                ParentId = parentId,
+                Bounds = areaBounds,
+                LayoutKind = "Unknown",
+                Confidence = 0.5,
+                Reason = "Fast recursive scan"
+            };
+
+            if (depth >= options.MaxDepth)
+                return node;
+
+            var innerInfos = infos
+                .Where(x => areaBounds.Contains(x.Bounds.Center))
+                .ToList();
+
+            if (innerInfos.Count < options.MinEntitiesPerChild)
+                return node;
+
+            var childBoundsList = DetectChildSheetBlockAreasFromFastInfos(
+                innerInfos,
+                areaBounds,
+                options);
+
+            foreach (var childBounds in childBoundsList)
+            {
+                var child = BuildSheetBlockAreaNodeRecursiveFromFastInfos(
+                    innerInfos,
+                    childBounds,
+                    depth + 1,
+                    node.Id,
+                    options,
+                    ref nextId);
+
+                node.Children.Add(child);
+            }
+
+            return node;
+        }
+
+        private static void WriteSheetBlockAreaTreeLog(
+            Bricscad.EditorInput.Editor ed,
+            SheetBlockAreaNode node)
+        {
+            var indent = new string(' ', node.Depth * 2);
+
+            ed.WriteMessage(
+                $"\n[SheetBlockTree] {indent}" +
+                $"Id={node.Id}, Depth={node.Depth}, Parent={node.ParentId}, " +
+                $"Children={node.Children.Count}, Kind={node.LayoutKind}, " +
+                $"Score={node.Confidence:0.00}, Bounds={node.Bounds}, Reason={node.Reason}");
+
+            foreach (var child in node.Children)
+            {
+                WriteSheetBlockAreaTreeLog(ed, child);
+            }
+        }
+
+        private static List<Bounds2D> DetectChildSheetBlockAreasFromFastInfos(
+    IReadOnlyList<FastFrameScanInfo> infos,
+    Bounds2D parentBounds,
+    SheetBlockAreaAnalysisOptions options)
+        {
+            // 다음 구현 지점:
+            // FastFrameScanInfo 기반 Divider 탐지
+            // → Merge
+            // → Outer reject
+            // → SpanRatio filter
+            // → BuildSubAreas
+            // → Filter
+
+            return new List<Bounds2D>();
+        }
 
         private List<SheetBlockAreaNode> AnalyzeSheetBlockAreaRecursive(
     IReadOnlyList<SheetEntity> entities,
@@ -1195,11 +1306,11 @@ namespace FluxCAD.BricsCAD.Plugin26
             public int MinEntitiesPerChild { get; init; } = 5;
 
             public double DividerPositionToleranceRatio { get; init; } = 0.005;
+            public double OuterDividerRejectToleranceRatio { get; init; } = 0.01;
 
             public bool DrawDebugOverlay { get; init; } = true;
+            public double MinDividerSpanRatio { get; init; } = 0.35;
         }
-
-        public double OuterDividerRejectToleranceRatio { get; init; } = 0.01;
 
         private static SheetBlockAreaNode BuildSheetBlockAreaTree(
     IReadOnlyList<SheetEntity> entities,
@@ -1216,6 +1327,37 @@ namespace FluxCAD.BricsCAD.Plugin26
                 options,
                 ref nextId);
         }
+
+        private static List<FastDividerLine> RejectOuterFrameDividers(
+    IReadOnlyList<FastDividerLine> lines,
+    Bounds2D parentBounds,
+    SheetBlockAreaAnalysisOptions options)
+        {
+            double xTol = parentBounds.Width * options.OuterDividerRejectToleranceRatio;
+            double yTol = parentBounds.Height * options.OuterDividerRejectToleranceRatio;
+
+            return lines
+                .Where(line =>
+                {
+                    if (line.IsVertical)
+                    {
+                        bool nearLeft = Math.Abs(line.Position - parentBounds.MinX) <= xTol;
+                        bool nearRight = Math.Abs(line.Position - parentBounds.MaxX) <= xTol;
+
+                        return !nearLeft && !nearRight;
+                    }
+                    else
+                    {
+                        bool nearBottom = Math.Abs(line.Position - parentBounds.MinY) <= yTol;
+                        bool nearTop = Math.Abs(line.Position - parentBounds.MaxY) <= yTol;
+
+                        return !nearBottom && !nearTop;
+                    }
+                })
+                .ToList();
+        }
+
+
 
 
         private static SheetBlockAreaNode BuildSheetBlockAreaNodeRecursive(
@@ -1293,6 +1435,9 @@ namespace FluxCAD.BricsCAD.Plugin26
             public double Length => Max - Min;
 
             public Bounds2D Bounds { get; init; }
+
+            public double SpanRatio { get; init; }
+            public double Confidence { get; init; }
         }
 
 
@@ -1325,6 +1470,22 @@ namespace FluxCAD.BricsCAD.Plugin26
 
             if (verticals.Count == 0 && horizontals.Count == 0)
                 return new List<Bounds2D>();
+
+            verticals = RejectOuterFrameDividers(
+                verticals,
+                parentBounds,
+                options)
+                .Where(x => x.SpanRatio >= options.MinDividerSpanRatio)
+                .OrderBy(x => x.Position)
+                .ToList();
+
+            horizontals = RejectOuterFrameDividers(
+                horizontals,
+                parentBounds,
+                options)
+                .Where(x => x.SpanRatio >= options.MinDividerSpanRatio)
+                .OrderBy(x => x.Position)
+                .ToList();
 
             var rawAreas = BuildSubAreasFromDividers(
                 parentBounds,
@@ -1519,24 +1680,32 @@ namespace FluxCAD.BricsCAD.Plugin26
 
                 if (looksVertical && b.Height >= minVerticalLength)
                 {
+                    double spanRatio = b.Height / Math.Max(parentBounds.Height, 1e-6);
+
                     result.Add(new FastDividerLine
                     {
                         IsVertical = true,
                         Position = b.Center.X,
                         Min = b.MinY,
                         Max = b.MaxY,
-                        Bounds = b
+                        Bounds = b,
+                        SpanRatio = spanRatio,
+                        Confidence = spanRatio
                     });
                 }
                 else if (looksHorizontal && b.Width >= minHorizontalLength)
                 {
+                    double spanRatio = b.Width / Math.Max(parentBounds.Width, 1e-6);
+
                     result.Add(new FastDividerLine
                     {
                         IsVertical = false,
                         Position = b.Center.Y,
                         Min = b.MinX,
                         Max = b.MaxX,
-                        Bounds = b
+                        Bounds = b,
+                        SpanRatio = spanRatio,
+                        Confidence = spanRatio
                     });
                 }
             }
