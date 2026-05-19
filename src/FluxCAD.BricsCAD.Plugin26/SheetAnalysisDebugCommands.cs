@@ -1099,13 +1099,13 @@ namespace FluxCAD.BricsCAD.Plugin26
                     var treeOptions = new SheetBlockAreaAnalysisOptions
                     {
                         MaxDepth = 2,
-                        MinChildAreaRatio = 0.03,
+                        MinChildAreaRatio = 0.02,
                         MaxChildAreaRatio = 0.92,
                         InnerMarginRatio = 0.01,
                         MinEntitiesPerChild = 5,
                         DividerPositionToleranceRatio = 0.005,
                         OuterDividerRejectToleranceRatio = 0.01,
-                        MinDividerSpanRatio = 0.35,
+                        MinDividerSpanRatio = 0.12,
                         DrawDebugOverlay = true
                     };
 
@@ -1192,6 +1192,15 @@ namespace FluxCAD.BricsCAD.Plugin26
 
             foreach (var childBounds in childBoundsList)
             {
+                if (IsAlmostSameBounds(childBounds, areaBounds))
+                {
+                    var doc = Bricscad.ApplicationServices.Application.DocumentManager.MdiActiveDocument;
+                    doc?.Editor.WriteMessage(
+                        "\n[SheetBlockTree] Skip child: same as parent bounds.");
+
+                    continue;
+                }
+
                 var child = BuildSheetBlockAreaNodeRecursiveFromFastInfos(
                     innerInfos,
                     childBounds,
@@ -1224,7 +1233,7 @@ namespace FluxCAD.BricsCAD.Plugin26
             }
         }
 
-        private static List<Bounds2D> DetectChildSheetBlockAreasFromFastInfos(
+        private static List<Bounds2D> DetectChildSheetBlockAreasFromFastInfos_old(
     IReadOnlyList<FastFrameScanInfo> infos,
     Bounds2D parentBounds,
     SheetBlockAreaAnalysisOptions options)
@@ -1240,13 +1249,324 @@ namespace FluxCAD.BricsCAD.Plugin26
             return new List<Bounds2D>();
         }
 
+        private static List<Bounds2D> MergeChildAreasToRowBands(
+            IReadOnlyList<Bounds2D> areas,
+            Bounds2D parentBounds,
+            SheetBlockAreaAnalysisOptions options)
+        {
+            if (areas == null || areas.Count == 0)
+                return new List<Bounds2D>();
+
+            var sorted = areas
+                .OrderByDescending(x => x.Center.Y)
+                .ThenBy(x => x.MinX)
+                .ToList();
+
+            double yTolerance = Math.Max(parentBounds.Height * 0.01, 20.0);
+
+            var bands = new List<List<Bounds2D>>();
+
+            foreach (var area in sorted)
+            {
+                List<Bounds2D>? matched = null;
+
+                foreach (var band in bands)
+                {
+                    var bandBounds = UnionBounds(band);
+
+                    double overlapY = Math.Max(
+                        0,
+                        Math.Min(bandBounds.MaxY, area.MaxY) -
+                        Math.Max(bandBounds.MinY, area.MinY));
+
+                    double minHeight = Math.Max(
+                        1e-6,
+                        Math.Min(bandBounds.Height, area.Height));
+
+                    double overlapRatio = overlapY / minHeight;
+
+                    bool sameRow =
+                        overlapRatio >= 0.55 ||
+                        Math.Abs(bandBounds.Center.Y - area.Center.Y) <= yTolerance;
+
+                    if (sameRow)
+                    {
+                        matched = band;
+                        break;
+                    }
+                }
+
+                if (matched == null)
+                {
+                    matched = new List<Bounds2D>();
+                    bands.Add(matched);
+                }
+
+                matched.Add(area);
+            }
+
+            return bands
+                .Select(UnionBounds)
+                .OrderByDescending(x => x.Center.Y)
+                .ThenBy(x => x.MinX)
+                .ToList();
+        }
+
+
+
+        private static List<Bounds2D> DetectChildSheetBlockAreasFromFastInfos(
+    IReadOnlyList<FastFrameScanInfo> infos,
+    Bounds2D parentBounds,
+    SheetBlockAreaAnalysisOptions options)
+        {
+            var doc = Bricscad.ApplicationServices.Application.DocumentManager.MdiActiveDocument;
+            if (doc == null)
+                return new List<Bounds2D>();
+
+            var ed = doc.Editor;
+
+            var dividers = DetectFastDividerLinesFromFastInfos(
+                infos,
+                parentBounds,
+                options);
+
+            ed.WriteMessage(
+                $"\n[DetectChildFast] Infos={infos.Count}, Dividers={dividers.Count}, Parent={parentBounds}");
+
+            if (dividers.Count == 0)
+                return new List<Bounds2D>();
+
+            var rawV = dividers.Count(x => x.IsVertical);
+            var rawH = dividers.Count(x => !x.IsVertical);
+
+            ed.WriteMessage(
+                $"\n[DetectChildFast] RawVertical={rawV}, RawHorizontal={rawH}");
+
+            var verticals = MergeFastDividerLines(
+                dividers,
+                parentBounds,
+                isVertical: true,
+                options)
+                .OrderBy(x => x.Position)
+                .ToList();
+
+            var horizontals = MergeFastDividerLines(
+                dividers,
+                parentBounds,
+                isVertical: false,
+                options)
+                .OrderBy(x => x.Position)
+                .ToList();
+
+            ed.WriteMessage(
+                $"\n[DetectChildFast] AfterMerge V={verticals.Count}, H={horizontals.Count}");
+
+            var verticalsAfterOuterReject = RejectOuterFrameDividers(
+                verticals,
+                parentBounds,
+                options)
+                .OrderBy(x => x.Position)
+                .ToList();
+
+            var horizontalsAfterOuterReject = RejectOuterFrameDividers(
+                horizontals,
+                parentBounds,
+                options)
+                .OrderBy(x => x.Position)
+                .ToList();
+
+            ed.WriteMessage(
+                $"\n[DetectChildFast] AfterOuterReject V={verticalsAfterOuterReject.Count}, H={horizontalsAfterOuterReject.Count}");
+
+            verticals = verticalsAfterOuterReject
+                //.Where(x => x.SpanRatio >= options.MinDividerSpanRatio)
+                .OrderBy(x => x.Position)
+                .ToList();
+
+            horizontals = horizontalsAfterOuterReject
+                //.Where(x => x.SpanRatio >= options.MinDividerSpanRatio)
+                .OrderBy(x => x.Position)
+                .ToList();
+
+            ed.WriteMessage(
+                $"\n[DetectChildFast] AfterSpanFilter V={verticals.Count}, H={horizontals.Count}, MinSpan={options.MinDividerSpanRatio:0.000}");
+
+            if (verticals.Count == 0 && horizontals.Count == 0)
+            {
+                ed.WriteMessage("\n[DetectChildFast] Stop: no dividers after filters.");
+                return new List<Bounds2D>();
+            }
+
+            var rawAreas = BuildSubAreasFromDividers(
+                parentBounds,
+                verticals,
+                horizontals);
+
+            ed.WriteMessage(
+                $"\n[DetectChildFast] RawAreas={rawAreas.Count}");
+
+            var filtered = FilterChildSheetBlockAreasFromFastInfos(
+                rawAreas,
+                infos,
+                parentBounds,
+                options);
+
+            ed.WriteMessage(
+                $"\n[DetectChildFast] FilteredAreas={filtered.Count}");
+
+            var rowBands = MergeChildAreasToRowBands(
+                filtered,
+                parentBounds,
+                options);
+
+            ed.WriteMessage(
+                $"\n[DetectChildFast] RowBands={rowBands.Count}");
+
+            return rowBands;
+        }
+
+
+        private static bool IsAlmostSameBounds(
+            Bounds2D a,
+            Bounds2D b,
+            double toleranceRatio = 0.01)
+        {
+            double dx = Math.Abs(a.MinX - b.MinX) + Math.Abs(a.MaxX - b.MaxX);
+            double dy = Math.Abs(a.MinY - b.MinY) + Math.Abs(a.MaxY - b.MaxY);
+
+            double tolX = Math.Max(a.Width, b.Width) * toleranceRatio;
+            double tolY = Math.Max(a.Height, b.Height) * toleranceRatio;
+
+            return dx <= tolX && dy <= tolY;
+        }
+
+        private static List<FastDividerLine> DetectFastDividerLinesFromFastInfos(
+            IReadOnlyList<FastFrameScanInfo> infos,
+            Bounds2D parentBounds,
+            SheetBlockAreaAnalysisOptions options)
+        {
+            var result = new List<FastDividerLine>();
+
+            double minVerticalLength = parentBounds.Height * options.MinDividerSpanRatio;
+            double minHorizontalLength = parentBounds.Width * options.MinDividerSpanRatio;
+
+            double maxVerticalWidth = parentBounds.Width * 0.02;
+            double maxHorizontalHeight = parentBounds.Height * 0.02;
+
+            foreach (var info in infos)
+            {
+                var b = info.Bounds;
+
+                if (b.IsEmpty)
+                    continue;
+
+                if (!parentBounds.Intersects(b))
+                    continue;
+
+                bool looksVertical =
+                    b.Height >= minVerticalLength &&
+                    b.Width <= maxVerticalWidth;
+
+                bool looksHorizontal =
+                    b.Width >= minHorizontalLength &&
+                    b.Height <= maxHorizontalHeight;
+
+                if (looksVertical)
+                {
+                    double spanRatio = b.Height / Math.Max(parentBounds.Height, 1e-6);
+
+                    result.Add(new FastDividerLine
+                    {
+                        IsVertical = true,
+                        Position = b.Center.X,
+                        Min = b.MinY,
+                        Max = b.MaxY,
+                        Bounds = b,
+                        SpanRatio = spanRatio,
+                        Confidence = spanRatio
+                    });
+                }
+                else if (looksHorizontal)
+                {
+                    double spanRatio = b.Width / Math.Max(parentBounds.Width, 1e-6);
+
+                    result.Add(new FastDividerLine
+                    {
+                        IsVertical = false,
+                        Position = b.Center.Y,
+                        Min = b.MinX,
+                        Max = b.MaxX,
+                        Bounds = b,
+                        SpanRatio = spanRatio,
+                        Confidence = spanRatio
+                    });
+                }
+            }
+
+            return result;
+        }
+
+        private static List<Bounds2D> FilterChildSheetBlockAreasFromFastInfos(
+    IReadOnlyList<Bounds2D> candidates,
+    IReadOnlyList<FastFrameScanInfo> infos,
+    Bounds2D parentBounds,
+    SheetBlockAreaAnalysisOptions options)
+        {
+            var result = new List<Bounds2D>();
+
+            var doc = Bricscad.ApplicationServices.Application.DocumentManager.MdiActiveDocument;
+            if (doc == null)
+                return result;
+
+            var ed = doc.Editor;
+
+            foreach (var area in candidates)
+            {
+                if (area.IsZeroArea || area.IsEmpty)
+                    continue;
+
+                var areaRatio = area.Area / Math.Max(parentBounds.Area, 1e-6);
+
+                if (areaRatio < options.MinChildAreaRatio)
+                    continue;
+
+                if (areaRatio > options.MaxChildAreaRatio)
+                    continue;
+
+                var insideCount = infos.Count(x =>
+                    !x.Bounds.IsZeroArea &&
+                    !x.Bounds.IsEmpty &&
+                    area.Contains(x.Bounds.Center));
+
+                bool keep =
+                    areaRatio >= options.MinChildAreaRatio &&
+                    areaRatio <= options.MaxChildAreaRatio &&
+                    insideCount >= options.MinEntitiesPerChild;
+
+                if (insideCount < options.MinEntitiesPerChild)
+                    continue;
+
+                ed.WriteMessage(
+                    $"\n[ChildAreaCandidate] Area={area}, Ratio={areaRatio:0.000}, Inside={insideCount}, Keep={keep}");
+
+                if (!keep)
+                    continue;
+
+                result.Add(area);
+            }
+
+            return result;
+        }
+
+
+
         private List<SheetBlockAreaNode> AnalyzeSheetBlockAreaRecursive(
-    IReadOnlyList<SheetEntity> entities,
-    Bounds2D areaBounds,
-    int depth,
-    int maxDepth,
-    int? parentId,
-    ref int nextId)
+            IReadOnlyList<SheetEntity> entities,
+            Bounds2D areaBounds,
+            int depth,
+            int maxDepth,
+            int? parentId,
+            ref int nextId)
         {
             var node = new SheetBlockAreaNode
             {
@@ -1410,6 +1730,15 @@ namespace FluxCAD.BricsCAD.Plugin26
 
                 if (childAreaRatio > options.MaxChildAreaRatio)
                     continue;
+
+                if (IsAlmostSameBounds(childBounds, areaBounds))
+                {
+                    var doc = Bricscad.ApplicationServices.Application.DocumentManager.MdiActiveDocument;
+                    doc?.Editor.WriteMessage(
+                        "\n[SheetBlockTree] Skip child: same as parent bounds.");
+
+                    continue;
+                }
 
                 var child = BuildSheetBlockAreaNodeRecursive(
                     innerEntities,
