@@ -1194,8 +1194,12 @@ namespace FluxCAD.BricsCAD.Plugin26
 
             public int MinEntitiesPerChild { get; init; } = 5;
 
+            public double DividerPositionToleranceRatio { get; init; } = 0.005;
+
             public bool DrawDebugOverlay { get; init; } = true;
         }
+
+        public double OuterDividerRejectToleranceRatio { get; init; } = 0.01;
 
         private static SheetBlockAreaNode BuildSheetBlockAreaTree(
     IReadOnlyList<SheetEntity> entities,
@@ -1294,32 +1298,38 @@ namespace FluxCAD.BricsCAD.Plugin26
 
 
         private static List<Bounds2D> DetectChildSheetBlockAreas(
-    IReadOnlyList<SheetEntity> entities,
-    Bounds2D parentBounds,
-    SheetBlockAreaAnalysisOptions options)
+            IReadOnlyList<SheetEntity> entities,
+            Bounds2D parentBounds,
+            SheetBlockAreaAnalysisOptions options)
         {
-            // 다음 구현 지점:
-            // 1. parentBounds 내부 엔티티만 대상으로 빠른 구조 스캔
-            // 2. 큰 내부 분할선 찾기
-            // 3. SubBlock 후보 bounds 생성
-            // 4. 너무 작은 체크/화살표/마크 제거
-
             var dividers = DetectFastDividerLines(entities, parentBounds);
 
             if (dividers.Count == 0)
                 return new List<Bounds2D>();
 
-            var verticals = dividers
-                .Where(x => x.IsVertical)
+            var verticals = MergeFastDividerLines(
+                dividers,
+                parentBounds,
+                isVertical: true,
+                options)
                 .OrderBy(x => x.Position)
                 .ToList();
 
-            var horizontals = dividers
-                .Where(x => !x.IsVertical)
+            var horizontals = MergeFastDividerLines(
+                dividers,
+                parentBounds,
+                isVertical: false,
+                options)
                 .OrderBy(x => x.Position)
                 .ToList();
 
-            var rawAreas = BuildSubAreasFromDividers(parentBounds, verticals, horizontals);
+            if (verticals.Count == 0 && horizontals.Count == 0)
+                return new List<Bounds2D>();
+
+            var rawAreas = BuildSubAreasFromDividers(
+                parentBounds,
+                verticals,
+                horizontals);
 
             return FilterChildSheetBlockAreas(
                 rawAreas,
@@ -1327,6 +1337,80 @@ namespace FluxCAD.BricsCAD.Plugin26
                 parentBounds,
                 options);
         }
+
+        public double DividerPositionToleranceRatio { get; init; } = 0.005;
+
+        private static List<FastDividerLine> MergeFastDividerLines(
+    IReadOnlyList<FastDividerLine> lines,
+    Bounds2D parentBounds,
+    bool isVertical,
+    SheetBlockAreaAnalysisOptions options)
+        {
+            if (lines.Count == 0)
+                return new List<FastDividerLine>();
+
+            double tolerance = isVertical
+                ? parentBounds.Width * options.DividerPositionToleranceRatio
+                : parentBounds.Height * options.DividerPositionToleranceRatio;
+
+            var ordered = lines
+                .Where(x => x.IsVertical == isVertical)
+                .OrderBy(x => x.Position)
+                .ToList();
+
+            var result = new List<FastDividerLine>();
+            var group = new List<FastDividerLine>();
+
+            foreach (var line in ordered)
+            {
+                if (group.Count == 0)
+                {
+                    group.Add(line);
+                    continue;
+                }
+
+                if (Math.Abs(line.Position - group.Average(x => x.Position)) <= tolerance)
+                {
+                    group.Add(line);
+                }
+                else
+                {
+                    result.Add(MergeDividerGroup(group, isVertical));
+                    group.Clear();
+                    group.Add(line);
+                }
+            }
+
+            if (group.Count > 0)
+                result.Add(MergeDividerGroup(group, isVertical));
+
+            return result;
+        }
+
+        private static FastDividerLine MergeDividerGroup(
+    IReadOnlyList<FastDividerLine> group,
+    bool isVertical)
+        {
+            var position = group.Average(x => x.Position);
+            var min = group.Min(x => x.Min);
+            var max = group.Max(x => x.Max);
+
+            var minX = group.Min(x => x.Bounds.MinX);
+            var minY = group.Min(x => x.Bounds.MinY);
+            var maxX = group.Max(x => x.Bounds.MaxX);
+            var maxY = group.Max(x => x.Bounds.MaxY);
+
+            return new FastDividerLine
+            {
+                IsVertical = isVertical,
+                Position = position,
+                Min = min,
+                Max = max,
+                Bounds = new Bounds2D(minX, minY, maxX, maxY)
+            };
+        }
+
+
 
         private static List<Bounds2D> FilterChildSheetBlockAreas(
     IReadOnlyList<Bounds2D> candidates,
