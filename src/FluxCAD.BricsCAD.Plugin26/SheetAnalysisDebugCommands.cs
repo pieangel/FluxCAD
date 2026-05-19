@@ -1319,8 +1319,51 @@ namespace FluxCAD.BricsCAD.Plugin26
                 .OrderBy(x => x.Position)
                 .ToList();
 
-            return BuildSubAreasFromDividers(parentBounds, verticals, horizontals);
+            var rawAreas = BuildSubAreasFromDividers(parentBounds, verticals, horizontals);
+
+            return FilterChildSheetBlockAreas(
+                rawAreas,
+                entities,
+                parentBounds,
+                options);
         }
+
+        private static List<Bounds2D> FilterChildSheetBlockAreas(
+    IReadOnlyList<Bounds2D> candidates,
+    IReadOnlyList<SheetEntity> entities,
+    Bounds2D parentBounds,
+    SheetBlockAreaAnalysisOptions options)
+        {
+            var result = new List<Bounds2D>();
+
+            foreach (var area in candidates)
+            {
+                if (area.IsZeroArea)
+                    continue;
+
+                var areaRatio = area.Area / Math.Max(parentBounds.Area, 1e-6);
+
+                if (areaRatio < options.MinChildAreaRatio)
+                    continue;
+
+                if (areaRatio > options.MaxChildAreaRatio)
+                    continue;
+
+                var insideEntities = entities
+                    .Where(e => e != null)
+                    .Where(e => !e.Bounds.IsZeroArea)
+                    .Where(e => area.Contains(e.Bounds.Center))
+                    .ToList();
+
+                if (insideEntities.Count < options.MinEntitiesPerChild)
+                    continue;
+
+                result.Add(area);
+            }
+
+            return result;
+        }
+
 
 
         private static List<Bounds2D> BuildSubAreasFromDividers(
