@@ -1067,6 +1067,18 @@ namespace FluxCAD.BricsCAD.Plugin26
 
                     var candidates = new List<FastSheetBlockFrameCandidate>();
 
+                    var layoutKind = DetectFastDocumentLayoutKind(candidates, infos, docBounds);
+
+                    ed.WriteMessage($"\n[FAST-SHEET-BLOCK] LayoutKind={layoutKind}");
+
+                    candidates = SelectStructuralCandidatesByLayoutKind(
+                            layoutKind,
+                            candidates,
+                            infos,
+                            docBounds)
+                        .OrderByDescending(x => x.Score)
+                        .ToList();
+
                     candidates.AddRange(FindClosedRectPolylineFrameCandidates(infos, docBounds));
                     candidates.AddRange(FindLineRectangleFrameCandidates(infos, docBounds));
 
@@ -1104,6 +1116,343 @@ namespace FluxCAD.BricsCAD.Plugin26
             }
         }
 
+        private sealed class SheetBlockAreaNode
+        {
+            public int Id { get; init; }
+            public int Depth { get; init; }
+            public int? ParentId { get; init; }
+
+            public Bounds2D Bounds { get; init; }
+            public string LayoutKind { get; set; } = "Unknown";
+
+            public List<SheetBlockAreaNode> Children { get; } = new();
+        }
+
+
+        private List<SheetBlockAreaNode> AnalyzeSheetBlockAreaRecursive(
+    IReadOnlyList<SheetEntity> entities,
+    Bounds2D areaBounds,
+    int depth,
+    int maxDepth,
+    int? parentId,
+    ref int nextId)
+        {
+            var node = new SheetBlockAreaNode
+            {
+                Id = nextId++,
+                Depth = depth,
+                ParentId = parentId,
+                Bounds = areaBounds,
+                LayoutKind = "Unknown"
+            };
+
+            if (depth >= maxDepth)
+                return new List<SheetBlockAreaNode> { node };
+
+            var innerEntities = entities
+                .Where(e => e != null)
+                .Where(e => !e.Bounds.IsEmpty)
+                .Where(e => areaBounds.ContainsCenterOf(e.Bounds))
+                .ToList();
+
+            // 여기서 기존 Fast Frame / Occupancy / Structure Scan 로직을
+            // areaBounds 내부 기준으로 다시 실행
+
+            // subCandidates 생성 후:
+            // foreach (var childBounds in subCandidates)
+            //     node.Children.AddRange(...)
+
+            return new List<SheetBlockAreaNode> { node };
+        }
+
+
+        private static bool LooksLikeGridTable(
+    IReadOnlyList<FastFrameScanInfo> infos,
+    Bounds2D docBounds)
+        {
+            var lines = infos
+                .Select(x => x.Line)
+                .Where(x => x != null)
+                .ToList();
+
+            if (lines.Count < 20)
+                return false;
+
+            var horizontalYs = new List<double>();
+            var verticalXs = new List<double>();
+
+            foreach (var ln in lines)
+            {
+                double dx = ln.EndPoint.X - ln.StartPoint.X;
+                double dy = ln.EndPoint.Y - ln.StartPoint.Y;
+                double len = Math.Sqrt(dx * dx + dy * dy);
+
+                if (len <= 0)
+                    continue;
+
+                if (Math.Abs(dy) <= len * 0.002)
+                    horizontalYs.Add((ln.StartPoint.Y + ln.EndPoint.Y) * 0.5);
+
+                if (Math.Abs(dx) <= len * 0.002)
+                    verticalXs.Add((ln.StartPoint.X + ln.EndPoint.X) * 0.5);
+            }
+
+            var yGroups = ClusterPositions(horizontalYs, docBounds.Height * 0.01);
+            var xGroups = ClusterPositions(verticalXs, docBounds.Width * 0.01);
+
+            return xGroups.Count >= 5 && yGroups.Count >= 3;
+        }
+
+        private static bool LooksLikeHorizontalBand(
+    IReadOnlyList<FastFrameScanInfo> infos,
+    Bounds2D docBounds)
+        {
+            var centers = infos
+                .Where(x => !x.Bounds.IsEmpty)
+                .Select(x => x.Bounds.Center.Y)
+                .ToList();
+
+            if (centers.Count < 30)
+                return false;
+
+            var yGroups = ClusterPositions(centers, docBounds.Height * 0.04);
+
+            if (yGroups.Count < 2)
+                return false;
+
+            var dominantGroups = yGroups
+                .Where(g => g.Count >= centers.Count * 0.08)
+                .ToList();
+
+            return dominantGroups.Count >= 2;
+        }
+
+        private static List<List<double>> ClusterPositions(
+    IReadOnlyList<double> positions,
+    double tolerance)
+        {
+            var result = new List<List<double>>();
+
+            if (positions == null || positions.Count == 0)
+                return result;
+
+            var ordered = positions.OrderBy(x => x).ToList();
+
+            var current = new List<double> { ordered[0] };
+
+            for (int i = 1; i < ordered.Count; i++)
+            {
+                var prevAvg = current.Average();
+
+                if (Math.Abs(ordered[i] - prevAvg) <= tolerance)
+                {
+                    current.Add(ordered[i]);
+                }
+                else
+                {
+                    result.Add(current);
+                    current = new List<double> { ordered[i] };
+                }
+            }
+
+            result.Add(current);
+
+            return result;
+        }
+
+        private static List<FastSheetBlockFrameCandidate> SelectStructuralCandidatesByLayoutKind(
+    FastDocumentLayoutKind layoutKind,
+    IReadOnlyList<FastSheetBlockFrameCandidate> candidates,
+    IReadOnlyList<FastFrameScanInfo> infos,
+    Bounds2D docBounds)
+        {
+            return layoutKind switch
+            {
+                FastDocumentLayoutKind.OuterFrame =>
+                    SelectOuterMostFrameCandidates(candidates, docBounds),
+
+                FastDocumentLayoutKind.MultiFrame =>
+                    SelectMultiFrameCandidates(candidates, docBounds),
+
+                FastDocumentLayoutKind.GridTable =>
+                    BuildGridTableCandidate(infos, docBounds),
+
+                FastDocumentLayoutKind.HorizontalBand =>
+                    BuildHorizontalBandCandidates(infos, docBounds),
+
+                _ =>
+                    SelectOuterMostFrameCandidates(candidates, docBounds)
+            };
+        }
+
+        private static List<FastSheetBlockFrameCandidate> SelectOuterMostFrameCandidates(
+    IReadOnlyList<FastSheetBlockFrameCandidate> candidates,
+    Bounds2D docBounds)
+        {
+            var ordered = candidates
+                .Where(x => x != null && !x.Bounds.IsEmpty)
+                .OrderByDescending(x => x.Bounds.Area)
+                .ThenByDescending(x => x.Score)
+                .ToList();
+
+            var result = new List<FastSheetBlockFrameCandidate>();
+
+            double tol = Math.Max(docBounds.Width, docBounds.Height) * 0.005;
+
+            foreach (var c in ordered)
+            {
+                bool containedByExisting = result.Any(r =>
+                    ContainsBounds(r.Bounds, c.Bounds, tol));
+
+                if (containedByExisting)
+                    continue;
+
+                result.Add(c);
+            }
+
+            return result;
+        }
+
+        private static List<FastSheetBlockFrameCandidate> SelectMultiFrameCandidates(
+            IReadOnlyList<FastSheetBlockFrameCandidate> candidates,
+            Bounds2D docBounds)
+        {
+            var ordered = candidates
+                .Where(x => x != null && !x.Bounds.IsEmpty)
+                .OrderByDescending(x => x.Score)
+                .ThenByDescending(x => x.Bounds.Area)
+                .ToList();
+
+            var result = new List<FastSheetBlockFrameCandidate>();
+
+            double tol = Math.Max(docBounds.Width, docBounds.Height) * 0.005;
+
+            foreach (var c in ordered)
+            {
+                bool duplicate = result.Any(r =>
+                    AreSimilarBounds(r.Bounds, c.Bounds, tol));
+
+                if (duplicate)
+                    continue;
+
+                bool containedByLarger = result.Any(r =>
+                    ContainsBounds(r.Bounds, c.Bounds, tol) &&
+                    c.Bounds.Area < r.Bounds.Area * 0.20);
+
+                if (containedByLarger)
+                    continue;
+
+                result.Add(c);
+            }
+
+            return result;
+        }
+
+        private static List<FastSheetBlockFrameCandidate> BuildGridTableCandidate(
+    IReadOnlyList<FastFrameScanInfo> infos,
+    Bounds2D docBounds)
+        {
+            var valid = infos
+                .Where(x => !x.Bounds.IsEmpty)
+                .Select(x => x.Bounds)
+                .ToList();
+
+            if (valid.Count == 0)
+                return new List<FastSheetBlockFrameCandidate>();
+
+            var b = Bounds2DHelper.Union(valid);
+
+            return new List<FastSheetBlockFrameCandidate>
+    {
+        new FastSheetBlockFrameCandidate
+        {
+            Kind = FastSheetBlockCandidateKind.GridTable,
+            Bounds = b,
+            Score = 1.20,
+            InsideEntityCount = valid.Count,
+            Reason = "GridTable|UnionOfFastScanInfos"
+        }
+    };
+        }
+
+        private static List<FastSheetBlockFrameCandidate> BuildHorizontalBandCandidates(
+    IReadOnlyList<FastFrameScanInfo> infos,
+    Bounds2D docBounds)
+        {
+            var result = new List<FastSheetBlockFrameCandidate>();
+
+            var valid = infos
+                .Where(x => !x.Bounds.IsEmpty)
+                .ToList();
+
+            var yGroups = valid
+                .GroupBy(x => FindBandIndex(x.Bounds.Center.Y, docBounds))
+                .Where(g => g.Count() >= valid.Count * 0.05)
+                .ToList();
+
+            foreach (var g in yGroups)
+            {
+                var bounds = g.Select(x => x.Bounds).ToList();
+                var b = Bounds2DHelper.Union(bounds);
+
+                if (b.IsEmpty)
+                    continue;
+
+                result.Add(new FastSheetBlockFrameCandidate
+                {
+                    Kind = FastSheetBlockCandidateKind.HorizontalBand,
+                    Bounds = b,
+                    Score = 0.95 + Math.Min(g.Count() / 1000.0, 0.20),
+                    InsideEntityCount = g.Count(),
+                    Reason = $"HorizontalBand|Count={g.Count()}"
+                });
+            }
+
+            return result;
+        }
+
+        private static int FindBandIndex(double y, Bounds2D docBounds)
+        {
+            const int bandCount = 12;
+
+            if (docBounds.Height <= 0)
+                return 0;
+
+            var t = (y - docBounds.MinY) / docBounds.Height;
+            var idx = (int)Math.Floor(t * bandCount);
+
+            return Math.Max(0, Math.Min(bandCount - 1, idx));
+        }
+
+
+
+        private static FastDocumentLayoutKind DetectFastDocumentLayoutKind(
+    IReadOnlyList<FastSheetBlockFrameCandidate> candidates,
+    IReadOnlyList<FastFrameScanInfo> infos,
+    Bounds2D docBounds)
+        {
+            var closedRects = candidates
+                .Where(x => x.Kind == FastSheetBlockCandidateKind.ClosedRectPolyline)
+                .Where(x => !x.Bounds.IsEmpty)
+                .ToList();
+
+            if (closedRects.Count == 1)
+                return FastDocumentLayoutKind.OuterFrame;
+
+            if (closedRects.Count >= 2)
+                return FastDocumentLayoutKind.MultiFrame;
+
+            if (LooksLikeGridTable(infos, docBounds))
+                return FastDocumentLayoutKind.GridTable;
+
+            if (LooksLikeHorizontalBand(infos, docBounds))
+                return FastDocumentLayoutKind.HorizontalBand;
+
+            return FastDocumentLayoutKind.FreeCluster;
+        }
+
+
+
         private sealed class FastFrameScanInfo
         {
             public ObjectId Id { get; init; }
@@ -1120,10 +1469,16 @@ namespace FluxCAD.BricsCAD.Plugin26
 
         private sealed class FastSheetBlockFrameCandidate
         {
-            public string Kind { get; init; } = "";
+            public FastSheetBlockCandidateKind Kind { get; init; }
+
             public Bounds2D Bounds { get; init; } = Bounds2D.Empty;
+
             public double Score { get; set; }
+
             public int InsideEntityCount { get; set; }
+
+            public int Depth { get; set; }
+
             public string Reason { get; set; } = "";
         }
 
@@ -1239,7 +1594,7 @@ namespace FluxCAD.BricsCAD.Plugin26
 
                 result.Add(new FastSheetBlockFrameCandidate
                 {
-                    Kind = "ClosedRectPolyline",
+                    Kind = FastSheetBlockCandidateKind.ClosedRectPolyline,
                     Bounds = b,
                     Score = 0.70 + Math.Min(areaRatio, 0.25),
                     Reason = $"PolylineHandle={info.Handle}"
@@ -1357,7 +1712,7 @@ namespace FluxCAD.BricsCAD.Plugin26
 
                             result.Add(new FastSheetBlockFrameCandidate
                             {
-                                Kind = "LineRect",
+                                Kind = FastSheetBlockCandidateKind.LineRect,
                                 Bounds = rect,
                                 Score = 0.60 + Math.Min(areaRatio, 0.30),
                                 Reason = "4 Lines"
