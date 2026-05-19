@@ -17550,8 +17550,8 @@ namespace FluxCAD.BricsCAD.Plugin26
             doc.Editor.WriteMessage($"\n[실행] PDF 내보내기 명령을 전달했습니다: {pdfPath}");
         }
 
-        [CommandMethod("FLUX_EXPORT_HD_FULL")]
-        public void FluxExportHdFull()
+        [CommandMethod("FLUX_EXPORT_HD_FULL_OLD")]
+        public void FluxExportHdFull_old()
         {
             Document doc = Application.DocumentManager.MdiActiveDocument;
             Editor ed = doc.Editor;
@@ -17572,6 +17572,72 @@ namespace FluxCAD.BricsCAD.Plugin26
             ed.WriteMessage($"\n[완료] 전체 이미지 생성 시도 완료: {path}");
         }
 
+        [CommandMethod("FLUX_EXPORT_HD_FULL")]
+        public void FluxExportHdFull()
+        {
+            Document doc = Application.DocumentManager.MdiActiveDocument;
+            Editor ed = doc.Editor;
+
+            Application.SetSystemVariable("ANTIALIASSCREEN", 2);
+            Application.SetSystemVariable("LWDISPLAY", 0);
+
+            ed.Command("._ZOOM", "_E");
+            ed.Regen();
+
+            string path = Path.Combine(
+                Path.GetDirectoryName(doc.Database.Filename),
+                "Full_Drawing_HD.png");
+
+            if (File.Exists(path))
+                File.Delete(path);
+
+            ed.Command("PNGOUT", "\"" + path + "\"", "_ALL", "");
+
+            if (!WaitForFileReady(path, 10000))
+            {
+                ed.WriteMessage($"\n[실패] PNG 파일이 준비되지 않았습니다: {path}");
+                return;
+            }
+
+            ed.WriteMessage($"\n[완료] 전체 이미지 생성 완료: {path}");
+        }
+
+
+        private static bool WaitForFileReady(string path, int timeoutMs = 10000)
+        {
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+
+            while (sw.ElapsedMilliseconds < timeoutMs)
+            {
+                try
+                {
+                    if (File.Exists(path))
+                    {
+                        var info = new FileInfo(path);
+
+                        if (info.Length > 0)
+                        {
+                            using (var stream = new FileStream(
+                                path,
+                                FileMode.Open,
+                                FileAccess.Read,
+                                FileShare.ReadWrite))
+                            {
+                                return true;
+                            }
+                        }
+                    }
+                }
+                catch
+                {
+                    // 아직 쓰는 중이면 잠시 기다림
+                }
+
+                System.Threading.Thread.Sleep(100);
+            }
+
+            return false;
+        }
 
 
         [CommandMethod("FLUX_EXPORT_FULL")]

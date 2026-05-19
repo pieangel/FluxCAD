@@ -1,0 +1,164 @@
+{
+  "source_image": "F:\\Projects\\FluxCAD\\sheet_cluster_detector\\inputs\\Full_Drawing_HD.png",
+  "image_size": {
+    "width": 2850,
+    "height": 1150
+  },
+  "cluster_count": 3,
+  "clusters": [
+    {
+      "id": "cluster_000",
+      "type_hint": "LongRowSheetCollection",
+      "pixel_bounds": {
+        "x": 1036,
+        "y": 288,
+        "width": 1156,
+        "height": 194
+      },
+      "area": 96594,
+      "aspect_ratio": 5.9588,
+      "child_count": 2,
+      "children": [
+        {
+          "pixel_bounds": {
+            "x": 1036,
+            "y": 288,
+            "width": 119,
+            "height": 191
+          },
+          "local_bounds": {
+            "x": 0,
+            "y": 0,
+            "width": 119,
+            "height": 191
+          },
+          "area": 15690,
+          "aspect_ratio": 0.623
+        },
+        {
+          "pixel_bounds": {
+            "x": 1200,
+            "y": 369,
+            "width": 992,
+            "height": 113
+          },
+          "local_bounds": {
+            "x": 164,
+            "y": 81,
+            "width": 992,
+            "height": 113
+          },
+          "area": 55648,
+          "aspect_ratio": 8.7788
+        }
+      ],
+      "confidence": 0.65,
+      "reason": [
+        "connected_component_after_cluster_morphology",
+        "wide_aspect_ratio"
+      ]
+    },
+    {
+      "id": "cluster_001",
+      "type_hint": "InternalContentCluster",
+      "pixel_bounds": {
+        "x": 912,
+        "y": 548,
+        "width": 739,
+        "height": 381
+      },
+      "area": 148658,
+      "aspect_ratio": 1.9396,
+      "child_count": 3,
+      "children": [
+        {
+          "pixel_bounds": {
+            "x": 912,
+            "y": 548,
+            "width": 444,
+            "height": 150
+          },
+          "local_bounds": {
+            "x": 0,
+            "y": 0,
+            "width": 444,
+            "height": 150
+          },
+          "area": 43935,
+          "aspect_ratio": 2.96
+        },
+        {
+          "pixel_bounds": {
+            "x": 929,
+            "y": 718,
+            "width": 713,
+            "height": 93
+          },
+          "local_bounds": {
+            "x": 17,
+            "y": 170,
+            "width": 713,
+            "height": 93
+          },
+          "area": 37766,
+          "aspect_ratio": 7.6667
+        },
+        {
+          "pixel_bounds": {
+            "x": 929,
+            "y": 835,
+            "width": 722,
+            "height": 94
+          },
+          "local_bounds": {
+            "x": 17,
+            "y": 287,
+            "width": 722,
+            "height": 94
+          },
+          "area": 38176,
+          "aspect_ratio": 7.6809
+        }
+      ],
+      "confidence": 0.55,
+      "reason": [
+        "connected_component_after_cluster_morphology"
+      ]
+    },
+    {
+      "id": "cluster_002",
+      "type_hint": "InternalContentCluster",
+      "pixel_bounds": {
+        "x": 917,
+        "y": 966,
+        "width": 150,
+        "height": 55
+      },
+      "area": 7430,
+      "aspect_ratio": 2.7273,
+      "child_count": 1,
+      "children": [
+        {
+          "pixel_bounds": {
+            "x": 917,
+            "y": 966,
+            "width": 150,
+            "height": 55
+          },
+          "local_bounds": {
+            "x": 0,
+            "y": 0,
+            "width": 150,
+            "height": 55
+          },
+          "area": 6092,
+          "aspect_ratio": 2.7273
+        }
+      ],
+      "confidence": 0.55,
+      "reason": [
+        "connected_component_after_cluster_morphology"
+      ]
+    }
+  ]
+}

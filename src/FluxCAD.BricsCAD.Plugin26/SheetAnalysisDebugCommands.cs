@@ -1013,6 +1013,1019 @@ namespace FluxCAD.BricsCAD.Plugin26
             public ClosedOuterLoop? OuterLoop { get; set; }
         }
 
+        private enum FastDocumentLayoutKind
+        {
+            Unknown,
+            OuterFrame,
+            MultiFrame,
+            GridTable,
+            HorizontalBand,
+            FreeCluster
+        }
+
+        private enum FastSheetBlockCandidateKind
+        {
+            ClosedRectPolyline,
+            LineRect,
+            GridTable,
+            HorizontalBand,
+            FreeCluster
+        }
+
+
+
+        [CommandMethod("FLUX_DEBUG_FAST_SHEET_BLOCK_FRAMES")]
+        public void FluxDebugFastSheetBlockFrames()
+        {
+            var doc = Bricscad.ApplicationServices.Application.DocumentManager.MdiActiveDocument;
+            if (doc == null)
+                return;
+
+            var db = doc.Database;
+            var ed = doc.Editor;
+
+            try
+            {
+                using (doc.LockDocument())
+                using (var tr = db.TransactionManager.StartTransaction())
+                {
+                    var msId = SymbolUtilityServices.GetBlockModelSpaceId(db);
+                    var ms = (BlockTableRecord)tr.GetObject(msId, OpenMode.ForRead);
+
+                    var infos = CollectFastFrameScanInfos(tr, ms);
+
+                    if (infos.Count == 0)
+                    {
+                        ed.WriteMessage("\n[FAST-SHEET-BLOCK] scan info empty.");
+                        return;
+                    }
+
+                    var docBounds = ComputeFastRobustBounds(infos);
+
+                    ed.WriteMessage($"\n[FAST-SHEET-BLOCK] ScanInfos={infos.Count}");
+                    ed.WriteMessage($"\n[FAST-SHEET-BLOCK] RobustBounds={docBounds}");
+
+                    var candidates = new List<FastSheetBlockFrameCandidate>();
+
+                    candidates.AddRange(FindClosedRectPolylineFrameCandidates(infos, docBounds));
+                    candidates.AddRange(FindLineRectangleFrameCandidates(infos, docBounds));
+
+                    ed.WriteMessage($"\n[FAST-SHEET-BLOCK] RawCandidates={candidates.Count}");
+
+                    candidates = ValidateFastFrameCandidates(candidates, infos, docBounds)
+                        .OrderByDescending(x => x.Score)
+                        .ToList();
+
+                    ed.WriteMessage($"\n[FAST-SHEET-BLOCK] ValidCandidates={candidates.Count}");
+
+                    candidates = DeduplicateFastFrameCandidates(candidates, docBounds)
+                        .OrderByDescending(x => x.Score)
+                        .ToList();
+
+                    ed.WriteMessage($"\n[FAST-SHEET-BLOCK] FinalCandidates={candidates.Count}");
+
+                    DrawFastFrameCandidates(db, tr, candidates.Select(x => x.Bounds).ToList());
+
+                    int i = 1;
+                    foreach (var c in candidates)
+                    {
+                        ed.WriteMessage(
+                            $"\n  [{i:000}] Kind={c.Kind}, Score={c.Score:0.00}, " +
+                            $"Inside={c.InsideEntityCount}, Bounds={c.Bounds}, Reason={c.Reason}");
+                        i++;
+                    }
+
+                    tr.Commit();
+                }
+            }
+            catch (System.Exception ex)
+            {
+                ed.WriteMessage($"\n[FAST-SHEET-BLOCK] failed: {ex}");
+            }
+        }
+
+        private sealed class FastFrameScanInfo
+        {
+            public ObjectId Id { get; init; }
+            public string Handle { get; init; } = "";
+            public string Kind { get; init; } = "";
+            public Bounds2D Bounds { get; init; } = Bounds2D.Empty;
+
+            public Line? Line { get; init; }
+            public Teigha.DatabaseServices.Polyline? Polyline { get; init; }
+
+            public bool IsLine => Line != null;
+            public bool IsPolyline => Polyline != null;
+        }
+
+        private sealed class FastSheetBlockFrameCandidate
+        {
+            public string Kind { get; init; } = "";
+            public Bounds2D Bounds { get; init; } = Bounds2D.Empty;
+            public double Score { get; set; }
+            public int InsideEntityCount { get; set; }
+            public string Reason { get; set; } = "";
+        }
+
+        private static List<FastFrameScanInfo> CollectFastFrameScanInfos(
+            Transaction tr,
+            BlockTableRecord ms)
+        {
+            var result = new List<FastFrameScanInfo>();
+
+            foreach (ObjectId id in ms)
+            {
+                if (!id.IsValid || id.IsErased)
+                    continue;
+
+                if (!id.ObjectClass.IsDerivedFrom(RXObject.GetClass(typeof(Entity))))
+                    continue;
+
+                var ent = tr.GetObject(id, OpenMode.ForRead, false) as Entity;
+                if (ent == null || ent.IsErased)
+                    continue;
+
+                // 후보 생성은 Line / Polyline 중심.
+                // BlockReference는 후보로 쓰지 않음.
+                if (ent is not Line && ent is not Teigha.DatabaseServices.Polyline)
+                    continue;
+
+                if (!TryGetEntityBounds2D(ent, out var b))
+                    continue;
+
+                if (b.IsEmpty || b.Width <= 0 || b.Height <= 0)
+                {
+                    // 수평/수직 line은 높이/폭이 0일 수 있으므로 line은 허용
+                    if (ent is not Line)
+                        continue;
+                }
+
+                result.Add(new FastFrameScanInfo
+                {
+                    Id = id,
+                    Handle = ent.Handle.ToString(),
+                    Kind = ent.GetType().Name,
+                    Bounds = b,
+                    Line = ent as Line,
+                    Polyline = ent as Teigha.DatabaseServices.Polyline
+                });
+            }
+
+            return result;
+        }
+
+        private static Bounds2D ComputeFastRobustBounds(IReadOnlyList<FastFrameScanInfo> infos)
+        {
+            var bounds = infos
+                .Where(x => x != null)
+                .Select(x => x.Bounds)
+                .Where(x => !x.IsEmpty)
+                .ToList();
+
+            if (bounds.Count == 0)
+                return Bounds2D.Empty;
+
+            if (bounds.Count < 30)
+                return Bounds2DHelper.Union(bounds);
+
+            var minXs = bounds.Select(x => x.MinX).OrderBy(x => x).ToList();
+            var minYs = bounds.Select(x => x.MinY).OrderBy(x => x).ToList();
+            var maxXs = bounds.Select(x => x.MaxX).OrderBy(x => x).ToList();
+            var maxYs = bounds.Select(x => x.MaxY).OrderBy(x => x).ToList();
+
+            double trim = 0.02;
+
+            var b = new Bounds2D(
+                Percentile(minXs, trim),
+                Percentile(minYs, trim),
+                Percentile(maxXs, 1.0 - trim),
+                Percentile(maxYs, 1.0 - trim));
+
+            b = Bounds2DHelper.Normalize(b);
+
+            var padX = b.Width * 0.03;
+            var padY = b.Height * 0.03;
+
+            return new Bounds2D(
+                b.MinX - padX,
+                b.MinY - padY,
+                b.MaxX + padX,
+                b.MaxY + padY);
+        }
+
+        private static List<FastSheetBlockFrameCandidate> FindClosedRectPolylineFrameCandidates(
+    IReadOnlyList<FastFrameScanInfo> infos,
+    Bounds2D docBounds)
+        {
+            var result = new List<FastSheetBlockFrameCandidate>();
+
+            foreach (var info in infos)
+            {
+                Teigha.DatabaseServices.Polyline? pl = info.Polyline;
+                if (pl == null)
+                    continue;
+
+                if (!pl.Closed)
+                    continue;
+
+                var b = info.Bounds;
+                if (!IsMeaningfulFastFrameBounds(b, docBounds))
+                    continue;
+
+                if (!IsAxisAlignedRectanglePolylineFast(pl, b))
+                    continue;
+
+                var areaRatio = b.Area / Math.Max(docBounds.Area, 1.0);
+
+                result.Add(new FastSheetBlockFrameCandidate
+                {
+                    Kind = "ClosedRectPolyline",
+                    Bounds = b,
+                    Score = 0.70 + Math.Min(areaRatio, 0.25),
+                    Reason = $"PolylineHandle={info.Handle}"
+                });
+            }
+
+            return result;
+        }
+
+        private static List<FastSheetBlockFrameCandidate> FindLineRectangleFrameCandidates(
+    IReadOnlyList<FastFrameScanInfo> infos,
+    Bounds2D docBounds)
+        {
+            var result = new List<FastSheetBlockFrameCandidate>();
+
+            var docW = Math.Max(docBounds.Width, 1e-6);
+            var docH = Math.Max(docBounds.Height, 1e-6);
+
+            double slopeTol = 0.002;
+            double minHorizontalLen = docW * 0.035;
+            double minVerticalLen = docH * 0.08;
+
+            var horizontals = new List<Line>();
+            var verticals = new List<Line>();
+
+            foreach (var info in infos)
+            {
+                var ln = info.Line;
+                if (ln == null)
+                    continue;
+
+                double dx = ln.EndPoint.X - ln.StartPoint.X;
+                double dy = ln.EndPoint.Y - ln.StartPoint.Y;
+                double len = Math.Sqrt(dx * dx + dy * dy);
+
+                if (len <= 0)
+                    continue;
+
+                bool nearHorizontal = Math.Abs(dy) <= Math.Max(1.0, len * slopeTol);
+                bool nearVertical = Math.Abs(dx) <= Math.Max(1.0, len * slopeTol);
+
+                if (nearHorizontal && len >= minHorizontalLen)
+                    horizontals.Add(ln);
+                else if (nearVertical && len >= minVerticalLen)
+                    verticals.Add(ln);
+            }
+
+            // 조합 폭발 방지
+            horizontals = horizontals
+                .OrderByDescending(GetLineLength)
+                .Take(350)
+                .ToList();
+
+            verticals = verticals
+                .OrderByDescending(GetLineLength)
+                .Take(350)
+                .ToList();
+
+            double posTol = Math.Max(docW, docH) * 0.002;
+
+            for (int i = 0; i < horizontals.Count; i++)
+            {
+                var h1 = horizontals[i];
+
+                for (int j = i + 1; j < horizontals.Count; j++)
+                {
+                    var h2 = horizontals[j];
+
+                    double y1 = GetHorizontalRepY(h1);
+                    double y2 = GetHorizontalRepY(h2);
+
+                    double yTop = Math.Max(y1, y2);
+                    double yBottom = Math.Min(y1, y2);
+
+                    double rectH = yTop - yBottom;
+                    if (rectH < docH * 0.04)
+                        continue;
+
+                    for (int a = 0; a < verticals.Count; a++)
+                    {
+                        var v1 = verticals[a];
+
+                        for (int b = a + 1; b < verticals.Count; b++)
+                        {
+                            var v2 = verticals[b];
+
+                            double x1 = GetVerticalRepX(v1);
+                            double x2 = GetVerticalRepX(v2);
+
+                            double xLeft = Math.Min(x1, x2);
+                            double xRight = Math.Max(x1, x2);
+
+                            double rectW = xRight - xLeft;
+                            if (rectW < docW * 0.035)
+                                continue;
+
+                            var rect = new Bounds2D(xLeft, yBottom, xRight, yTop);
+
+                            if (!IsMeaningfulFastFrameBounds(rect, docBounds))
+                                continue;
+
+                            if (!CoversHorizontal(h1, xLeft, xRight, posTol))
+                                continue;
+
+                            if (!CoversHorizontal(h2, xLeft, xRight, posTol))
+                                continue;
+
+                            if (!CoversVertical(v1, yBottom, yTop, posTol))
+                                continue;
+
+                            if (!CoversVertical(v2, yBottom, yTop, posTol))
+                                continue;
+
+                            var areaRatio = rect.Area / Math.Max(docBounds.Area, 1.0);
+
+                            result.Add(new FastSheetBlockFrameCandidate
+                            {
+                                Kind = "LineRect",
+                                Bounds = rect,
+                                Score = 0.60 + Math.Min(areaRatio, 0.30),
+                                Reason = "4 Lines"
+                            });
+                        }
+                    }
+                }
+            }
+
+            return result;
+        }
+
+        private static List<FastSheetBlockFrameCandidate> ValidateFastFrameCandidates(
+    IReadOnlyList<FastSheetBlockFrameCandidate> candidates,
+    IReadOnlyList<FastFrameScanInfo> infos,
+    Bounds2D docBounds)
+        {
+            var result = new List<FastSheetBlockFrameCandidate>();
+
+            foreach (var c in candidates)
+            {
+                if (c.Bounds.IsEmpty)
+                    continue;
+
+                int insideCount = 0;
+
+                foreach (var info in infos)
+                {
+                    if (info.Bounds.IsEmpty)
+                        continue;
+
+                    var center = info.Bounds.Center;
+
+                    if (center.X >= c.Bounds.MinX &&
+                        center.X <= c.Bounds.MaxX &&
+                        center.Y >= c.Bounds.MinY &&
+                        center.Y <= c.Bounds.MaxY)
+                    {
+                        insideCount++;
+                    }
+                }
+
+                c.InsideEntityCount = insideCount;
+
+                if (insideCount < 8)
+                    continue;
+
+                var areaRatio = c.Bounds.Area / Math.Max(docBounds.Area, 1.0);
+
+                // 너무 작은 내부 형상은 제거
+                if (areaRatio < 0.003)
+                    continue;
+
+                c.Score += Math.Min(insideCount / 200.0, 0.20);
+
+                result.Add(c);
+            }
+
+            return result;
+        }
+
+        private static List<FastSheetBlockFrameCandidate> DeduplicateFastFrameCandidates(
+    IReadOnlyList<FastSheetBlockFrameCandidate> candidates,
+    Bounds2D docBounds)
+        {
+            var ordered = candidates
+                .Where(x => x != null && !x.Bounds.IsEmpty)
+                .OrderByDescending(x => x.Score)
+                .ToList();
+
+            var result = new List<FastSheetBlockFrameCandidate>();
+
+            double tol = Math.Max(docBounds.Width, docBounds.Height) * 0.003;
+
+            foreach (var c in ordered)
+            {
+                bool duplicate = result.Any(r =>
+                    AreSimilarBounds(r.Bounds, c.Bounds, tol) ||
+                    ContainsBounds(r.Bounds, c.Bounds, tol));
+
+                if (duplicate)
+                    continue;
+
+                result.Add(c);
+            }
+
+            return result;
+        }
+
+        private static bool IsMeaningfulFastFrameBounds(Bounds2D b, Bounds2D docBounds)
+        {
+            if (b.IsEmpty || docBounds.IsEmpty)
+                return false;
+
+            if (b.Width <= 0 || b.Height <= 0)
+                return false;
+
+            var docW = Math.Max(docBounds.Width, 1e-6);
+            var docH = Math.Max(docBounds.Height, 1e-6);
+            var docArea = Math.Max(docBounds.Area, 1.0);
+
+            var widthRatio = b.Width / docW;
+            var heightRatio = b.Height / docH;
+            var areaRatio = b.Area / docArea;
+
+            if (areaRatio < 0.003)
+                return false;
+
+            if (widthRatio < 0.025)
+                return false;
+
+            if (heightRatio < 0.035)
+                return false;
+
+            var aspect = Math.Max(b.Width, b.Height) / Math.Max(1e-6, Math.Min(b.Width, b.Height));
+
+            if (aspect > 25.0)
+                return false;
+
+            return true;
+        }
+
+        private static bool IsAxisAlignedRectanglePolylineFast(Teigha.DatabaseServices.Polyline? pl, Bounds2D b)
+        {
+            if (pl == null || !pl.Closed || b.IsEmpty)
+                return false;
+
+            int n = pl.NumberOfVertices;
+
+            if (n < 4 || n > 8)
+                return false;
+
+            double tol = Math.Max(b.Width, b.Height) * 0.005;
+
+            int cornerLike = 0;
+
+            for (int i = 0; i < n; i++)
+            {
+                var p = pl.GetPoint2dAt(i);
+
+                bool onLeft = Math.Abs(p.X - b.MinX) <= tol;
+                bool onRight = Math.Abs(p.X - b.MaxX) <= tol;
+                bool onBottom = Math.Abs(p.Y - b.MinY) <= tol;
+                bool onTop = Math.Abs(p.Y - b.MaxY) <= tol;
+
+                if ((onLeft || onRight) && (onBottom || onTop))
+                    cornerLike++;
+            }
+
+            return cornerLike >= 4;
+        }
+
+        private static bool AreSimilarBounds(Bounds2D a, Bounds2D b, double tol)
+        {
+            if (a.IsEmpty || b.IsEmpty)
+                return false;
+
+            return Math.Abs(a.MinX - b.MinX) <= tol &&
+                   Math.Abs(a.MinY - b.MinY) <= tol &&
+                   Math.Abs(a.MaxX - b.MaxX) <= tol &&
+                   Math.Abs(a.MaxY - b.MaxY) <= tol;
+        }
+
+        private static double GetLineLength(Line ln)
+        {
+            return ln.StartPoint.DistanceTo(ln.EndPoint);
+        }
+
+        private static double GetHorizontalRepY(Line ln)
+        {
+            return (ln.StartPoint.Y + ln.EndPoint.Y) * 0.5;
+        }
+
+        private static double GetVerticalRepX(Line ln)
+        {
+            return (ln.StartPoint.X + ln.EndPoint.X) * 0.5;
+        }
+
+        private static bool CoversHorizontal(Line ln, double x1, double x2, double tol)
+        {
+            double minX = Math.Min(ln.StartPoint.X, ln.EndPoint.X);
+            double maxX = Math.Max(ln.StartPoint.X, ln.EndPoint.X);
+            double y1 = ln.StartPoint.Y;
+            double y2 = ln.EndPoint.Y;
+
+            if (Math.Abs(y1 - y2) > tol)
+                return false;
+
+            return minX <= x1 + tol && maxX >= x2 - tol;
+        }
+
+        private static bool CoversVertical(Line ln, double y1, double y2, double tol)
+        {
+            double minY = Math.Min(ln.StartPoint.Y, ln.EndPoint.Y);
+            double maxY = Math.Max(ln.StartPoint.Y, ln.EndPoint.Y);
+            double x1 = ln.StartPoint.X;
+            double x2 = ln.EndPoint.X;
+
+            if (Math.Abs(x1 - x2) > tol)
+                return false;
+
+            return minY <= y1 + tol && maxY >= y2 - tol;
+        }
+
+
+
+        private static void DrawFastFrameCandidates(
+    Database db,
+    Transaction tr,
+    IReadOnlyList<Bounds2D> candidates)
+        {
+            const string layerName = "FLUX_FAST_SHEET_BLOCK_FRAME";
+
+            EnsureDebugLayer(
+                db,
+                tr,
+                layerName,
+                colorIndex: 2,
+                clearLayerFirst: true);
+
+            for (int i = 0; i < candidates.Count; i++)
+            {
+                var b = candidates[i];
+
+                if (b.IsEmpty)
+                    continue;
+
+                DrawBoundsRectangle(
+                    db,
+                    tr,
+                    layerName,
+                    b,
+                    colorIndex: 2);
+
+                DrawDebugText(
+                    db,
+                    tr,
+                    layerName,
+                    b.Center,
+                    $"FAST BLOCK {i + 1}",
+                    colorIndex: 2,
+                    textHeight: Math.Max(5.0, Math.Min(b.Width, b.Height) * 0.04));
+            }
+        }
+
+        private static bool TryGetEntityBounds2D(Entity ent, out Bounds2D b)
+        {
+            b = Bounds2D.Empty;
+
+            try
+            {
+                var ext = ent.GeometricExtents;
+
+                b = new Bounds2D(
+                    ext.MinPoint.X,
+                    ext.MinPoint.Y,
+                    ext.MaxPoint.X,
+                    ext.MaxPoint.Y);
+
+                return !b.IsEmpty;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        private static bool IsLargeEnoughForBlockCandidate(
+    Bounds2D b,
+    Point3d docMin,
+    Point3d docMax)
+        {
+            if (b.IsEmpty)
+                return false;
+
+            var docWidth = Math.Abs(docMax.X - docMin.X);
+            var docHeight = Math.Abs(docMax.Y - docMin.Y);
+
+            if (docWidth <= 0 || docHeight <= 0)
+                return false;
+
+            // 문서 폭/높이 대비 너무 작은 것은 제외
+            if (b.Width < docWidth * 0.03)
+                return false;
+
+            if (b.Height < docHeight * 0.03)
+                return false;
+
+            var docArea = docWidth * docHeight;
+            var area = b.Width * b.Height;
+
+            // 전체 문서 면적의 0.2% 미만은 제외
+            if (area < docArea * 0.002)
+                return false;
+
+            return true;
+        }
+
+        [CommandMethod("FLUX_DEBUG_SHEET_BLOCK_AREAS")]
+        public void FluxDebugSheetBlockAreas()
+        {
+            var doc = Bricscad.ApplicationServices.Application.DocumentManager.MdiActiveDocument;
+            if (doc == null)
+                return;
+
+            var db = doc.Database;
+            var ed = doc.Editor;
+
+            try
+            {
+                var sheetFilePath = db.Filename;
+                if (string.IsNullOrWhiteSpace(sheetFilePath))
+                {
+                    ed.WriteMessage("\n[FluxCAD] 저장된 DWG 파일이 아닙니다.");
+                    return;
+                }
+
+                ed.WriteMessage("\n[FluxCAD] Mode=DebugSheetBlockAreas");
+
+                IEntitySnapshotBuilder snapshotBuilder = new SimpleSheetFileSnapshotBuilder();
+                var entities = snapshotBuilder.Build(sheetFilePath);
+
+                if (entities == null || entities.Count == 0)
+                {
+                    ed.WriteMessage("\n[FluxCAD] snapshot이 비어 있습니다.");
+                    return;
+                }
+
+                var allBounds = Bounds2DHelper.FromEntities(entities);
+                if (allBounds.IsEmpty)
+                {
+                    ed.WriteMessage("\n[FluxCAD] sheet bounds가 비어 있습니다.");
+                    return;
+                }
+
+                var geometryEntities = entities
+                    .Where(x => x != null)
+                    .Where(x => x.IsVisible)
+                    .Where(x => x.IsGeometryLike)
+                    .Where(x => !x.IsTextLike)
+                    .Where(x => !x.IsDimensionLike)
+                    .Where(x => !x.IsBlockReference)
+                    .Where(x => !Bounds2DHelper.IsEmpty(x.Bounds))
+                    .ToList();
+
+                if (geometryEntities.Count == 0)
+                {
+                    ed.WriteMessage("\n[FluxCAD] geometry entity가 비어 있습니다.");
+                    return;
+                }
+
+                var geometryEntitiesForBounds = geometryEntities
+                    .Where(x => !GhostEntityPolicy.IsIgnorableGhostEntity(x, Bounds2D.Empty))
+                    .ToList();
+
+                if (geometryEntitiesForBounds.Count == 0)
+                    geometryEntitiesForBounds = geometryEntities.ToList();
+
+                var robustBounds = ComputeRobustGeometryBounds(
+                    geometryEntitiesForBounds,
+                    out var rejectedOutliers,
+                    trimRatio: 0.02,
+                    minKeepCount: 20);
+
+                if (robustBounds.IsEmpty)
+                    robustBounds = allBounds;
+
+                var filteredGeometryEntities = GhostEntityPolicy.ExcludeGhosts(
+                    geometryEntitiesForBounds,
+                    robustBounds,
+                    out var rejectedGhosts).ToList();
+
+                if (filteredGeometryEntities.Count > 0)
+                {
+                    var refinedBounds = ComputeRobustGeometryBounds(
+                        filteredGeometryEntities,
+                        out var rejectedOutliers2,
+                        trimRatio: 0.02,
+                        minKeepCount: 20);
+
+                    if (!refinedBounds.IsEmpty)
+                    {
+                        robustBounds = refinedBounds;
+                        rejectedOutliers = rejectedOutliers2;
+                    }
+                }
+
+                ed.WriteMessage($"\n[FluxCAD] AllBounds={allBounds}");
+                ed.WriteMessage($"\n[FluxCAD] RobustBounds={robustBounds}");
+                ed.WriteMessage($"\n[FluxCAD] Geometry={geometryEntities.Count}");
+                ed.WriteMessage($"\n[FluxCAD] rejectedOutliers={rejectedOutliers.Count}");
+                ed.WriteMessage($"\n[FluxCAD] rejectedGhosts={rejectedGhosts.Count}");
+
+                var candidates = new List<SheetBlockAreaCandidate>();
+
+                var frameCandidates = FindSheetBlockFrameCandidates(
+                    geometryEntities,
+                    robustBounds,
+                    ed);
+
+                candidates.AddRange(frameCandidates);
+
+                if (frameCandidates.Count == 0)
+                {
+                    var coarseCandidates = FindCoarseOccupancySheetBlockCandidates(
+                        entities,
+                        robustBounds,
+                        ed);
+
+                    candidates.AddRange(coarseCandidates);
+                }
+
+                var finalCandidates = MergeAndFilterSheetBlockAreaCandidates(
+                    candidates,
+                    robustBounds)
+                    .OrderByDescending(x => x.Score)
+                    .ThenBy(x => x.Bounds.MinY)
+                    .ThenBy(x => x.Bounds.MinX)
+                    .ToList();
+
+                using (doc.LockDocument())
+                using (var tr = db.TransactionManager.StartTransaction())
+                {
+                    DrawSheetBlockAreaCandidates(
+                        db,
+                        tr,
+                        robustBounds,
+                        finalCandidates,
+                        clearLayerFirst: true);
+
+                    tr.Commit();
+                }
+
+                ed.WriteMessage($"\n[FluxCAD] SheetBlockAreaCandidates={finalCandidates.Count}");
+
+                for (int i = 0; i < finalCandidates.Count; i++)
+                {
+                    var c = finalCandidates[i];
+                    ed.WriteMessage(
+                        $"\n  [SheetBlockArea {i + 1}] " +
+                        $"Kind={c.Kind}, Score={c.Score:0.00}, Bounds={c.Bounds}, " +
+                        $"Reason={c.Reason}");
+                }
+            }
+            catch (System.Exception ex)
+            {
+                ed.WriteMessage($"\n[FluxCAD] FLUX_DEBUG_SHEET_BLOCK_AREAS failed: {ex}");
+            }
+        }
+
+        private enum SheetBlockAreaCandidateKind
+        {
+            Frame,
+            CoarseOccupancyCluster
+        }
+
+        private sealed class SheetBlockAreaCandidate
+        {
+            public SheetBlockAreaCandidateKind Kind { get; init; }
+            public Bounds2D Bounds { get; init; } = Bounds2D.Empty;
+            public double Score { get; init; }
+            public string Reason { get; init; } = "";
+        }
+
+        private static IReadOnlyList<SheetBlockAreaCandidate> FindSheetBlockFrameCandidates(
+            IReadOnlyList<SheetEntity> geometryEntities,
+            Bounds2D documentBounds,
+            Bricscad.EditorInput.Editor ed)
+        {
+            var result = new List<SheetBlockAreaCandidate>();
+
+            var closedPolylines = geometryEntities
+                .Where(x => x.Kind == SheetEntityKind.Polyline)
+                .Where(x => x.IsClosed)
+                .Where(x => !Bounds2DHelper.IsEmpty(x.Bounds))
+                .ToList();
+
+            foreach (var e in closedPolylines)
+            {
+                var b = Bounds2DHelper.Normalize(e.Bounds);
+
+                if (!IsMeaningfulBlockBounds(b, documentBounds))
+                    continue;
+
+                var areaRatio = SafeArea(b) / Math.Max(SafeArea(documentBounds), 1.0);
+                var score = 0.65 + Math.Min(areaRatio, 0.30);
+
+                result.Add(new SheetBlockAreaCandidate
+                {
+                    Kind = SheetBlockAreaCandidateKind.Frame,
+                    Bounds = b,
+                    Score = score,
+                    Reason = $"ClosedPolyline|Handle={e.Handle}|AreaRatio={areaRatio:0.000}"
+                });
+            }
+
+            ed.WriteMessage($"\n[FluxCAD] ClosedPolyline frame candidates={result.Count}");
+
+            return result;
+        }
+
+        private IReadOnlyList<SheetBlockAreaCandidate> FindCoarseOccupancySheetBlockCandidates(
+            IReadOnlyList<SheetEntity> entities,
+            Bounds2D robustBounds,
+            Bricscad.EditorInput.Editor ed)
+        {
+            var result = new List<SheetBlockAreaCandidate>();
+
+            var gridInput = PrepareOccupancyInput(
+                entities,
+                robustBounds,
+                ed,
+                OccupancyInputMode.RawAllGeometrySeeds);
+
+            if (gridInput == null || gridInput.Count == 0)
+                return result;
+
+            const int rows = 60;
+            const int cols = 60;
+
+            var hitMapBuilder = new StrokeOccupancyGridHitMapBuilder();
+            var hitMap = hitMapBuilder.Build(
+                gridInput,
+                robustBounds,
+                rows,
+                cols);
+
+            var islandFinder = new OccupancyHitIslandFinder();
+            var hitGrid = BuildHitGrid(hitMap);
+
+            CloseSingleCellGaps(hitGrid);
+
+            var islands = islandFinder.Find(hitGrid)
+                .Where(x => x.CellCount >= 3)
+                .OrderByDescending(x => x.CellCount)
+                .ToList();
+
+            ed.WriteMessage($"\n[FluxCAD] Coarse occupancy islands={islands.Count}");
+
+            foreach (var island in islands)
+            {
+                var b = island.Bounds;
+
+                if (!IsMeaningfulBlockBounds(b, robustBounds))
+                    continue;
+
+                var areaRatio = SafeArea(b) / Math.Max(SafeArea(robustBounds), 1.0);
+                var cellRatio = island.CellCount / (double)(rows * cols);
+
+                var score =
+                    0.45 +
+                    Math.Min(areaRatio * 0.8, 0.35) +
+                    Math.Min(cellRatio * 2.0, 0.20);
+
+                result.Add(new SheetBlockAreaCandidate
+                {
+                    Kind = SheetBlockAreaCandidateKind.CoarseOccupancyCluster,
+                    Bounds = b,
+                    Score = score,
+                    Reason = $"CoarseIsland|Id={island.Id}|Cells={island.CellCount}|AreaRatio={areaRatio:0.000}"
+                });
+            }
+
+            return result;
+        }
+
+        private static IReadOnlyList<SheetBlockAreaCandidate> MergeAndFilterSheetBlockAreaCandidates(
+            IReadOnlyList<SheetBlockAreaCandidate> candidates,
+            Bounds2D documentBounds)
+        {
+            if (candidates == null || candidates.Count == 0)
+                return Array.Empty<SheetBlockAreaCandidate>();
+
+            var ordered = candidates
+                .Where(x => x != null)
+                .Where(x => !Bounds2DHelper.IsEmpty(x.Bounds))
+                .Where(x => IsMeaningfulBlockBounds(x.Bounds, documentBounds))
+                .OrderByDescending(x => x.Score)
+                .ToList();
+
+            var result = new List<SheetBlockAreaCandidate>();
+
+            foreach (var c in ordered)
+            {
+                bool containedByExisting = result.Any(r =>
+                    ContainsBounds(r.Bounds, c.Bounds, tolerance: Math.Max(documentBounds.Width, documentBounds.Height) * 0.005));
+
+                if (containedByExisting)
+                    continue;
+
+                result.Add(c);
+            }
+
+            return result;
+        }
+
+        private static void DrawSheetBlockAreaCandidates(
+            Database db,
+            Transaction tr,
+            Bounds2D documentBounds,
+            IReadOnlyList<SheetBlockAreaCandidate> candidates,
+            bool clearLayerFirst)
+        {
+            const string rootLayer = "FLUX_SHEET_BLOCK_D0_DOCUMENT";
+            const string blockLayer = "FLUX_SHEET_BLOCK_D1_AREA";
+
+            EnsureDebugLayer(db, tr, rootLayer, colorIndex: 8, clearLayerFirst: clearLayerFirst);
+            EnsureDebugLayer(db, tr, blockLayer, colorIndex: 3, clearLayerFirst: clearLayerFirst);
+
+            DrawBoundsRectangle(db, tr, rootLayer, documentBounds, colorIndex: 8);
+
+            for (int i = 0; i < candidates.Count; i++)
+            {
+                var c = candidates[i];
+
+                short colorIndex = c.Kind == SheetBlockAreaCandidateKind.Frame
+                    ? (short)2
+                    : (short)3;
+
+                DrawBoundsRectangle(db, tr, blockLayer, c.Bounds, colorIndex);
+
+                DrawDebugText(
+                    db,
+                    tr,
+                    blockLayer,
+                    c.Bounds.Center,
+                    $"BLOCK {i + 1}\n{c.Kind}\n{c.Score:0.00}",
+                    colorIndex,
+                    Math.Max(8.0, Math.Min(c.Bounds.Width, c.Bounds.Height) * 0.04));
+            }
+        }
+
+        private static bool IsMeaningfulBlockBounds(Bounds2D b, Bounds2D documentBounds)
+        {
+            if (Bounds2DHelper.IsEmpty(b) || Bounds2DHelper.IsEmpty(documentBounds))
+                return false;
+
+            if (b.Width <= 0 || b.Height <= 0)
+                return false;
+
+            var docArea = SafeArea(documentBounds);
+            var area = SafeArea(b);
+
+            if (docArea <= 0 || area <= 0)
+                return false;
+
+            var areaRatio = area / docArea;
+
+            if (areaRatio < 0.01)
+                return false;
+
+            if (b.Width < documentBounds.Width * 0.03)
+                return false;
+
+            if (b.Height < documentBounds.Height * 0.03)
+                return false;
+
+            return true;
+        }
+
+        private static double SafeArea(Bounds2D b)
+        {
+            if (Bounds2DHelper.IsEmpty(b))
+                return 0.0;
+
+            return Math.Max(0.0, b.Width) * Math.Max(0.0, b.Height);
+        }
+
 
 
         [CommandMethod("FLUX_DEBUG_DIRECTIONAL_EDGE_ANALYSIS")]
