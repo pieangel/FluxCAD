@@ -1116,17 +1116,17 @@ namespace FluxCAD.BricsCAD.Plugin26
             }
         }
 
-        private sealed class SheetBlockAreaNode
-        {
-            public int Id { get; init; }
-            public int Depth { get; init; }
-            public int? ParentId { get; init; }
-
-            public Bounds2D Bounds { get; init; }
-            public string LayoutKind { get; set; } = "Unknown";
-
-            public List<SheetBlockAreaNode> Children { get; } = new();
-        }
+//         private sealed class SheetBlockAreaNode
+//         {
+//             public int Id { get; init; }
+//             public int Depth { get; init; }
+//             public int? ParentId { get; init; }
+// 
+//             public Bounds2D Bounds { get; init; }
+//             public string LayoutKind { get; set; } = "Unknown";
+// 
+//             public List<SheetBlockAreaNode> Children { get; } = new();
+//         }
 
 
         private List<SheetBlockAreaNode> AnalyzeSheetBlockAreaRecursive(
@@ -1164,6 +1164,259 @@ namespace FluxCAD.BricsCAD.Plugin26
 
             return new List<SheetBlockAreaNode> { node };
         }
+
+
+        private sealed class SheetBlockAreaNode
+        {
+            public int Id { get; init; }
+            public int Depth { get; init; }
+            public int? ParentId { get; init; }
+
+            public Bounds2D Bounds { get; init; } = Bounds2D.Empty;
+            public string LayoutKind { get; set; } = "Unknown";
+
+            public double Confidence { get; set; }
+            public string Reason { get; set; } = string.Empty;
+
+            public List<SheetBlockAreaNode> Children { get; } = new();
+
+            public bool HasChildren => Children.Count > 0;
+        }
+
+        private sealed class SheetBlockAreaAnalysisOptions
+        {
+            public int MaxDepth { get; init; } = 2;
+
+            public double MinChildAreaRatio { get; init; } = 0.03;
+            public double MaxChildAreaRatio { get; init; } = 0.92;
+
+            public double InnerMarginRatio { get; init; } = 0.01;
+
+            public int MinEntitiesPerChild { get; init; } = 5;
+
+            public bool DrawDebugOverlay { get; init; } = true;
+        }
+
+        private static SheetBlockAreaNode BuildSheetBlockAreaTree(
+    IReadOnlyList<SheetEntity> entities,
+    Bounds2D rootBounds,
+    SheetBlockAreaAnalysisOptions options)
+        {
+            int nextId = 1;
+
+            return BuildSheetBlockAreaNodeRecursive(
+                entities,
+                rootBounds,
+                depth: 0,
+                parentId: null,
+                options,
+                ref nextId);
+        }
+
+
+        private static SheetBlockAreaNode BuildSheetBlockAreaNodeRecursive(
+    IReadOnlyList<SheetEntity> entities,
+    Bounds2D areaBounds,
+    int depth,
+    int? parentId,
+    SheetBlockAreaAnalysisOptions options,
+    ref int nextId)
+        {
+            var node = new SheetBlockAreaNode
+            {
+                Id = nextId++,
+                Depth = depth,
+                ParentId = parentId,
+                Bounds = areaBounds,
+                LayoutKind = "Unknown",
+                Confidence = 0.5,
+                Reason = "Initial area"
+            };
+
+            if (depth >= options.MaxDepth)
+                return node;
+
+            var innerEntities = entities
+                .Where(x => x != null)
+                .Where(x => x.IsVisible)
+                .Where(x => x.IsGeometryLike)
+                .Where(x => !x.IsTextLike)
+                .Where(x => !x.IsDimensionLike)
+                .Where(x => !Bounds2DHelper.IsEmpty(x.Bounds))
+                .Where(x => areaBounds.Contains(x.Bounds.Center))
+                .ToList();
+
+            if (innerEntities.Count < options.MinEntitiesPerChild)
+                return node;
+
+            // 다음 단계에서 여기에 SubBlock 후보 탐지 로직을 넣습니다.
+            var childBoundsList = DetectChildSheetBlockAreas(
+                innerEntities,
+                areaBounds,
+                options);
+
+            foreach (var childBounds in childBoundsList)
+            {
+                var childAreaRatio = childBounds.Area / Math.Max(areaBounds.Area, 1e-6);
+
+                if (childAreaRatio < options.MinChildAreaRatio)
+                    continue;
+
+                if (childAreaRatio > options.MaxChildAreaRatio)
+                    continue;
+
+                var child = BuildSheetBlockAreaNodeRecursive(
+                    innerEntities,
+                    childBounds,
+                    depth + 1,
+                    node.Id,
+                    options,
+                    ref nextId);
+
+                node.Children.Add(child);
+            }
+
+            return node;
+        }
+
+        private sealed class FastDividerLine
+        {
+            public bool IsVertical { get; init; }
+            public double Position { get; init; }
+
+            public double Min { get; init; }
+            public double Max { get; init; }
+            public double Length => Max - Min;
+
+            public Bounds2D Bounds { get; init; }
+        }
+
+
+
+        private static List<Bounds2D> DetectChildSheetBlockAreas(
+    IReadOnlyList<SheetEntity> entities,
+    Bounds2D parentBounds,
+    SheetBlockAreaAnalysisOptions options)
+        {
+            // 다음 구현 지점:
+            // 1. parentBounds 내부 엔티티만 대상으로 빠른 구조 스캔
+            // 2. 큰 내부 분할선 찾기
+            // 3. SubBlock 후보 bounds 생성
+            // 4. 너무 작은 체크/화살표/마크 제거
+
+            var dividers = DetectFastDividerLines(entities, parentBounds);
+
+            if (dividers.Count == 0)
+                return new List<Bounds2D>();
+
+            var verticals = dividers
+                .Where(x => x.IsVertical)
+                .OrderBy(x => x.Position)
+                .ToList();
+
+            var horizontals = dividers
+                .Where(x => !x.IsVertical)
+                .OrderBy(x => x.Position)
+                .ToList();
+
+            return BuildSubAreasFromDividers(parentBounds, verticals, horizontals);
+        }
+
+
+        private static List<Bounds2D> BuildSubAreasFromDividers(
+    Bounds2D parentBounds,
+    IReadOnlyList<FastDividerLine> verticals,
+    IReadOnlyList<FastDividerLine> horizontals)
+        {
+            var xs = new List<double> { parentBounds.MinX };
+            xs.AddRange(verticals.Select(v => v.Position));
+            xs.Add(parentBounds.MaxX);
+
+            var ys = new List<double> { parentBounds.MinY };
+            ys.AddRange(horizontals.Select(h => h.Position));
+            ys.Add(parentBounds.MaxY);
+
+            xs = xs.Distinct().OrderBy(x => x).ToList();
+            ys = ys.Distinct().OrderBy(y => y).ToList();
+
+            var result = new List<Bounds2D>();
+
+            for (int ix = 0; ix < xs.Count - 1; ix++)
+            {
+                for (int iy = 0; iy < ys.Count - 1; iy++)
+                {
+                    var area = new Bounds2D(
+                        xs[ix],
+                        ys[iy],
+                        xs[ix + 1],
+                        ys[iy + 1]);
+
+                    if (area.IsZeroArea)
+                        continue;
+
+                    result.Add(area);
+                }
+            }
+
+            return result;
+        }
+
+
+        private static List<FastDividerLine> DetectFastDividerLines(
+    IReadOnlyList<SheetEntity> entities,
+    Bounds2D parentBounds)
+        {
+            var result = new List<FastDividerLine>();
+
+            double minVerticalLength = parentBounds.Height * 0.35;
+            double minHorizontalLength = parentBounds.Width * 0.35;
+
+            foreach (var e in entities)
+            {
+                if (e == null)
+                    continue;
+
+                var b = e.Bounds;
+
+                if (b.IsZeroArea)
+                    continue;
+
+                if (!parentBounds.Intersects(b))
+                    continue;
+
+                bool looksVertical = b.Height > parentBounds.Height * 0.25
+                                  && b.Width < parentBounds.Width * 0.02;
+
+                bool looksHorizontal = b.Width > parentBounds.Width * 0.25
+                                    && b.Height < parentBounds.Height * 0.02;
+
+                if (looksVertical && b.Height >= minVerticalLength)
+                {
+                    result.Add(new FastDividerLine
+                    {
+                        IsVertical = true,
+                        Position = b.Center.X,
+                        Min = b.MinY,
+                        Max = b.MaxY,
+                        Bounds = b
+                    });
+                }
+                else if (looksHorizontal && b.Width >= minHorizontalLength)
+                {
+                    result.Add(new FastDividerLine
+                    {
+                        IsVertical = false,
+                        Position = b.Center.Y,
+                        Min = b.MinX,
+                        Max = b.MaxX,
+                        Bounds = b
+                    });
+                }
+            }
+
+            return result;
+        }
+
 
 
         private static bool LooksLikeGridTable(
