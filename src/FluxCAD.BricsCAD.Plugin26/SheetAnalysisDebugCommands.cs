@@ -1416,11 +1416,23 @@ namespace FluxCAD.BricsCAD.Plugin26
                         continue;
 
                     double entityArea =
-                        cellInfos.Sum(x => x.Bounds.Area);
+                        cellInfos.Sum(x => x.EffectiveArea);
 
                     double density =
                         entityArea /
                         Math.Max(cellBounds.Area, 1e-6);
+
+                    double normalizedDensity =
+                        entityArea /
+                        Math.Max(
+                            cellBounds.Width + cellBounds.Height,
+                            1.0);
+
+                    double coverageScore =
+                        cellInfos.Count /
+                        Math.Max(
+                            (cellBounds.Width + cellBounds.Height) * 0.01,
+                            1.0);
 
                     int dividerCount =
                         cellInfos.Count(x =>
@@ -1437,6 +1449,9 @@ namespace FluxCAD.BricsCAD.Plugin26
                         DividerCount = dividerCount,
 
                         Density = density,
+
+                        NormalizedDensity = normalizedDensity,
+                        CoverageScore = coverageScore,
 
                         Confidence = Math.Min(
                             1.0,
@@ -1949,11 +1964,17 @@ namespace FluxCAD.BricsCAD.Plugin26
 
             public string Reason { get; set; } = "";
 
+            public double NormalizedDensity { get; set; }
+
+            public double CoverageScore { get; set; }
+
             public override string ToString()
             {
                 return
                     $"R={RowIndex}, C={ColumnIndex}, " +
                     $"Density={Density:0.000}, " +
+                    $"NormDensity={NormalizedDensity:0.000}, " +
+                    $"Coverage={CoverageScore:0.000}, " +
                     $"Entities={EntityCount}, " +
                     $"Dividers={DividerCount}, " +
                     $"Kind={Kind}";
@@ -2618,6 +2639,30 @@ namespace FluxCAD.BricsCAD.Plugin26
                     $"LongH={IsLongHorizontal}, " +
                     $"LongV={IsLongVertical}";
             }
+
+            public double EffectiveArea
+            {
+                get
+                {
+                    if (IsLine && Line != null)
+                    {
+                        return Math.Max(
+                            Line.Length * 2.0,
+                            1.0);
+                    }
+
+                    if (IsPolyline && Polyline != null)
+                    {
+                        return Math.Max(
+                            Polyline.Length * 2.0,
+                            Bounds.Area * 0.1);
+                    }
+
+                    return Math.Max(Bounds.Area, 1.0);
+                }
+            }
+
+
         }
 
         private sealed class FastSheetBlockFrameCandidate
